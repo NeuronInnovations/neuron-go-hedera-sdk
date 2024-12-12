@@ -1,0 +1,11 @@
+{
+    "workbench.colorTheme": "Visual Studio Dark",
+    "workbench.colorCustomizations": {
+        "[Visual Studio Dark]": {"titleBar.activeBackground": "#14677d"}
+    },
+    "cSpell.words": [
+        "Configurator",
+        "Jetvision"
+    ],
+    "cSpell.language": "en-GB"
+}
