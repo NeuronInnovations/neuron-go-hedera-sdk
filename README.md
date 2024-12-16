@@ -368,29 +368,3 @@ The `neuron-go-hedera-sdk` supports the following command-line flags for configu
       ./mydapp --mode=peer --buyer-or-seller=seller --envFile=.env-seller --port=20088 
    ```
 
-
-
-
-```mermaid
-
-      sequenceDiagram
-         participant b as buyer
-         box Hedera
-         participant bi as buyerStdInTopic
-         participant sh as AcccountService
-         participant si as sellerStdInTopic
-         end
-         Note over si,s: Seller listens to its topic for requests
-         Note over b,bi: Buyer listens to its topic for requests
-
-         participant s as seller
-         b ->>+ sh:create escrow account
-         sh ->>-b: acccount created: 0.0.123
-         b ->>+ sh:fund account:0.0.123, 10HBar
-         sh ->>-b: done
-         b ->>+ si:I want data and left money in 0.0.123 and my encrypted IP address is xxxxxx
-         s --> si:received request
-         s --> s: do checks
-         s -->> b: here's data
-         
-```
