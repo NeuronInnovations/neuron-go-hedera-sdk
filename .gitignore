@@ -7,13 +7,9 @@
 *.out
 go.work
 !init.env
-.DS_Store
-personal.txt
-draw.drawio
+**/.DS_Store
 __debug*
 .vscode/launch.json
 sdk
 neuron-sdk
-
-README.bak.md
-Mermaid.md
+/.personal
