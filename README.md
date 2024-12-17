@@ -69,7 +69,7 @@ Additionally, the device account's EVM address is recorded in the smart contract
 
 ## Compiling
 
-To build the `neuron-go-hedera-sdk`, you need to ensure that you have the latest version of Go installed. You can download and install it from the [official Go GitHub releases page](https://github.com/golang/go/releases).
+To build the `neuron-go-hedera-sdk`, you need to ensure that you have the latest version of Go installed. You can download and install it from [the official golang site](https://go.dev/dl/)
 
 ### Steps to Build the SDK
 
