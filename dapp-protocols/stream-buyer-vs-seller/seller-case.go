@@ -140,7 +140,7 @@ func HandleSellerCase(ctx context.Context, p2pHost host.Host, protocol protocol.
 					Topic: requestMsgFromOtherSide.StdInTopic,
 				}
 
-				if requestMsgFromOtherSide.Version != "0.3" {
+				if requestMsgFromOtherSide.Version != "0.4" {
 					fmt.Println("NACK: Ignore message as it does not match the current version", requestMsgFromOtherSide.Version) // TODO: send to the other side
 					hedera_helper.PeerSendErrorMessage(otherSideStdIn, commonlib.VersionError, "I am ignoring your message because it's not matching the current version", commonlib.Upgrade)
 					return
@@ -154,7 +154,7 @@ func HandleSellerCase(ctx context.Context, p2pHost host.Host, protocol protocol.
 					})
 
 				if err != nil || buyerSharedAccountInfo.AccountID.IsZero() {
-					fmt.Println("That seller doesn't exist on the hedera network:", err)
+					fmt.Println("That buyer either doesn't exist on the hedera network or hedera struggles to fetch him:", err)
 					return
 				}
 

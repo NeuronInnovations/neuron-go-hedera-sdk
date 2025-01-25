@@ -235,7 +235,7 @@ func BuyerPrepareServiceRequest(
 		EthPublicKey:       fromEthAddress,
 		PublicKey:          fromHederaPupblicKeyEnc.StringRaw(),
 		StdInTopic:         peerInfo.StdInTopic,
-		Version:            "0.3",
+		Version:            "0.4",
 	}
 
 	ret := commonlib.TopicPostalEnvelope{
@@ -257,9 +257,9 @@ func SellerSendScheduledTransferRequest(
 	defer client.Close()
 
 	transferTx, err := hedera.NewTransferTransaction().
-		AddHbarTransfer(sharedAccID, hedera.HbarFrom(-1, hedera.HbarUnits.Hbar)).
-		AddHbarTransfer(toHederaParentID, hedera.HbarFrom(0.7, hedera.HbarUnits.Hbar)).
-		AddHbarTransfer(toHederaDeviceID, hedera.HbarFrom(0.3, hedera.HbarUnits.Hbar)).
+		AddHbarTransfer(sharedAccID, hedera.HbarFrom(-0.1, hedera.HbarUnits.Hbar)).
+		AddHbarTransfer(toHederaParentID, hedera.HbarFrom(0.07, hedera.HbarUnits.Hbar)).
+		AddHbarTransfer(toHederaDeviceID, hedera.HbarFrom(0.03, hedera.HbarUnits.Hbar)).
 		// TODO: AddTokenTransfer() transfer tokens to  other fee and reward accounts.
 		SetTransactionMemo(uuid.New().String()).
 		FreezeWith(client)

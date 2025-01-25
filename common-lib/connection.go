@@ -21,7 +21,10 @@ import (
 )
 
 func InitialConnect(ctx context.Context, p2pHost host.Host, addrInfo peer.AddrInfo, buyerBuffers *NodeBuffers, protocol protocol.ID) error {
-	if info, ok := buyerBuffers.GetBuffer(addrInfo.ID); ok && info.LibP2PState == Connected {
+
+	info, exists := buyerBuffers.GetBuffer(addrInfo.ID)
+
+	if exists && info.LibP2PState == Connected {
 		if p2pHost.Network().Connectedness(addrInfo.ID) == network.Connected {
 			if info.StreamHandler != nil && !network.Stream.Conn(*info.StreamHandler).IsClosed() {
 				fmt.Printf("😍😍 Thanks, we're good, connected and pumping %s -> ! 😍😍\n", addrInfo.ID)
@@ -29,6 +32,9 @@ func InitialConnect(ctx context.Context, p2pHost host.Host, addrInfo peer.AddrIn
 			}
 		}
 	}
+
+	// now there are two cases to test.
+	// a buffer is there but state is not connected, or it is not there.
 
 	conErr := HolePunchConnectIfNotConnected(ctx, p2pHost, addrInfo, true)
 	//conErr := p2pHost.Connect(ctx, *pid)
@@ -39,9 +45,11 @@ func InitialConnect(ctx context.Context, p2pHost host.Host, addrInfo peer.AddrIn
 	}
 
 	fmt.Println("connected, create a stream ", addrInfo.ID)
+	// --------  stuck here
 	s, strErr := p2pHost.NewStream(ctx, addrInfo.ID, protocol)
 	if strErr != nil {
-		log.Println(strErr)
+		log.Println("failed to create a new stream in InitialConnect. ", strErr)
+		log.Println("this is what we know about the buffer:  exists:", exists, " bufferrInfo", info)
 		return fmt.Errorf("%s:error connecting: %w", CanNotConnectStreamError, strErr)
 
 		//continue
@@ -87,9 +95,16 @@ func InitialConnect(ctx context.Context, p2pHost host.Host, addrInfo peer.AddrIn
 func ReconnectPeersIfNeeded(ctx context.Context, p2pHost host.Host, peerID peer.ID, bufferInfo NodeBufferInfo, connectedBuffersOfBuyers *NodeBuffers, protocol protocol.ID) error {
 
 	if bufferInfo.LibP2PState == Connected {
-		return nil
+		// check if the adress book truly has a connection otherwise the state is not valid.
+		if p2pHost.Network().Connectedness(peerID) == network.Connected {
+			return nil
+		} else {
+			connectedBuffersOfBuyers.UpdateBufferLibP2PState(peerID, Reconnecting)
+
+		}
 	}
 	if bufferInfo.LibP2PState == ConnectionLost {
+		// remove the buffer, even if this means you loose the shared account id or last IP address.
 		connectedBuffersOfBuyers.RemoveBuffer(peerID)
 		return fmt.Errorf("%s:we will not try to connect to %s, he is explicitly disconnected and expect him to issue a new request", bufferInfo.LibP2PState, peerID)
 	}
@@ -160,7 +175,7 @@ func WriteAndFlushBuffer(bufferInfo NodeBufferInfo, peerID peer.ID, connectedBuf
 		return fmt.Errorf("%s:buffer writer is nil", ConnectionLostWriteError)
 	}
 	if bufferInfo.LibP2PState == Connected {
-		_, writeErr := bufferInfo.Writer.Write(append(data, []byte("\n")...))
+		_, writeErr := bufferInfo.Writer.Write(data)
 		if writeErr != nil {
 			//TODO: send a write error
 			connectedBuffersOfBuyers.UpdateBufferLibP2PState(peerID, ConnectionLost)
