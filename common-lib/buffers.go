@@ -55,6 +55,11 @@ func StateManagerInit(buyerOrSellerFlag string) {
 			NodeBuffersInstance.mu.Lock()
 			for peerID, bufferInfo := range NodeBuffersInstance.Buffers {
 				bufferInfo.LibP2PState = Connecting
+				bufferInfo.RendezvousState = NotInitiated
+				bufferInfo.LastConnectionAttempt = time.Time{}
+				bufferInfo.NextScheduleRequestTime = time.Time{}
+				bufferInfo.NoOfConnectionAttempts = 0
+				bufferInfo.NextScheduleRequestTime = time.Time{}
 				log.Printf("Setting LibP2PState to ConnectionLost for peer: %s", peerID)
 
 				// Persist the updated state
@@ -144,7 +149,7 @@ type TopicPostalEnvelope struct {
 type NodeBufferInfo struct {
 	Writer                         *bufio.Writer       `json:"-"`
 	StreamHandler                  *network.Stream     `json:"-"`
-	LastOtherSideMultiAddress      multiaddr.Multiaddr `json:"last_other_side_multi_address"`
+	LastOtherSideMultiAddress      string              `json:"last_other_side_multi_address"`
 	LibP2PState                    LibP2PState         `json:"lib_p2p_state"`
 	RendezvousState                RendezvousState     `json:"rendezvous_state"`
 	IsOtherSideValidAccount        bool                `json:"is_other_side_valid_account"`
@@ -220,6 +225,7 @@ func (sb *NodeBuffers) LoadState() error {
 
 		return b.ForEach(func(k, v []byte) error {
 			var info NodeBufferInfo
+
 			if err := json.Unmarshal(v, &info); err != nil {
 				return fmt.Errorf("failed to unmarshal data for key %s: %w", k, err)
 			}
@@ -253,7 +259,7 @@ func (sb *NodeBuffers) SetLastOtherSideMultiAddress(sellerID peer.ID, lastOtherS
 	defer sb.mu.Unlock()
 	info, exists := sb.Buffers[sellerID]
 	if exists {
-		info.LastOtherSideMultiAddress = lastOtherSideMultiAddress
+		info.LastOtherSideMultiAddress = lastOtherSideMultiAddress.String()
 	}
 }
 

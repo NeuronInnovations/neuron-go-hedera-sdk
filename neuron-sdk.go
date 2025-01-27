@@ -46,7 +46,7 @@ import (
 
 var fixPrivKey_g crypto.PrivKey
 
-var Version string = "0.0" // variable is set using a build flag
+var Version string
 
 func init() {
 
@@ -98,6 +98,7 @@ func init() {
 // connectivity-level validation (e.g., NAT traversal, peer discoverability), the implementor will
 // eventually be required to handle application-specific validation and logic at the dApp level.
 func LaunchSDK(
+	version string,
 	protocol protocol.ID,
 	keyAndLocationConfigurator func(envIsReady chan bool, envFile string) error,
 	buyerCase func(ctx context.Context, p2pHost host.Host, buffers *neuronbuffers.NodeBuffers),
@@ -107,6 +108,7 @@ func LaunchSDK(
 	// validatorCase func(ctx context.Context, p2pHost host.Host, buffers *neuronbuffers.NodeBuffers),
 ) {
 	ctx := context.Background()
+	Version = version
 	commonlib.MyProtocol = protocol
 
 	// enable persistence. TODO: use a flag to choose if you want to disable it. This is useful for stateless setups.

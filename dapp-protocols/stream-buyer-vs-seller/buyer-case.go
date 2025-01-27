@@ -362,7 +362,7 @@ func HandleBuyerCase(ctx context.Context, p2pHost host.Host, buyerCase func(ctx 
 						continue
 					} else {
 						a, b, _ := sellerBuffers.GetReconnectInfo(peerID)
-						fmt.Println("re-submit because is not too early", isTooEarly, a, b)
+						log.Println("re-submit because it's time now", isTooEarly, a, b)
 					}
 					sellerBuffers.IncrementReconnectAttempts(peerID)
 					secondExecError := hedera_helper.SendTransactionEnvelope(peerBuffer.RequestOrResponse)

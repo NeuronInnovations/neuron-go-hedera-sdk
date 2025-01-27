@@ -258,8 +258,8 @@ func SellerSendScheduledTransferRequest(
 
 	transferTx, err := hedera.NewTransferTransaction().
 		AddHbarTransfer(sharedAccID, hedera.HbarFrom(-0.1, hedera.HbarUnits.Hbar)).
-		AddHbarTransfer(toHederaParentID, hedera.HbarFrom(0.07, hedera.HbarUnits.Hbar)).
-		AddHbarTransfer(toHederaDeviceID, hedera.HbarFrom(0.03, hedera.HbarUnits.Hbar)).
+		AddHbarTransfer(toHederaParentID, hedera.HbarFrom(0.02, hedera.HbarUnits.Hbar)).
+		AddHbarTransfer(toHederaDeviceID, hedera.HbarFrom(0.08, hedera.HbarUnits.Hbar)).
 		// TODO: AddTokenTransfer() transfer tokens to  other fee and reward accounts.
 		SetTransactionMemo(uuid.New().String()).
 		FreezeWith(client)

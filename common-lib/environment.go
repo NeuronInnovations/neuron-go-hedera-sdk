@@ -82,7 +82,7 @@ func UpdateEnvVariable(key, value string, envFile string) error {
 	os.Setenv(key, value)
 	err = writeEnvFile(envFile, envMap)
 	if err != nil {
-		fmt.Println("Error writing .env file")
+		fmt.Println("Error writing .env file located at ", envFile, " error is", err)
 		return err
 	}
 
