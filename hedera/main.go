@@ -531,7 +531,7 @@ func createSharedAccount(buyer, seller, arbiter hedera.PublicKey, initialPayment
 	return hedera.NewAccountCreateTransaction().
 		SetKey(kl).
 		SetInitialBalance(
-			hedera.HbarFrom(float64(initialPayment), hedera.HbarUnits.Hbar),
+			hedera.HbarFrom(float64(initialPayment), hedera.HbarUnits.Millibar),
 		), nil
 
 }

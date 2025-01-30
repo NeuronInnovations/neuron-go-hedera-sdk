@@ -296,7 +296,7 @@ func HandleBuyerCase(ctx context.Context, p2pHost host.Host, buyerCase func(ctx 
 			os.Getenv("hedera_evm_id"),
 			keylib.ConverHederaPublicKeyToEthereunAddress(seller),
 			"e2436b1e019e993215e832762f9242020d199940", // that's the london address, yes; it's fixed for now but a parameter in env MyArbiterPublicKey in the future.
-			1, // price, every seller gets the same for now
+			100, // millibar  price, every seller gets the same for now
 		)
 		if err != nil {
 			return commonlib.TopicPostalEnvelope{}, err
