@@ -1,4 +1,4 @@
-module neuron/sdk
+module github.com/NeuronInnovations/go-adsb
 
 go 1.22.0
 
