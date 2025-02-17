@@ -112,7 +112,7 @@ func LaunchSDK(
 	commonlib.MyProtocol = protocol
 
 	// enable persistence. TODO: use a flag to choose if you want to disable it. This is useful for stateless setups.
-	commonlib.StateManagerInit(*commonlib.BuyerOrSellerFlag)
+	commonlib.StateManagerInit(*commonlib.BuyerOrSellerFlag, *commonlib.ClearCacheFlag)
 	defer func() {
 		if err := commonlib.CloseDB(*commonlib.BuyerOrSellerFlag); err != nil {
 			log.Printf("Failed to close database: %v", err)

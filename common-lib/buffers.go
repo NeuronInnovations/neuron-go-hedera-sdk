@@ -23,17 +23,38 @@ var db *bbolt.DB
 var NodeBuffersInstance *NodeBuffers
 
 // Initialize the database in the package init function
-func StateManagerInit(buyerOrSellerFlag string) {
+func StateManagerInit(buyerOrSellerFlag string, clearCacheFlag bool) {
 
-	dbPath := fmt.Sprintf("neuron-connections-%s.db", buyerOrSellerFlag)
+	// Put the BoltDB file in the OS temp directory, using buyerOrSellerFlag in the filename.
+	// This allows you to reuse the same DB on subsequent runs if the temp file still exists.
+	dbPath := fmt.Sprintf("%s/neuron-connections-%s.db", os.TempDir(), buyerOrSellerFlag)
+
+	// delete the db if the clearcache flag is set
+	if clearCacheFlag {
+		// Delete the database file if the reset flag is provided
+
+		if _, err := os.Stat(dbPath); err == nil {
+			err = os.Remove(dbPath)
+			if err != nil {
+				log.Fatalf("Failed to delete existing database: %v", err)
+			}
+			log.Println("Existing database deleted successfully.")
+		} else if !os.IsNotExist(err) {
+			log.Fatalf("Error checking database file: %v", err)
+		}
+
+	}
 
 	var err error
 	db, err = bbolt.Open(dbPath, 0600, nil)
+
 	if err != nil {
 		// If database initialization fails, log the error and proceed without persistence
-		log.Printf("Warning: failed to open BoltDB (%v). Continuing without persistence.", err)
+		log.Fatalf("Failed to open BoltDB at %s (%v). Continuing without persistence.", dbPath, err)
 		db = nil // Explicitly set db to nil to indicate no persistence
 	} else {
+		log.Printf("BoltDB opened successfully at: %s", dbPath)
+
 		// Initialize the database schema or buckets if needed
 		err = db.Update(func(tx *bbolt.Tx) error {
 			_, err := tx.CreateBucketIfNotExists([]byte("NodeBuffers"))
@@ -70,9 +91,9 @@ func StateManagerInit(buyerOrSellerFlag string) {
 			NodeBuffersInstance.mu.Unlock()
 
 			// Dump database to JSON for debugging
-			if err := NodeBuffersInstance.dumpToJSON(fmt.Sprintf("neuron-connections-startup-%s.json", buyerOrSellerFlag)); err != nil {
-				log.Printf("Warning: Failed to dump database to JSON: %v", err)
-			}
+			//if err := NodeBuffersInstance.dumpToJSON(fmt.Sprintf("neuron-connections-startup-%s.json", buyerOrSellerFlag)); err != nil {
+			//	log.Printf("Warning: Failed to dump database to JSON: %v", err)
+			//}
 
 		}
 	}
@@ -82,9 +103,9 @@ func StateManagerInit(buyerOrSellerFlag string) {
 func CloseDB(buyerOrSellerFlag string) error {
 	if db != nil {
 		// Dump database to JSON for debugging before closing
-		if err := NodeBuffersInstance.dumpToJSON(fmt.Sprintf("neuron-connections-shutdown-%s.json", buyerOrSellerFlag)); err != nil {
-			log.Printf("Warning: Failed to dump database to JSON on shutdown: %v", err)
-		}
+		//if err := NodeBuffersInstance.dumpToJSON(fmt.Sprintf("neuron-connections-shutdown-%s.json", buyerOrSellerFlag)); err != nil {
+		//	log.Printf("Warning: Failed to dump database to JSON on shutdown: %v", err)
+		//}
 		return db.Close()
 	}
 	return nil

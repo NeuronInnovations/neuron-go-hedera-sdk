@@ -55,7 +55,7 @@ func InitialConnect(ctx context.Context, p2pHost host.Host, addrInfo peer.AddrIn
 		//continue
 	}
 	fmt.Printf("😍😍 Stream connected and pumping %s -> %s ! 😍😍\n", addrInfo, p2pHost.ID())
-	streamWriter := bufio.NewWriter(s)
+	streamWriter := bufio.NewWriterSize(s, 100)
 
 	// start pass the map to the jetvision.
 	buyerBuffers.AddBuffer3(addrInfo.ID, streamWriter, SendOK, Connected)
@@ -137,7 +137,7 @@ func ReconnectPeersIfNeeded(ctx context.Context, p2pHost host.Host, peerID peer.
 
 	// Successfully reconnected
 	fmt.Printf("Stream reconnected to %s\n", peerID)
-	streamWriter := bufio.NewWriter(s)
+	streamWriter := bufio.NewWriterSize(s, 100)
 	connectedBuffersOfBuyers.AddBuffer3(peerID, streamWriter, ReceivedOK, Connected)
 	return nil
 }
@@ -187,6 +187,7 @@ func WriteAndFlushBuffer(bufferInfo NodeBufferInfo, peerID peer.ID, connectedBuf
 			}
 		}
 		// Flush the buffer
+
 		flushErr := bufferInfo.Writer.Flush()
 		if flushErr != nil {
 			//fmt.Println("Flush error: ", flushErr)
@@ -198,6 +199,7 @@ func WriteAndFlushBuffer(bufferInfo NodeBufferInfo, peerID peer.ID, connectedBuf
 				return fmt.Errorf("%s:error flushing buffer: %w", ConnectionLostFlushError, flushErr)
 			}
 		}
+
 		return nil
 	}
 	return fmt.Errorf("%s:buffer is not Connected %v", bufferInfo.LibP2PState, peerID)

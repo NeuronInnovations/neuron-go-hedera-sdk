@@ -43,6 +43,9 @@ var ListOfSellersSourceFlag *string
 // when the node is in buyer mode and when the ListOfSellersSourceFlag is set to "explorer".
 var RadiusFlag *int
 
+// ClearCacheFlag specifies whether the cache should be cleared before starting the node. Default is false.
+var ClearCacheFlag *bool
+
 func InitFlags() {
 	PeerOrRelayFlag = flag.String("mode", "peer", "Select peer, or relay")
 	ForceProtocolFlag = flag.String("force-protocol", "udp", "Force protocol: udp or tcp")
@@ -54,6 +57,7 @@ func InitFlags() {
 	MyPublicPortFlag = flag.String("my-public-port", "", "set my public port")
 	ListOfSellersSourceFlag = flag.String("list-of-sellers-source", "explorer", "set where the list of sellers is to be obtained from:'explorer' or 'env'")
 	RadiusFlag = flag.Int("radius", 1, "set radius in Km to restrict seller lat lon when in buyer mode")
+	ClearCacheFlag = flag.Bool("clear-cache", false, "set clear cache flag to delete cache be")
 	flag.CommandLine.ParseErrorsWhitelist.UnknownFlags = true
 	flag.Parse()
 }

@@ -131,13 +131,23 @@ type PeerInfo struct {
 	StdErrTopic uint64
 }
 
+// TODO: retry on failure. This one likes to return 502 bad gateway and eth rate limit exceeded.
+// however, currently we stop the world on failure but should keep retrying.
 func GetPeerInfo(hederaAccEvmAddress string) (PeerInfo, error) {
-	contractCaller := GetHRpcClient()
-	peerInfo, error := contractCaller.HederaAddressToPeer(
-		&bind.CallOpts{},
-		common.HexToAddress(hederaAccEvmAddress),
-	)
-	return peerInfo, error
+	var peerInfo PeerInfo
+	var err error
+	for i := 0; i < 5; i++ {
+		contractCaller := GetHRpcClient()
+		peerInfo, err = contractCaller.HederaAddressToPeer(
+			&bind.CallOpts{},
+			common.HexToAddress(hederaAccEvmAddress),
+		)
+		if err == nil {
+			return peerInfo, nil
+		}
+		log.Println("Error getting rpc peer info, retrying:", i, "th time")
+	}
+	return peerInfo, err
 }
 
 func GetAllPeers() ([]string, error) {
