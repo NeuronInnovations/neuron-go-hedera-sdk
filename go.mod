@@ -1,4 +1,4 @@
-module github.com/NeuronInnovations/go-adsb
+module github.com/NeuronInnovations/neuron-go-hedera-sdk
 
 go 1.22.0
 
