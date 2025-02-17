@@ -5,8 +5,9 @@ import (
 	"fmt"
 	"log"
 	"math/big"
-	"neuron/sdk/keylib"
 	"os"
+
+	"github.com/NeuronInnovations/neuron-go-hedera-sdk/keylib"
 
 	"github.com/ethereum/go-ethereum/accounts/abi/bind"
 	"github.com/ethereum/go-ethereum/common"

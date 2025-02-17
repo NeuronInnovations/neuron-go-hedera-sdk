@@ -6,11 +6,14 @@ import (
 	"fmt"
 	"log"
 
-	commonlib "neuron/sdk/common-lib"
-	"neuron/sdk/hederacontract"
-	"neuron/sdk/keylib"
 	"os"
 	"time"
+
+	"github.com/NeuronInnovations/neuron-go-hedera-sdk/keylib"
+
+	"github.com/NeuronInnovations/neuron-go-hedera-sdk/hederacontract"
+
+	commonlib "github.com/NeuronInnovations/neuron-go-hedera-sdk/common-lib"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/ethclient"

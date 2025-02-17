@@ -6,17 +6,25 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	commonlib "neuron/sdk/common-lib"
-	flags "neuron/sdk/common-lib"
-	neuronbuffers "neuron/sdk/common-lib"
-	hedera_helper "neuron/sdk/hedera"
-	"neuron/sdk/keylib"
-	"neuron/sdk/upnp"
-	validatorLib "neuron/sdk/validator-lib"
-	"neuron/sdk/whoami"
 	"os"
 	"strings"
 	"time"
+
+	"github.com/NeuronInnovations/neuron-go-hedera-sdk/whoami"
+
+	validatorLib "github.com/NeuronInnovations/neuron-go-hedera-sdk/validator-lib"
+
+	"github.com/NeuronInnovations/neuron-go-hedera-sdk/upnp"
+
+	"github.com/NeuronInnovations/neuron-go-hedera-sdk/keylib"
+
+	hedera_helper "github.com/NeuronInnovations/neuron-go-hedera-sdk/hedera"
+
+	neuronbuffers "github.com/NeuronInnovations/neuron-go-hedera-sdk/common-lib"
+
+	flags "github.com/NeuronInnovations/neuron-go-hedera-sdk/common-lib"
+
+	commonlib "github.com/NeuronInnovations/neuron-go-hedera-sdk/common-lib"
 
 	"github.com/hashgraph/hedera-sdk-go/v2"
 	"github.com/libp2p/go-libp2p/core/host"

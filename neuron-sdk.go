@@ -9,17 +9,20 @@ import (
 	"log"
 	_ "net/http/pprof"
 
-	commonlib "neuron/sdk/common-lib"
-	flags "neuron/sdk/common-lib"
-	neuronbuffers "neuron/sdk/common-lib"
+	neuronbuffers "github.com/NeuronInnovations/neuron-go-hedera-sdk/common-lib"
 
-	streambuyervsseller "neuron/sdk/dapp-protocols/stream-buyer-vs-seller"
-	hedera_helper "neuron/sdk/hedera"
-	"neuron/sdk/keylib"
+	flags "github.com/NeuronInnovations/neuron-go-hedera-sdk/common-lib"
 
-	"neuron/sdk/whoami"
+	commonlib "github.com/NeuronInnovations/neuron-go-hedera-sdk/common-lib"
+
+	streambuyervsseller "github.com/NeuronInnovations/neuron-go-hedera-sdk/dapp-protocols/stream-buyer-vs-seller"
+	hedera_helper "github.com/NeuronInnovations/neuron-go-hedera-sdk/hedera"
+	"github.com/NeuronInnovations/neuron-go-hedera-sdk/keylib"
+
 	"runtime"
 	"runtime/debug"
+
+	"github.com/NeuronInnovations/neuron-go-hedera-sdk/whoami"
 
 	"github.com/hashgraph/hedera-sdk-go/v2"
 	"github.com/libp2p/go-libp2p"
