@@ -263,7 +263,7 @@ func HandleBuyerCase(ctx context.Context, p2pHost host.Host, buyerCase func(ctx 
 									}
 
 									// if the radius flag is set then check if the seller is in the radius
-									if *flags.RadiusFlag != 0 {
+									if *flags.RadiusFlag > 0 {
 
 										centerLat := commonlib.MyLocation.Latitude
 										centerLon := commonlib.MyLocation.Longitude
@@ -278,7 +278,7 @@ func HandleBuyerCase(ctx context.Context, p2pHost host.Host, buyerCase func(ctx 
 											listOfSellers[seller] = true
 										}
 									} else { // no filtering by radius set.
-										listOfSellers[seller] = true
+										listOfSellers[seller] = true // include the seller in the list
 									}
 								}
 								// todo: deduplicate the list

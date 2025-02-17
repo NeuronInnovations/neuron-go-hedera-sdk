@@ -56,7 +56,7 @@ func InitFlags() {
 	MyPublicIpFlag = flag.String("my-public-ip", "", "set my public ip")
 	MyPublicPortFlag = flag.String("my-public-port", "", "set my public port")
 	ListOfSellersSourceFlag = flag.String("list-of-sellers-source", "explorer", "set where the list of sellers is to be obtained from:'explorer' or 'env'")
-	RadiusFlag = flag.Int("radius", 1, "set radius in Km to restrict seller lat lon when in buyer mode")
+	RadiusFlag = flag.Int("radius", -1, "set radius in Km to restrict seller lat lon when in buyer mode")
 	ClearCacheFlag = flag.Bool("clear-cache", false, "set clear cache flag to delete cache be")
 	flag.CommandLine.ParseErrorsWhitelist.UnknownFlags = true
 	flag.Parse()
