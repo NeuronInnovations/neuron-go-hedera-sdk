@@ -137,7 +137,7 @@ type PeerInfo struct {
 func GetPeerInfo(hederaAccEvmAddress string) (PeerInfo, error) {
 	var peerInfo PeerInfo
 	var err error
-	for i := 0; i < 5; i++ {
+	for i := 0; i < 25; i++ {
 		contractCaller := GetHRpcClient()
 		peerInfo, err = contractCaller.HederaAddressToPeer(
 			&bind.CallOpts{},
