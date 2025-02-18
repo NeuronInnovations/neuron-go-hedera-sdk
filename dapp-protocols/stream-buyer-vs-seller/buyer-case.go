@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/NeuronInnovations/neuron-go-hedera-sdk/whoami"
@@ -174,7 +175,10 @@ func HandleBuyerCase(ctx context.Context, p2pHost host.Host, buyerCase func(ctx 
 		Lon       float64
 	}
 
-	listOfSellers := make(map[Seller]bool)
+	var (
+		listOfSellers     = make(map[Seller]bool)
+		listOfSellersLock sync.RWMutex
+	)
 
 	// if the list of sellers source is the environment file the we get it from there (otherwise ask explorer)
 	if *flags.ListOfSellersSourceFlag == "env" {
@@ -204,7 +208,9 @@ func HandleBuyerCase(ctx context.Context, p2pHost host.Host, buyerCase func(ctx 
 						Lat:       heartbeatMessage.Location.Latitude,
 						Lon:       heartbeatMessage.Location.Longitude,
 					}
+					listOfSellersLock.Lock()
 					listOfSellers[seller] = true
+					listOfSellersLock.Unlock()
 				}
 			} else {
 				log.Fatal("Node heartbeat is not ok. Provide a list where every single node has a heartbeat:  ", seller, peerInfo)
@@ -275,10 +281,14 @@ func HandleBuyerCase(ctx context.Context, p2pHost host.Host, buyerCase func(ctx 
 										_, distanceKm := haversine.Distance(center, farPoint)
 										// check if the distance is less than the radius
 										if int(distanceKm) < *radius {
+											listOfSellersLock.Lock()
 											listOfSellers[seller] = true
+											listOfSellersLock.Unlock()
 										}
 									} else { // no filtering by radius set.
-										listOfSellers[seller] = true // include the seller in the list
+										listOfSellersLock.Lock()
+										listOfSellers[seller] = true
+										listOfSellersLock.Unlock()
 									}
 								}
 								// todo: deduplicate the list
@@ -292,7 +302,7 @@ func HandleBuyerCase(ctx context.Context, p2pHost host.Host, buyerCase func(ctx 
 	}
 
 	/*
-		Every 20 seconds we will be handling every seller indivudually.
+		Every 60 seconds we will be handling every seller indivudually.
 		- We want to send him a request for service if we have not done so before
 		- We want to check if the seller has established a connection with us (after a request was sent)
 		- We want to check if a seller has lost a connection when there previously was one and send him a re-request, which is the same as the initial request but with nack-noConnection in front of MessageType
@@ -312,107 +322,118 @@ func HandleBuyerCase(ctx context.Context, p2pHost host.Host, buyerCase func(ctx 
 		return *res, err
 	}
 
-	for {
+	go func() {
+		for {
+			listOfSellersLock.RLock()                            // Lock before reading the map
+			sellersCopy := make([]Seller, 0, len(listOfSellers)) // Slice to store copied keys
 
-		for seller := range listOfSellers {
-
-			sellerEvnAddress := keylib.ConverHederaPublicKeyToEthereunAddress(seller.PublicKey)
-			peerIDStr := keylib.ConvertHederaPublicKeyToPeerID(seller.PublicKey)
-			peerID, _ := peer.Decode(peerIDStr)
-			perrInfo, err := hedera_helper.GetPeerInfo(sellerEvnAddress)
-
-			if err != nil {
-				continue
+			// Copy the keys (Seller structs) into the slice
+			for seller := range listOfSellers {
+				sellersCopy = append(sellersCopy, seller)
 			}
-			if !perrInfo.Available {
-				continue
-			}
+			listOfSellersLock.RUnlock() // Unlock after copying
 
-			peerBuffer, peerHasBuffer := sellerBuffers.GetBuffer(peerID)
+			for _, seller := range sellersCopy {
 
-			if peerHasBuffer && !peerBuffer.IsOtherSideValidAccount {
-				fmt.Printf("skipping invalid seller: evm address %s ", sellerEvnAddress)
-				continue
-			}
+				sellerEvnAddress := keylib.ConverHederaPublicKeyToEthereunAddress(seller.PublicKey)
+				peerIDStr := keylib.ConvertHederaPublicKeyToPeerID(seller.PublicKey)
+				peerID, _ := peer.Decode(peerIDStr)
+				perrInfo, err := hedera_helper.GetPeerInfo(sellerEvnAddress)
 
-			if peerHasBuffer && peerBuffer.NextScheduleRequestTime.After(time.Now()) {
-				continue
-			}
+				if err != nil {
+					continue
+				}
+				if !perrInfo.Available {
+					continue
+				}
 
-			//TODO: check if the remote peer has a heartbeat in the past 5 minutes
+				peerBuffer, peerHasBuffer := sellerBuffers.GetBuffer(peerID)
 
-			conns := p2pHost.Network().ConnsToPeer(peerID)
+				if peerHasBuffer && !peerBuffer.IsOtherSideValidAccount {
+					fmt.Printf("skipping invalid seller: evm address %s ", sellerEvnAddress)
+					continue
+				}
 
-			if len(conns) == 0 {
+				if peerHasBuffer && peerBuffer.NextScheduleRequestTime.After(time.Now()) {
+					continue
+				}
 
-				if !peerHasBuffer { // no cons and never requested
-					envelope, setupErr := prepareServiceRequestMsg(seller.PublicKey)
-					if setupErr != nil {
-						sellerBuffers.AddBuffer2(peerID, envelope, false, commonlib.NotInitiated, neuronbuffers.LibP2PState(commonlib.BadMessageError))
-						log.Printf("💀 envelope setup error; seller %s will be blacklisted, err: %v \n", sellerEvnAddress, setupErr)
-						hedera_helper.SendSelfErrorMessage(neuronbuffers.BadMessageError, "Could not create envelope for: "+sellerEvnAddress, commonlib.DoNothing)
+				//TODO: check if the remote peer has a heartbeat in the past 5 minutes
+
+				conns := p2pHost.Network().ConnsToPeer(peerID)
+
+				if len(conns) == 0 {
+
+					if !peerHasBuffer { // no cons and never requested
+						envelope, setupErr := prepareServiceRequestMsg(seller.PublicKey)
+						if setupErr != nil {
+							sellerBuffers.AddBuffer2(peerID, envelope, false, commonlib.NotInitiated, neuronbuffers.LibP2PState(commonlib.BadMessageError))
+							log.Printf("💀 envelope setup error; seller %s will be blacklisted, err: %v \n", sellerEvnAddress, setupErr)
+							hedera_helper.SendSelfErrorMessage(neuronbuffers.BadMessageError, "Could not create envelope for: "+sellerEvnAddress, commonlib.DoNothing)
+							continue
+						}
+
+						sellerBuffers.IncrementReconnectAttempts(peerID)
+						if execErr := hedera_helper.SendTransactionEnvelope(envelope); execErr != nil {
+							// has errors
+							sellerBuffers.AddBuffer2(peerID, envelope, true, commonlib.SendFail, commonlib.Connecting)
+							log.Printf("💀 send hedera transaction envelope error %s, will allow to try later %v \n", sellerEvnAddress, setupErr)
+							hedera_helper.SendSelfErrorMessage(neuronbuffers.ServiceError, "Could not send the reqquest to: "+sellerEvnAddress, commonlib.DoNothing)
+							continue
+						}
+						// has no errors
+						sellerBuffers.AddBuffer2(peerID, envelope, true, commonlib.SendOK, commonlib.Connecting)
+
+					} else { // have buffer,  no cons and requested before: re-submit for up to backoff
+						if isTooEarly, _ := commonlib.IsRequestTooEarly(sellerBuffers, peerID); isTooEarly {
+							continue
+						} else {
+							a, b, _ := sellerBuffers.GetReconnectInfo(peerID)
+							log.Println("re-submit because it's time now", isTooEarly, a, b)
+						}
+						sellerBuffers.IncrementReconnectAttempts(peerID)
+						secondExecError := hedera_helper.SendTransactionEnvelope(peerBuffer.RequestOrResponse)
+						if secondExecError != nil {
+							log.Printf("💀-2  skip that seller %s because ExecuteHederaTransaction error: %v", sellerEvnAddress, secondExecError)
+							// TODO: 💥 tell to myself that I could not send the transaction to the other side
+							hedera_helper.SendSelfErrorMessage(neuronbuffers.ServiceError, "Could not send the reqquest to: "+sellerEvnAddress, commonlib.DoNothing)
+							sellerBuffers.UpdateBufferRendezvousState(peerID, commonlib.SendFail)
+							sellerBuffers.UpdateBufferLibP2PState(peerID, commonlib.CanNotConnectUnknownReason)
+							continue
+						}
+						sellerBuffers.UpdateBufferRendezvousState(peerID, commonlib.SendOK)
+						sellerBuffers.UpdateBufferLibP2PState(peerID, commonlib.Connecting)
+					}
+				} else { // there are cons
+					if !peerHasBuffer {
+						// it's possible to not have a buffer when you reboot but people still talk to you and that's why you have cons.
+						// just close those cons and issue a new request, you can be lazy and let the loop do that in the next iteration.
+						fmt.Println("I am connected but have no buffer. .. i'll just hang around for the loop to issue a fresh request ", peerID)
+						p2pHost.Network().ClosePeer(peerID)
 						continue
 					}
 
-					sellerBuffers.IncrementReconnectAttempts(peerID)
-					if execErr := hedera_helper.SendTransactionEnvelope(envelope); execErr != nil {
-						// has errors
-						sellerBuffers.AddBuffer2(peerID, envelope, true, commonlib.SendFail, commonlib.Connecting)
-						log.Printf("💀 send hedera transaction envelope error %s, will allow to try later %v \n", sellerEvnAddress, setupErr)
-						hedera_helper.SendSelfErrorMessage(neuronbuffers.ServiceError, "Could not send the reqquest to: "+sellerEvnAddress, commonlib.DoNothing)
-						continue
+					streams := 0
+					//log.Println("This one has cons", conns)
+					for _, conn := range conns {
+						streams += len(conn.GetStreams())
 					}
-					// has no errors
-					sellerBuffers.AddBuffer2(peerID, envelope, true, commonlib.SendOK, commonlib.Connecting)
-
-				} else { // have buffer,  no cons and requested before: re-submit for up to backoff
-					if isTooEarly, _ := commonlib.IsRequestTooEarly(sellerBuffers, peerID); isTooEarly {
+					if streams == 0 { // there are cons but no streams
+						log.Println("I am connected but have no streams. .. i'll just hang around ", peerID, streams)
 						continue
 					} else {
-						a, b, _ := sellerBuffers.GetReconnectInfo(peerID)
-						log.Println("re-submit because it's time now", isTooEarly, a, b)
-					}
-					sellerBuffers.IncrementReconnectAttempts(peerID)
-					secondExecError := hedera_helper.SendTransactionEnvelope(peerBuffer.RequestOrResponse)
-					if secondExecError != nil {
-						log.Printf("💀-2  skip that seller %s because ExecuteHederaTransaction error: %v", sellerEvnAddress, secondExecError)
-						// TODO: 💥 tell to myself that I could not send the transaction to the other side
-						hedera_helper.SendSelfErrorMessage(neuronbuffers.ServiceError, "Could not send the reqquest to: "+sellerEvnAddress, commonlib.DoNothing)
-						sellerBuffers.UpdateBufferRendezvousState(peerID, commonlib.SendFail)
-						sellerBuffers.UpdateBufferLibP2PState(peerID, commonlib.CanNotConnectUnknownReason)
-						continue
-					}
-					sellerBuffers.UpdateBufferRendezvousState(peerID, commonlib.SendOK)
-					sellerBuffers.UpdateBufferLibP2PState(peerID, commonlib.Connecting)
-				}
-			} else { // there are cons
-				if !peerHasBuffer {
-					// it's possible to not have a buffer when you reboot but people still talk to you and that's why you have cons.
-					// just close those cons and issue a new request, you can be lazy and let the loop do that in the next iteration.
-					fmt.Println("I am connected but have no buffer. .. i'll just hang around for the loop to issue a fresh request ", peerID)
-					p2pHost.Network().ClosePeer(peerID)
-					continue
-				}
+						sellerBuffers.UpdateBufferRendezvousState(peerID, commonlib.SendOK)
+						sellerBuffers.UpdateBufferLibP2PState(peerID, commonlib.Connected)
+						sellerBuffers.SetLastOtherSideMultiAddress(peerID, conns[0].RemoteMultiaddr())
 
-				streams := 0
-				//log.Println("This one has cons", conns)
-				for _, conn := range conns {
-					streams += len(conn.GetStreams())
-				}
-				if streams == 0 { // there are cons but no streams
-					log.Println("I am connected but have no streams. .. i'll just hang around ", peerID, streams)
-					continue
-				} else {
-					sellerBuffers.UpdateBufferRendezvousState(peerID, commonlib.SendOK)
-					sellerBuffers.UpdateBufferLibP2PState(peerID, commonlib.Connected)
-					sellerBuffers.SetLastOtherSideMultiAddress(peerID, conns[0].RemoteMultiaddr())
+					}
+				} // end if there are conns
 
-				}
-			} // end if there are conns
+			}
+
+			time.Sleep(60 * time.Second)
 		} // end for
-
-		time.Sleep(20 * time.Second)
-	} // end for
+	}()
 
 }
 

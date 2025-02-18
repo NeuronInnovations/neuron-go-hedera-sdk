@@ -31,6 +31,7 @@ func InitialConnect(ctx context.Context, p2pHost host.Host, addrInfo peer.AddrIn
 				return nil
 			}
 		}
+		log.Println("the buffer is there but the state is not connected, we will try to reconnect")
 	}
 
 	// now there are two cases to test.
@@ -45,6 +46,7 @@ func InitialConnect(ctx context.Context, p2pHost host.Host, addrInfo peer.AddrIn
 	}
 
 	fmt.Println("connected, create a stream ", addrInfo.ID)
+	log.Println("connect and open stream")
 	// --------  stuck here
 	s, strErr := p2pHost.NewStream(ctx, addrInfo.ID, protocol)
 	if strErr != nil {
