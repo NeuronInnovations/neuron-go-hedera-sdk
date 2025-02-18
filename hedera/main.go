@@ -328,26 +328,30 @@ func BuyerCounterSignSchedule(scheduleID hedera.ScheduleID) error {
 	return sigerr
 }
 
-func PeerSendErrorMessage(otherSideStdIn hedera.TopicID, errorType commonlib.ErrorType, errorMessage string, recoverAction commonlib.RecoverAction) error {
-	client := GetHederaClientUsingEnv()
-	defer client.Close()
-	m := &commonlib.NeuronPeerErrorMsg{
-		MessageType:   "peerError",
-		StdInTopic:    commonlib.MyStdIn.Topic,
-		PublicKey:     commonlib.MyPublicKey.StringRaw(),
-		ErrorType:     errorType,
-		ErrorMessage:  errorMessage,
-		RecoverAction: recoverAction,
-		Version:       "0.1",
-	}
+func PeerSendErrorMessage(otherSideStdIn hedera.TopicID, errorType commonlib.ErrorType, errorMessage string, recoverAction commonlib.RecoverAction) {
+	go func() {
+		client := GetHederaClientUsingEnv()
+		defer client.Close()
+		m := &commonlib.NeuronPeerErrorMsg{
+			MessageType:   "peerError",
+			StdInTopic:    commonlib.MyStdIn.Topic,
+			PublicKey:     commonlib.MyPublicKey.StringRaw(),
+			ErrorType:     errorType,
+			ErrorMessage:  errorMessage,
+			RecoverAction: recoverAction,
+			Version:       "0.1",
+		}
 
-	jsonBytes, _ := json.Marshal(m)
+		jsonBytes, _ := json.Marshal(m)
 
-	_, err := hedera.NewTopicMessageSubmitTransaction().
-		SetMessage(jsonBytes).
-		SetTopicID(otherSideStdIn).
-		Execute(client)
-	return err
+		_, err := hedera.NewTopicMessageSubmitTransaction().
+			SetMessage(jsonBytes).
+			SetTopicID(otherSideStdIn).
+			Execute(client)
+		if err != nil {
+			log.Println(err)
+		}
+	}()
 }
 
 func SendSelfErrorMessage(errorType commonlib.ErrorType, errorMessage string, recoverAction commonlib.RecoverAction) error {

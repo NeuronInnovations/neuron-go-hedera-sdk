@@ -66,7 +66,7 @@ func HandleSellerCase(ctx context.Context, p2pHost host.Host, protocol protocol.
 					fmt.Println("Successfully converted map to NeuronServiceRequestMsg:", requestMsgFromOtherSide)
 				default:
 					// Handle unexpected types
-					log.Panicf("Unexpected Message type: %T", message)
+					log.Printf("Unexpected Message type: %T; the raw message was %s", message, message)
 				}
 				fmt.Println("Send invoice to: ", peerID)
 				sharedAccID, err := hedera.AccountIDFromString(fmt.Sprintf("0.0.%d", requestMsgFromOtherSide.SharedAccID))

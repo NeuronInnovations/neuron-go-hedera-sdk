@@ -57,7 +57,8 @@ func InitialConnect(ctx context.Context, p2pHost host.Host, addrInfo peer.AddrIn
 		//continue
 	}
 	fmt.Printf("😍😍 Stream connected and pumping %s -> %s ! 😍😍\n", addrInfo, p2pHost.ID())
-	streamWriter := bufio.NewWriterSize(s, 100)
+	//streamWriter := bufio.NewWriterSize(s, 100)
+	streamWriter := bufio.NewWriter(s)
 
 	// start pass the map to the jetvision.
 	buyerBuffers.AddBuffer3(addrInfo.ID, streamWriter, SendOK, Connected)
@@ -95,7 +96,6 @@ func InitialConnect(ctx context.Context, p2pHost host.Host, addrInfo peer.AddrIn
 // This function complements the `InitialConnect` logic by ensuring resiliency in maintaining peer
 // connections, particularly for long-lived seller nodes communicating with buyers.
 func ReconnectPeersIfNeeded(ctx context.Context, p2pHost host.Host, peerID peer.ID, bufferInfo NodeBufferInfo, connectedBuffersOfBuyers *NodeBuffers, protocol protocol.ID) error {
-
 	if bufferInfo.LibP2PState == Connected {
 		// check if the adress book truly has a connection otherwise the state is not valid.
 		if p2pHost.Network().Connectedness(peerID) == network.Connected {
@@ -138,8 +138,10 @@ func ReconnectPeersIfNeeded(ctx context.Context, p2pHost host.Host, peerID peer.
 	}
 
 	// Successfully reconnected
-	fmt.Printf("Stream reconnected to %s\n", peerID)
-	streamWriter := bufio.NewWriterSize(s, 100)
+	fmt.Printf("😍 -> Stream reconnected to %s\n", peerID)
+	//streamWriter := bufio.NewWriterSize(s, 100)
+	streamWriter := bufio.NewWriter(s)
+
 	connectedBuffersOfBuyers.AddBuffer3(peerID, streamWriter, ReceivedOK, Connected)
 	return nil
 }
@@ -189,18 +191,19 @@ func WriteAndFlushBuffer(bufferInfo NodeBufferInfo, peerID peer.ID, connectedBuf
 			}
 		}
 		// Flush the buffer
-
-		flushErr := bufferInfo.Writer.Flush()
-		if flushErr != nil {
-			//fmt.Println("Flush error: ", flushErr)
-			connectedBuffersOfBuyers.UpdateBufferLibP2PState(peerID, ConnectionLost)
-			connectedBuffersOfBuyers.IncrementReconnectAttempts(peerID)
-			if tooEarly, tooEarlyError := IsRequestTooEarly(connectedBuffersOfBuyers, peerID); tooEarly {
-				return tooEarlyError
-			} else {
-				return fmt.Errorf("%s:error flushing buffer: %w", ConnectionLostFlushError, flushErr)
+		/*
+			flushErr := bufferInfo.Writer.Flush()
+			if flushErr != nil {
+				//fmt.Println("Flush error: ", flushErr)
+				connectedBuffersOfBuyers.UpdateBufferLibP2PState(peerID, ConnectionLost)
+				connectedBuffersOfBuyers.IncrementReconnectAttempts(peerID)
+				if tooEarly, tooEarlyError := IsRequestTooEarly(connectedBuffersOfBuyers, peerID); tooEarly {
+					return tooEarlyError
+				} else {
+					return fmt.Errorf("%s:error flushing buffer: %w", ConnectionLostFlushError, flushErr)
+				}
 			}
-		}
+		*/
 
 		return nil
 	}
