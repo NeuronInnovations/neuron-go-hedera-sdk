@@ -1,7 +1,6 @@
 package commonlib
 
 import (
-	"bufio"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -168,7 +167,7 @@ type TopicPostalEnvelope struct {
 
 // NodeBufferInfo holds runtime info related to a remote peer.
 type NodeBufferInfo struct {
-	Writer                         *bufio.Writer       `json:"-"`
+	Writer                         network.Stream      `json:"-"` //  TODO: only one needed
 	StreamHandler                  *network.Stream     `json:"-"`
 	LastOtherSideMultiAddress      string              `json:"last_other_side_multi_address"`
 	LibP2PState                    LibP2PState         `json:"lib_p2p_state"`
@@ -304,7 +303,7 @@ func (sb *NodeBuffers) AddBuffer2(sellerID peer.ID, request TopicPostalEnvelope,
 }
 
 // AddBuffer3 adds a new bufio.Writer for a buyerID with a specified state and a bufio.Writer
-func (bb *NodeBuffers) AddBuffer3(buyerID peer.ID, streamWriter *bufio.Writer, rendezvousState RendezvousState, libP2PState LibP2PState) {
+func (bb *NodeBuffers) AddBuffer3(buyerID peer.ID, streamWriter network.Stream, rendezvousState RendezvousState, libP2PState LibP2PState) {
 	bb.mu.Lock()
 	defer bb.mu.Unlock()
 	bb.Buffers[buyerID] = &NodeBufferInfo{
@@ -440,17 +439,6 @@ func (bb *NodeBuffers) GetReconnectInfo(buyerID peer.ID) (int, time.Time, bool) 
 		return 0, time.Time{}, false
 	}
 	return info.NoOfConnectionAttempts, info.LastConnectionAttempt, true
-}
-
-// GetBufferList returns a copy of a list of all buffers to iterate over
-func (bb *NodeBuffers) GetBufferList() []*bufio.Writer {
-	bb.mu.Lock()
-	defer bb.mu.Unlock()
-	bufferList := make([]*bufio.Writer, 0, len(bb.Buffers))
-	for _, info := range bb.Buffers {
-		bufferList = append(bufferList, info.Writer)
-	}
-	return bufferList
 }
 
 // GetBufferMap returns a copy of the internal map of buffers and their states

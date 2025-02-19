@@ -1,11 +1,11 @@
 package commonlib
 
 import (
-	"bufio"
 	"context"
 	"fmt"
 	"log"
 	"math"
+	"net"
 
 	_ "net/http/pprof"
 
@@ -18,6 +18,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/core/protocol"
+	"golang.org/x/time/rate"
 )
 
 func InitialConnect(ctx context.Context, p2pHost host.Host, addrInfo peer.AddrInfo, buyerBuffers *NodeBuffers, protocol protocol.ID) error {
@@ -58,10 +59,10 @@ func InitialConnect(ctx context.Context, p2pHost host.Host, addrInfo peer.AddrIn
 	}
 	fmt.Printf("😍😍 Stream connected and pumping %s -> %s ! 😍😍\n", addrInfo, p2pHost.ID())
 	//streamWriter := bufio.NewWriterSize(s, 100)
-	streamWriter := bufio.NewWriter(s)
+	//streamWriter := bufio.NewWriter(s)
 
 	// start pass the map to the jetvision.
-	buyerBuffers.AddBuffer3(addrInfo.ID, streamWriter, SendOK, Connected)
+	buyerBuffers.AddBuffer3(addrInfo.ID, s, SendOK, Connected)
 
 	return nil
 
@@ -140,9 +141,9 @@ func ReconnectPeersIfNeeded(ctx context.Context, p2pHost host.Host, peerID peer.
 	// Successfully reconnected
 	fmt.Printf("😍 -> Stream reconnected to %s\n", peerID)
 	//streamWriter := bufio.NewWriterSize(s, 100)
-	streamWriter := bufio.NewWriter(s)
+	//streamWriter := bufio.NewWriter(s)
 
-	connectedBuffersOfBuyers.AddBuffer3(peerID, streamWriter, ReceivedOK, Connected)
+	connectedBuffersOfBuyers.AddBuffer3(peerID, s, ReceivedOK, Connected)
 	return nil
 }
 
@@ -172,38 +173,40 @@ func IsRequestTooEarly(connectedBuffersOfBuyers *NodeBuffers, peerID peer.ID) (b
 }
 
 // function exported to SDK user to put data down the stream.
+var writeLimiter = rate.NewLimiter(rate.Limit(1000), 200) // 100 writes per second, burst size 20
 func WriteAndFlushBuffer(bufferInfo NodeBufferInfo, peerID peer.ID, connectedBuffersOfBuyers *NodeBuffers, data []byte) error {
-	// Attempt to write to the buffer
 	if bufferInfo.Writer == nil {
 		bufferInfo.LibP2PState = ConnectionLost
-		return fmt.Errorf("%s:buffer writer is nil", ConnectionLostWriteError)
+		return fmt.Errorf("%s:stream handler is nil", ConnectionLostWriteError)
 	}
+
 	if bufferInfo.LibP2PState == Connected {
+		// ✅ Set deadline to prevent blocking writes
+		bufferInfo.Writer.SetWriteDeadline(time.Now().Add(10 * time.Millisecond))
+
+		// ✅ Rate-limit writes to match receiver's capacity
+		if !writeLimiter.Allow() {
+			log.Println("Write skipped: rate limit exceeded")
+			return nil
+		}
+
+		writeStart := time.Now()
 		_, writeErr := bufferInfo.Writer.Write(data)
+		writeDuration := time.Since(writeStart)
+
+		if writeDuration > 10*time.Millisecond {
+			log.Printf("⚠️ High write latency: %v. Receiver may be slow.", writeDuration)
+		}
+
 		if writeErr != nil {
-			//TODO: send a write error
+			if netErr, ok := writeErr.(net.Error); ok && netErr.Timeout() {
+				log.Printf("Write skipped: Receiver not ready (timeout)")
+				return nil
+			}
 			connectedBuffersOfBuyers.UpdateBufferLibP2PState(peerID, ConnectionLost)
 			connectedBuffersOfBuyers.IncrementReconnectAttempts(peerID)
-			if tooEarly, tooEarlyError := IsRequestTooEarly(connectedBuffersOfBuyers, peerID); tooEarly {
-				return tooEarlyError
-			} else {
-				return fmt.Errorf("%s:error writing to buffer: %w", ConnectionLostWriteError, writeErr)
-			}
+			return fmt.Errorf("%s:error writing to stream: %w", ConnectionLostWriteError, writeErr)
 		}
-		// Flush the buffer
-		/*
-			flushErr := bufferInfo.Writer.Flush()
-			if flushErr != nil {
-				//fmt.Println("Flush error: ", flushErr)
-				connectedBuffersOfBuyers.UpdateBufferLibP2PState(peerID, ConnectionLost)
-				connectedBuffersOfBuyers.IncrementReconnectAttempts(peerID)
-				if tooEarly, tooEarlyError := IsRequestTooEarly(connectedBuffersOfBuyers, peerID); tooEarly {
-					return tooEarlyError
-				} else {
-					return fmt.Errorf("%s:error flushing buffer: %w", ConnectionLostFlushError, flushErr)
-				}
-			}
-		*/
 
 		return nil
 	}
