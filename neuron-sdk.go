@@ -2,12 +2,10 @@ package sdk
 
 import (
 	"context"
-
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
-	_ "net/http/pprof"
 
 	neuronbuffers "github.com/NeuronInnovations/neuron-go-hedera-sdk/common-lib"
 

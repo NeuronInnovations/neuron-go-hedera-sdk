@@ -18,7 +18,6 @@ import (
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/core/protocol"
-	"golang.org/x/time/rate"
 )
 
 func InitialConnect(ctx context.Context, p2pHost host.Host, addrInfo peer.AddrInfo, buyerBuffers *NodeBuffers, protocol protocol.ID) error {
@@ -135,6 +134,10 @@ func ReconnectPeersIfNeeded(ctx context.Context, p2pHost host.Host, peerID peer.
 	if err != nil {
 		log.Println("Stream creation failed to", peerID, ":", err)
 		connectedBuffersOfBuyers.IncrementReconnectAttempts(peerID)
+
+		if bufferInfo.NoOfConnectionAttempts > 20 {
+			connectedBuffersOfBuyers.RemoveBuffer(peerID)
+		}
 		return fmt.Errorf("%s:stream creation failed: %w", CanNotConnectStreamError, err)
 	}
 
@@ -172,37 +175,41 @@ func IsRequestTooEarly(connectedBuffersOfBuyers *NodeBuffers, peerID peer.ID) (b
 	return false, nil
 }
 
-// function exported to SDK user to put data down the stream.
-var writeLimiter = rate.NewLimiter(rate.Limit(1000), 200) // 100 writes per second, burst size 20
-func WriteAndFlushBuffer(bufferInfo NodeBufferInfo, peerID peer.ID, connectedBuffersOfBuyers *NodeBuffers, data []byte) error {
+// connection.go (commonlib)
+// TODO: reate limiter needs to come from a parameter so hat it belongs to the seller thread
+//var writeLimiter = rate.NewLimiter(rate.Limit(1000), 200) // 1000 writes/sec, burst=200
+
+func WriteAndFlushBuffer(
+	bufferInfo NodeBufferInfo,
+	peerID peer.ID,
+	connectedBuffersOfBuyers *NodeBuffers,
+	data []byte,
+) error {
 	if bufferInfo.Writer == nil {
 		bufferInfo.LibP2PState = ConnectionLost
 		return fmt.Errorf("%s:stream handler is nil", ConnectionLostWriteError)
 	}
 
 	if bufferInfo.LibP2PState == Connected {
-		// ✅ Set deadline to prevent blocking writes
+		// Short write deadline to avoid blocking too long
 		bufferInfo.Writer.SetWriteDeadline(time.Now().Add(10 * time.Millisecond))
-
-		// ✅ Rate-limit writes to match receiver's capacity
-		if !writeLimiter.Allow() {
-			log.Println("Write skipped: rate limit exceeded")
-			return nil
-		}
 
 		writeStart := time.Now()
 		_, writeErr := bufferInfo.Writer.Write(data)
 		writeDuration := time.Since(writeStart)
 
+		// Log a warning if we took >10ms to return from the write call
 		if writeDuration > 10*time.Millisecond {
 			log.Printf("⚠️ High write latency: %v. Receiver may be slow.", writeDuration)
 		}
 
 		if writeErr != nil {
+			// If we timed out, treat that as "not ready yet"
 			if netErr, ok := writeErr.(net.Error); ok && netErr.Timeout() {
-				log.Printf("Write skipped: Receiver not ready (timeout)")
+				log.Printf("Write skipped: Receiver not ready (timeout).")
 				return nil
 			}
+			// Otherwise, update state & increment reconnect attempts
 			connectedBuffersOfBuyers.UpdateBufferLibP2PState(peerID, ConnectionLost)
 			connectedBuffersOfBuyers.IncrementReconnectAttempts(peerID)
 			return fmt.Errorf("%s:error writing to stream: %w", ConnectionLostWriteError, writeErr)
