@@ -200,7 +200,7 @@ func WriteAndFlushBuffer(
 
 		// Log a warning if we took >10ms to return from the write call
 		if writeDuration > 10*time.Millisecond {
-			log.Printf("⚠️ High write latency: %v. Receiver may be slow.", writeDuration)
+			//log.Printf("⚠️ High write latency: %v. Receiver may be slow.", writeDuration)
 		}
 
 		if writeErr != nil {
