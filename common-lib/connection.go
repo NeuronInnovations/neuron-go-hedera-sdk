@@ -22,6 +22,9 @@ import (
 
 func InitialConnect(ctx context.Context, p2pHost host.Host, addrInfo peer.AddrInfo, buyerBuffers *NodeBuffers, protocol protocol.ID) error {
 
+	// show address info
+	fmt.Println("address info of initial connect", addrInfo)
+
 	info, exists := buyerBuffers.GetBuffer(addrInfo.ID)
 
 	if exists && info.LibP2PState == Connected {
@@ -50,7 +53,15 @@ func InitialConnect(ctx context.Context, p2pHost host.Host, addrInfo peer.AddrIn
 	log.Println("connect and open stream")
 	// --------  stuck here
 
-	s, strErr := p2pHost.NewStream(ctx, addrInfo.ID, protocol)
+	// Create a context with a timeout for the NewStream operation
+	streamCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	for _, conn := range p2pHost.Network().ConnsToPeer(addrInfo.ID) {
+		log.Println("Connection to %s open with muxer: %s", addrInfo.ID, conn.ConnState())
+	}
+
+	s, strErr := p2pHost.NewStream(streamCtx, addrInfo.ID, protocol)
 	if strErr != nil {
 		log.Printf("First attempt failed, resetting connection and retrying: %v", strErr)
 		p2pHost.Network().ClosePeer(addrInfo.ID)
@@ -241,8 +252,9 @@ func HolePunchConnectIfNotConnected(ctx context.Context, p2pHost host.Host, pi p
 	dialCtx, cancel := context.WithTimeout(forceDirectConnCtx, time.Second*30)
 	defer cancel()
 	if err := p2pHost.Connect(dialCtx, pi); err != nil {
+		log.Println("hole punch failed to connect to ", pi.ID)
 		return err
 	}
-	//}
+	log.Println("hole punch connected to ", pi.ID)
 	return nil
 }

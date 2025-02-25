@@ -37,6 +37,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/event"
 	"github.com/libp2p/go-libp2p/core/host"
+	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/core/protocol"
 	"github.com/libp2p/go-libp2p/p2p/security/noise"
@@ -251,7 +252,13 @@ func LaunchSDK(
 					log.Println("local reachability changed", e.Reachability.String())
 				case event.EvtNATDeviceTypeChanged:
 					log.Println("nat device type changed", e.TransportProtocol.String(), e.NatDeviceType.String())
+				case event.EvtPeerConnectednessChanged:
+					log.Println("peer connectednes", e.Connectedness.String())
+				case event.EvtPeerIdentificationCompleted:
+					log.Println("peer identification completed", e.Peer)
+
 				default:
+					log.Println("unknown event", e)
 				}
 			}
 		}()
@@ -275,6 +282,16 @@ func LaunchSDK(
 	} // switch end
 
 	fmt.Printf("The node is up and tho peerID is %v\n", p2pHost.ID())
+
+	// Monitor connection events
+	p2pHost.Network().Notify(&network.NotifyBundle{
+		ConnectedF: func(n network.Network, c network.Conn) {
+			log.Printf("Connected to %s", c.RemotePeer())
+		},
+		DisconnectedF: func(n network.Network, c network.Conn) {
+			log.Printf("Disconnected from %s", c.RemotePeer())
+		},
+	})
 
 	// keep the node running until a keyboard interrupt
 	keyboardCancelChannel := make(chan os.Signal, 1)

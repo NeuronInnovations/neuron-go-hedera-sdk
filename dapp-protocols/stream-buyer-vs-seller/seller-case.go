@@ -103,7 +103,7 @@ func HandleSellerCase(ctx context.Context, p2pHost host.Host, protocol protocol.
 
 	go sellerCase(ctx, p2pHost, buyerBuffers)
 
-	hedera_helper.ListenToTopicAndCallBack(commonlib.MyStdIn,
+	go hedera_helper.ListenToTopicAndCallBack(commonlib.MyStdIn,
 
 		func(message hedera.TopicMessage) {
 
