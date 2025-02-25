@@ -129,6 +129,8 @@ func LaunchSDK(
 	fixPrivKey_g = fixPrivKey
 	rawPublicKey, _ := fixPrivKey.GetPublic().Raw()
 	fmt.Printf("My private key type is: %v\nMy public key is: %x\n", fixPrivKey.Type(), rawPublicKey)
+	pk, _ := hedera.PublicKeyFromString(hex.EncodeToString(rawPublicKey))
+	commonlib.MyPublicKey = pk
 	fmt.Println("Neuron  host is starting ...")
 
 	// Configuring a Libp2p host with dynamic options based on mode (relay or peer).

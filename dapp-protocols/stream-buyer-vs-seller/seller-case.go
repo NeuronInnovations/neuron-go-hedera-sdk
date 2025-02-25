@@ -107,7 +107,7 @@ func HandleSellerCase(ctx context.Context, p2pHost host.Host, protocol protocol.
 
 		func(message hedera.TopicMessage) {
 
-			fmt.Println("request from other side: ", message.Contents)
+			fmt.Printf("request from other side: %s ", message.Contents)
 
 			lastStdInTimestamp := message.ConsensusTimestamp.Format(time.RFC3339Nano)
 
@@ -171,7 +171,7 @@ func HandleSellerCase(ctx context.Context, p2pHost host.Host, protocol protocol.
 					return
 				}
 
-				if buyerSharedAccountInfo.Balance.AsTinybar() < 100000000 {
+				if buyerSharedAccountInfo.Balance.AsTinybar() < 100_000_000 {
 					hedera_helper.PeerSendErrorMessage(otherSideStdIn, commonlib.BalanceError, "Your balance is too low, but I will serve you anyway", commonlib.DoNothing)
 				}
 

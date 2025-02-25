@@ -87,7 +87,7 @@ func HandleBuyerCase(ctx context.Context, p2pHost host.Host, buyerCase func(ctx 
 	// ------- LISTEN -----------
 
 	go hedera_helper.ListenToTopicAndCallBack(commonlib.MyStdIn, func(topicMessage hedera.TopicMessage) {
-		fmt.Println("received: ", topicMessage.Contents)
+		fmt.Printf("received %s: ", topicMessage.Contents)
 
 		// TODO: is this someone I want to respond to? Have I asked him for services?
 		validatorLib.IsRequestPermitted()
@@ -142,6 +142,10 @@ func HandleBuyerCase(ctx context.Context, p2pHost host.Host, buyerCase func(ctx 
 			}
 			switch sellerError.ErrorType {
 			case commonlib.DialError:
+				// get the public key of th sender
+				///peerIDStr := keylib.ConvertHederaPublicKeyToPeerID(acc.PublicKey)
+				//p2pHost.Network().ClosePeer(peer.ID(peerIDStr))
+				//log.Println("Response to dial error cleaning streams to: ", peer.ID(peerIDStr))
 			case commonlib.FlushError:
 			case commonlib.DisconnectedError:
 			case commonlib.NoKnownAddressError:
@@ -408,7 +412,7 @@ func HandleBuyerCase(ctx context.Context, p2pHost host.Host, buyerCase func(ctx 
 					if !peerHasBuffer {
 						// it's possible to not have a buffer when you reboot but people still talk to you and that's why you have cons.
 						// just close those cons and issue a new request, you can be lazy and let the loop do that in the next iteration.
-						fmt.Println("I am connected but have no buffer. .. i'll just hang around for the loop to issue a fresh request ", peerID)
+						fmt.Println("I am connected but have no buffer. .. i'll close the peer and just hang around for the loop to issue a fresh request ", peerID)
 						p2pHost.Network().ClosePeer(peerID)
 						continue
 					}
@@ -419,7 +423,9 @@ func HandleBuyerCase(ctx context.Context, p2pHost host.Host, buyerCase func(ctx 
 						streams += len(conn.GetStreams())
 					}
 					if streams == 0 { // there are cons but no streams
-						log.Println("I am connected but have no streams. .. i'll just hang around ", peerID, streams)
+						log.Println("I am connected but have no streams. .. i'll  close the peer and just hang around ", peerID, streams)
+						p2pHost.Network().ClosePeer(peerID)
+
 						continue
 					} else {
 						sellerBuffers.UpdateBufferRendezvousState(peerID, commonlib.SendOK)

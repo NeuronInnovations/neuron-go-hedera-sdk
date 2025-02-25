@@ -46,14 +46,21 @@ func InitialConnect(ctx context.Context, p2pHost host.Host, addrInfo peer.AddrIn
 	}
 
 	fmt.Println("connected, create a stream ", addrInfo.ID)
+
 	log.Println("connect and open stream")
 	// --------  stuck here
+
 	s, strErr := p2pHost.NewStream(ctx, addrInfo.ID, protocol)
 	if strErr != nil {
-		log.Println("failed to create a new stream in InitialConnect. ", strErr)
-		log.Println("this is what we know about the buffer:  exists:", exists, " bufferrInfo", info)
-		return fmt.Errorf("%s:error connecting: %w", CanNotConnectStreamError, strErr)
-
+		log.Printf("First attempt failed, resetting connection and retrying: %v", strErr)
+		p2pHost.Network().ClosePeer(addrInfo.ID)
+		time.Sleep(1 * time.Second) // Brief delay before retry
+		s, strErr = p2pHost.NewStream(ctx, addrInfo.ID, protocol)
+		if strErr != nil {
+			log.Println("failed to create a new stream in InitialConnect. ", strErr)
+			log.Println("this is what we know about the buffer:  exists:", exists, " bufferrInfo", info)
+			return fmt.Errorf("%s:error connecting: %w", CanNotConnectStreamError, strErr)
+		}
 		//continue
 	}
 	fmt.Printf("😍😍 Stream connected and pumping %s -> %s ! 😍😍\n", addrInfo, p2pHost.ID())
@@ -200,19 +207,26 @@ func WriteAndFlushBuffer(
 
 		// Log a warning if we took >10ms to return from the write call
 		if writeDuration > 10*time.Millisecond {
-			//log.Printf("⚠️ High write latency: %v. Receiver may be slow.", writeDuration)
+			log.Printf("⚠️ High write latency: %v. Receiver may be slow.", writeDuration)
 		}
 
 		if writeErr != nil {
 			// If we timed out, treat that as "not ready yet"
 			if netErr, ok := writeErr.(net.Error); ok && netErr.Timeout() {
-				log.Printf("Write skipped: Receiver not ready (timeout).")
-				return nil
+				log.Printf("Write skipped: Receiver not ready (timeout). Resseting stream.")
+				// reset stream
+				bufferInfo.Writer.Reset()
+				connectedBuffersOfBuyers.RemoveBuffer(peerID)
+				return fmt.Errorf("%s:error writing to stream - 1:  %w", ConnectionLostWriteError, writeErr)
+
 			}
 			// Otherwise, update state & increment reconnect attempts
+			bufferInfo.Writer.Reset()
+
 			connectedBuffersOfBuyers.UpdateBufferLibP2PState(peerID, ConnectionLost)
 			connectedBuffersOfBuyers.IncrementReconnectAttempts(peerID)
-			return fmt.Errorf("%s:error writing to stream: %w", ConnectionLostWriteError, writeErr)
+			connectedBuffersOfBuyers.RemoveBuffer(peerID)
+			return fmt.Errorf("%s:error writing to stream - 2:  %w", ConnectionLostWriteError, writeErr)
 		}
 
 		return nil
@@ -221,14 +235,14 @@ func WriteAndFlushBuffer(
 }
 
 func HolePunchConnectIfNotConnected(ctx context.Context, p2pHost host.Host, pi peer.AddrInfo, isClient bool) error {
-	if p2pHost.Network().Connectedness(pi.ID) != network.Connected {
-		holePunchCtx := network.WithSimultaneousConnect(ctx, isClient, "hole-punching")
-		forceDirectConnCtx := network.WithForceDirectDial(holePunchCtx, "hole-punching")
-		dialCtx, cancel := context.WithTimeout(forceDirectConnCtx, time.Second*30)
-		defer cancel()
-		if err := p2pHost.Connect(dialCtx, pi); err != nil {
-			return err
-		}
+	//if p2pHost.Network().Connectedness(pi.ID) != network.Connected {
+	holePunchCtx := network.WithSimultaneousConnect(ctx, isClient, "hole-punching")
+	forceDirectConnCtx := network.WithForceDirectDial(holePunchCtx, "hole-punching")
+	dialCtx, cancel := context.WithTimeout(forceDirectConnCtx, time.Second*30)
+	defer cancel()
+	if err := p2pHost.Connect(dialCtx, pi); err != nil {
+		return err
 	}
+	//}
 	return nil
 }
