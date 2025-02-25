@@ -9,11 +9,10 @@ import (
 	"os"
 	"time"
 
+	commonlib "github.com/NeuronInnovations/neuron-go-hedera-sdk/common-lib"
 	"github.com/NeuronInnovations/neuron-go-hedera-sdk/keylib"
 
 	"github.com/NeuronInnovations/neuron-go-hedera-sdk/hederacontract"
-
-	commonlib "github.com/NeuronInnovations/neuron-go-hedera-sdk/common-lib"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/ethclient"

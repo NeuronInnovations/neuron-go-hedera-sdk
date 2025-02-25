@@ -199,7 +199,7 @@ func WriteAndFlushBuffer(
 
 	if bufferInfo.LibP2PState == Connected {
 		// Short write deadline to avoid blocking too long
-		bufferInfo.Writer.SetWriteDeadline(time.Now().Add(10 * time.Millisecond))
+		bufferInfo.Writer.SetWriteDeadline(time.Now().Add(20 * time.Millisecond))
 
 		writeStart := time.Now()
 		_, writeErr := bufferInfo.Writer.Write(data)
