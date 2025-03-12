@@ -12,11 +12,10 @@ import (
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/multiformats/go-multiaddr"
-	"go.etcd.io/bbolt"
 )
 
 // Package-level variable for the BoltDB instance
-var db *bbolt.DB
+//var db *bbolt.DB
 
 // Package-level variable for the NodeBuffers instance
 var NodeBuffersInstance *NodeBuffers
@@ -24,90 +23,13 @@ var NodeBuffersInstance *NodeBuffers
 // Initialize the database in the package init function
 func StateManagerInit(buyerOrSellerFlag string, clearCacheFlag bool) {
 
-	// Put the BoltDB file in the OS temp directory, using buyerOrSellerFlag in the filename.
-	// This allows you to reuse the same DB on subsequent runs if the temp file still exists.
-	dbPath := fmt.Sprintf("%s/neuron-connections-%s.db", os.TempDir(), buyerOrSellerFlag)
+	NodeBuffersInstance = NewNodeBuffers()
 
-	// delete the db if the clearcache flag is set
-	if clearCacheFlag {
-		// Delete the database file if the reset flag is provided
+	// Dump database to JSON for debugging
+	//if err := NodeBuffersInstance.dumpToJSON(fmt.Sprintf("neuron-connections-startup-%s.json", buyerOrSellerFlag)); err != nil {
+	//	log.Printf("Warning: Failed to dump database to JSON: %v", err)
+	//}
 
-		if _, err := os.Stat(dbPath); err == nil {
-			err = os.Remove(dbPath)
-			if err != nil {
-				log.Fatalf("Failed to delete existing database: %v", err)
-			}
-			log.Println("Existing database deleted successfully.")
-		} else if !os.IsNotExist(err) {
-			log.Fatalf("Error checking database file: %v", err)
-		}
-
-	}
-
-	var err error
-	db, err = bbolt.Open(dbPath, 0600, nil)
-
-	if err != nil {
-		// If database initialization fails, log the error and proceed without persistence
-		log.Fatalf("Failed to open BoltDB at %s (%v). Continuing without persistence.", dbPath, err)
-		db = nil // Explicitly set db to nil to indicate no persistence
-	} else {
-		log.Printf("BoltDB opened successfully at: %s", dbPath)
-
-		// Initialize the database schema or buckets if needed
-		err = db.Update(func(tx *bbolt.Tx) error {
-			_, err := tx.CreateBucketIfNotExists([]byte("NodeBuffers"))
-			return err
-		})
-		if err != nil {
-			log.Printf("Warning: failed to initialize BoltDB buckets (%v). Continuing without persistence.", err)
-			db.Close()
-			db = nil
-		} else {
-			// Initialize the NodeBuffers instance
-			NodeBuffersInstance = NewNodeBuffers()
-			// Load state from the database
-			if err := NodeBuffersInstance.LoadState(); err != nil {
-				log.Printf("Warning: Failed to load state: %v", err)
-			}
-
-			// Loop through all buffers and set their state to ConnectionLost
-			NodeBuffersInstance.mu.Lock()
-			for peerID, bufferInfo := range NodeBuffersInstance.Buffers {
-				bufferInfo.LibP2PState = Connecting
-				bufferInfo.RendezvousState = NotInitiated
-				bufferInfo.LastConnectionAttempt = time.Time{}
-				bufferInfo.NextScheduleRequestTime = time.Time{}
-				bufferInfo.NoOfConnectionAttempts = 0
-				bufferInfo.NextScheduleRequestTime = time.Time{}
-				log.Printf("Setting LibP2PState to ConnectionLost for peer: %s", peerID)
-
-				// Persist the updated state
-				if persistErr := NodeBuffersInstance.persistNodeBufferInfo(peerID); persistErr != nil {
-					log.Printf("Warning: Error persisting state for peerID %s: %v", peerID, persistErr)
-				}
-			}
-			NodeBuffersInstance.mu.Unlock()
-
-			// Dump database to JSON for debugging
-			//if err := NodeBuffersInstance.dumpToJSON(fmt.Sprintf("neuron-connections-startup-%s.json", buyerOrSellerFlag)); err != nil {
-			//	log.Printf("Warning: Failed to dump database to JSON: %v", err)
-			//}
-
-		}
-	}
-}
-
-// CloseDB closes the BoltDB database.
-func CloseDB(buyerOrSellerFlag string) error {
-	if db != nil {
-		// Dump database to JSON for debugging before closing
-		//if err := NodeBuffersInstance.dumpToJSON(fmt.Sprintf("neuron-connections-shutdown-%s.json", buyerOrSellerFlag)); err != nil {
-		//	log.Printf("Warning: Failed to dump database to JSON on shutdown: %v", err)
-		//}
-		return db.Close()
-	}
-	return nil
 }
 
 type NodeBuffers struct {
@@ -181,86 +103,6 @@ type NodeBufferInfo struct {
 	LastGoodsReceivedTime          time.Time           `json:"last_goods_received_time"`
 }
 
-// persistNodeBufferInfo persists a single NodeBufferInfo to BoltDB using JSON.
-func (sb *NodeBuffers) persistNodeBufferInfo(peerID peer.ID) error {
-	if db == nil {
-		return nil
-	}
-
-	info, exists := sb.Buffers[peerID]
-	if !exists {
-		return fmt.Errorf("peerID %s not found in NodeBuffers", peerID)
-	}
-
-	data, err := json.Marshal(info)
-	if err != nil {
-		return fmt.Errorf("failed to marshal NodeBufferInfo: %w", err)
-	}
-
-	key := []byte(peerID.String())
-
-	return db.Update(func(tx *bbolt.Tx) error {
-		b := tx.Bucket([]byte("NodeBuffers"))
-		if b == nil {
-			return fmt.Errorf("NodeBuffers bucket does not exist")
-		}
-		return b.Put(key, data)
-	})
-}
-
-// deleteNodeBufferInfo removes a NodeBufferInfo from BoltDB.
-func (bb *NodeBuffers) deleteNodeBufferInfo(peerID peer.ID) error {
-	if db == nil {
-		return nil
-	}
-
-	key := []byte(peerID.String())
-
-	return db.Update(func(tx *bbolt.Tx) error {
-		b := tx.Bucket([]byte("NodeBuffers"))
-		if b == nil {
-			return nil // Bucket doesn't exist; nothing to delete
-		}
-		if err := b.Delete(key); err != nil {
-			return fmt.Errorf("failed to delete key %s: %w", peerID, err)
-		}
-		return nil
-	})
-}
-
-// LoadState loads the persisted NodeBuffers from BoltDB.
-func (sb *NodeBuffers) LoadState() error {
-	if db == nil {
-		return nil
-	}
-
-	sb.mu.Lock()
-	defer sb.mu.Unlock()
-
-	return db.View(func(tx *bbolt.Tx) error {
-		b := tx.Bucket([]byte("NodeBuffers"))
-		if b == nil {
-			return nil // No data to load
-		}
-
-		return b.ForEach(func(k, v []byte) error {
-			var info NodeBufferInfo
-
-			if err := json.Unmarshal(v, &info); err != nil {
-				return fmt.Errorf("failed to unmarshal data for key %s: %w", k, err)
-			}
-
-			peerID, err := peer.Decode(string(k))
-			if err != nil {
-				return fmt.Errorf("failed to decode peer ID %s: %w", k, err)
-			}
-
-			sb.Buffers[peerID] = &info
-			return nil
-		})
-	})
-}
-
 func (sb *NodeBuffers) SetStreamHandler(sellerID peer.ID, streamHandler *network.Stream) {
 	sb.mu.Lock()
 	defer sb.mu.Unlock()
@@ -296,10 +138,6 @@ func (sb *NodeBuffers) AddBuffer2(sellerID peer.ID, request TopicPostalEnvelope,
 		RequestOrResponse:       request,
 	}
 
-	// Persist the updated state
-	if err := sb.persistNodeBufferInfo(sellerID); err != nil {
-		log.Printf("Warning: Error persisting state for sellerID %s: %v", sellerID, err)
-	}
 }
 
 // AddBuffer3 adds a new bufio.Writer for a buyerID with a specified state and a bufio.Writer
@@ -318,10 +156,6 @@ func (bb *NodeBuffers) AddBuffer3(buyerID peer.ID, streamWriter network.Stream, 
 		NextScheduledConnectionAttempt: time.Time{},
 	}
 
-	// Persist the updated state
-	if err := bb.persistNodeBufferInfo(buyerID); err != nil {
-		log.Printf("Warning: Error persisting state for buyerID %s: %v", buyerID, err)
-	}
 }
 
 // UpdateBufferIsValidAccount updates account validity
@@ -331,11 +165,6 @@ func (bb *NodeBuffers) UpdateBufferIsValidAccount(buyerID peer.ID, isValidAccoun
 	info, exists := bb.Buffers[buyerID]
 	if exists {
 		info.IsOtherSideValidAccount = isValidAccount
-
-		// Persist the updated state
-		if err := bb.persistNodeBufferInfo(buyerID); err != nil {
-			log.Printf("Warning: Error persisting state for buyerID %s: %v", buyerID, err)
-		}
 	}
 }
 
@@ -356,10 +185,6 @@ func (bb *NodeBuffers) RemoveBuffer(buyerID peer.ID) {
 	defer bb.mu.Unlock()
 	delete(bb.Buffers, buyerID)
 
-	// Remove from BoltDB
-	if err := bb.deleteNodeBufferInfo(buyerID); err != nil {
-		log.Printf("Warning: Error deleting state for buyerID %s: %v", buyerID, err)
-	}
 }
 
 // UpdateBufferLibP2PState updates the LibP2PState of a buffer for a given buyerID
@@ -376,10 +201,6 @@ func (bb *NodeBuffers) UpdateBufferLibP2PState(buyerID peer.ID, state LibP2PStat
 	}
 	info.LastConnectionAttempt = time.Now()
 
-	// Persist the updated state
-	if err := bb.persistNodeBufferInfo(buyerID); err != nil {
-		log.Printf("Warning: Error persisting state for buyerID %s: %v", buyerID, err)
-	}
 	return true
 }
 
@@ -391,10 +212,6 @@ func (bb *NodeBuffers) UpdateBufferRendezvousState(buyerID peer.ID, state Rendez
 	if exists {
 		info.RendezvousState = state
 
-		// Persist the updated state
-		if err := bb.persistNodeBufferInfo(buyerID); err != nil {
-			log.Printf("Warning: Error persisting state for buyerID %s: %v", buyerID, err)
-		}
 	}
 }
 
@@ -408,10 +225,6 @@ func (bb *NodeBuffers) IncrementReconnectAttempts(buyerID peer.ID) {
 		info.LastConnectionAttempt = time.Now()
 		info.NextScheduledConnectionAttempt = time.Now().Add(time.Second * time.Duration(1<<info.NoOfConnectionAttempts))
 
-		// Persist the updated state
-		if err := bb.persistNodeBufferInfo(buyerID); err != nil {
-			log.Printf("Warning: Error persisting state for buyerID %s: %v", buyerID, err)
-		}
 	}
 }
 
@@ -423,10 +236,6 @@ func (bb *NodeBuffers) SetNeuronSellerRequest(buyerID peer.ID, msg TopicPostalEn
 	if exists {
 		info.RequestOrResponse = msg
 
-		// Persist the updated state
-		if err := bb.persistNodeBufferInfo(buyerID); err != nil {
-			log.Printf("Warning: Error persisting state for buyerID %s: %v", buyerID, err)
-		}
 	}
 }
 
@@ -459,10 +268,6 @@ func (bb *NodeBuffers) SetLastGoodsReceivedTime(buyerID peer.ID) {
 	if exists {
 		info.LastGoodsReceivedTime = time.Now()
 
-		// Persist the updated state
-		if err := bb.persistNodeBufferInfo(buyerID); err != nil {
-			log.Printf("Warning: Error persisting state for buyerID %s: %v", buyerID, err)
-		}
 	}
 }
 

@@ -40,7 +40,6 @@ import (
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/core/protocol"
-	"github.com/libp2p/go-libp2p/p2p/security/noise"
 	quictransprt "github.com/libp2p/go-libp2p/p2p/transport/quic"
 	"github.com/multiformats/go-multiaddr"
 	manet "github.com/multiformats/go-multiaddr/net"
@@ -115,11 +114,6 @@ func LaunchSDK(
 
 	// enable persistence. TODO: use a flag to choose if you want to disable it. This is useful for stateless setups.
 	commonlib.StateManagerInit(*commonlib.BuyerOrSellerFlag, *commonlib.ClearCacheFlag)
-	defer func() {
-		if err := commonlib.CloseDB(*commonlib.BuyerOrSellerFlag); err != nil {
-			log.Printf("Failed to close database: %v", err)
-		}
-	}()
 
 	// private keys are coming from the environment. Location is coming either from the force flag or the env variable. If any of them is missing
 	// then an external fallback configurator will be used. This can be an UI, a wallet, etc.
@@ -140,9 +134,11 @@ func LaunchSDK(
 	// Public or discovered NAT addresses are dynamically advertised using a custom AddrsFactory. Once options are set,the host is
 	// started using the createHost function.
 	var p2pHost host.Host
+
 	options := []libp2p.Option{
 		libp2p.Transport(quictransprt.NewTransport),
-		libp2p.Security(noise.ID, noise.New),
+
+		//libp2p.Security(noise.ID, noise.New),
 		libp2p.AddrsFactory(func(m []multiaddr.Multiaddr) []multiaddr.Multiaddr {
 			// advertise only public addresses for now.  TODO: reintroduce local addresses
 			filtered := multiaddr.FilterAddrs(m, manet.IsPublicAddr)

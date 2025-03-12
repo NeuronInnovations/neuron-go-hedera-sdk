@@ -16,7 +16,7 @@ require (
 	github.com/pion/stun v0.6.1
 	github.com/spf13/pflag v1.0.6
 	github.com/umahmood/haversine v0.0.0-20151105152445-808ab04add26
-	go.etcd.io/bbolt v1.4.0
+	//go.etcd.io/bbolt v1.4.0
 	golang.org/x/time v0.5.0
 	google.golang.org/grpc v1.65.0
 )

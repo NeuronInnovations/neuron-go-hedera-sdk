@@ -518,7 +518,9 @@ func SignSchedule(scheduleId hedera.ScheduleID, privateKey string) error {
 		Execute(client)
 
 	if err != nil {
-		panic(err)
+		fmt.Println("No problem - Error getting schedule info: ", err)
+		return err
+
 	}
 
 	fmt.Println("Schedule signatories: ", query, "signers", query.Signatories)
