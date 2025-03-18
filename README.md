@@ -219,9 +219,10 @@ import (
 	"context"
 	"fmt"
 	"log"
-	neuronsdk "neuron/sdk" // Import neuronFactory from neuron-go-sdk
-	commonlib "neuron/sdk/common-lib"
-	hedera_msg "neuron/sdk/hedera"
+
+	neuronsdk "github.com/NeuronInnovations/neuron-go-hedera-sdk" // Import neuronFactory from neuron-go-sdk
+	commonlib "github.com/NeuronInnovations/neuron-go-hedera-sdk/common-lib"
+	hedera_msg "github.com/NeuronInnovations/neuron-go-hedera-sdk/hedera"
 	"time"
 
 	"github.com/hashgraph/hedera-sdk-go/v2"
