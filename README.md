@@ -178,6 +178,7 @@ To use the sdk you implement callbacks for the `LaunchSDK` function.  T
 
 ```go
 neuronsdk.LaunchSDK(
+		"0.1" // Specify your app's version
 		NrnProtocol, // Specify a protocol ID
 		func(envIsReady chan bool, envFile string) error {
          // Define custom key configurator logic or leave empty
@@ -235,6 +236,7 @@ func main2() {
 	var NrnProtocol = protocol.ID("/nrn-mydapp/v1")
 
 	neuronsdk.LaunchSDK(
+               "0.1" // Specify your app's version
 		NrnProtocol, // Specify a protocol ID
 		nil,         // leave nil if you don't need custom key configuration logic
 		func(ctx context.Context, h host.Host, b *commonlib.NodeBuffers) { // Define buyer case logic here (if required)
