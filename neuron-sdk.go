@@ -485,6 +485,8 @@ func SetupKeysAndLocation(envFile string, forceLocationFlag *string, configurato
 	// Decode the private key from the environment variable
 	privKey, err := LoadPrivateKey(os.Getenv("private_key"))
 	if err != nil {
+		fmt.Println("We could not load your key, maybe it is in DER format? Try to un-DER. We are proceeding to load the configurator (if you have one)")
+
 		return HandleFallbackConfigurator(envFile, configurator)
 	}
 
@@ -519,6 +521,9 @@ func LoadPrivateKey(keyHex string) (crypto.PrivKey, error) {
 // HandleFallbackConfigurator attempts to use the configurator to recover from errors.
 func HandleFallbackConfigurator(envFile string, configurator func(envIsReady chan bool, envFile string) error) (crypto.PrivKey, error) {
 	uiChannelEnvReady := make(chan bool)
+	if configurator == nil {
+		log.Panic("The configurator is nil, exiting")
+	}
 	configurator(uiChannelEnvReady, envFile)
 
 	if envIsReady := <-uiChannelEnvReady; !envIsReady {

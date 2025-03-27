@@ -1,3 +1,5 @@
+package commonlib
+
 // environment.go
 //
 // This file is responsible for managing the application's environment variables.
@@ -18,8 +20,26 @@
 // - Load environment data from the `.env` file and system environment.
 // - Provide methods for updating and persisting environment variables.
 // - Handle file operations like backup creation and restoration to ensure robustness.
-
-package commonlib
+// environment.go
+//
+// This file is responsible for managing the application's environment variables.
+// It loads environment data from a combination of sources:
+// - A `.env` file specified by the `--envFile` flag (defaulting to `.env` if not provided).
+// - Command-line flags passed as arguments (see flags.go for details).
+//
+// The `InitEnv` function ensures that the environment variables are initialized correctly,
+// either from the specified `.env` file or directly from the operating system's environment
+// if the file is not found. This approach supports flexibility for deployment scenarios like
+// local development or Kubernetes, where environment variables may already be present in the OS.
+//
+// Additionally, this file provides functionality for dynamically updating environment variables
+// (`UpdateEnvVariable`) and ensures that any changes are safely written back to the `.env` file
+// while creating a backup to avoid accidental data loss.
+//
+// Key responsibilities:
+// - Load environment data from the `.env` file and system environment.
+// - Provide methods for updating and persisting environment variables.
+// - Handle file operations like backup creation and restoration to ensure robustness.
 
 import (
 	"crypto"
@@ -97,27 +117,42 @@ func writeEnvFile(filename string, envMap map[string]string) error {
 		return fmt.Errorf("failed to create backup: %v", err)
 	}
 
-	// Write the new content to the file
+	// Write to a temporary file first
+	tmpFile := filename + ".tmp"
 	var lines []string
 	for key, value := range envMap {
 		lines = append(lines, key+"="+value)
 	}
 	sort.Strings(lines)
-	content := strings.Join(lines, "\n")
+	content := strings.Join(lines, "\n") + "\n"
 
-	err = os.WriteFile(filename, []byte(content), 0644)
+	tmpF, err := os.Create(tmpFile)
 	if err != nil {
-		// Restore from backup if writing fails
-		restoreErr := restoreBackup(filename, backupFilename)
-		if restoreErr != nil {
-			return fmt.Errorf("failed to write and restore backup: %v, restore error: %v", err, restoreErr)
-		}
-		return fmt.Errorf("failed to write file, restored backup: %v", err)
+		return fmt.Errorf("failed to create temp file: %v", err)
 	}
 
-	// Remove the backup after successful write
-	err = os.Remove(backupFilename)
-	if err != nil {
+	if _, err := tmpF.WriteString(content); err != nil {
+		tmpF.Close()
+		return fmt.Errorf("failed to write to temp file: %v", err)
+	}
+
+	if err := tmpF.Sync(); err != nil {
+		tmpF.Close()
+		return fmt.Errorf("failed to sync temp file: %v", err)
+	}
+
+	if err := tmpF.Close(); err != nil {
+		return fmt.Errorf("failed to close temp file: %v", err)
+	}
+
+	// Replace the original file with the temp file
+	if err := os.Rename(tmpFile, filename); err != nil {
+		restoreErr := restoreBackup(filename, backupFilename)
+		return fmt.Errorf("failed to replace original file: %v, restore error: %v", err, restoreErr)
+	}
+
+	// Remove the backup after successful replacement
+	if err := os.Remove(backupFilename); err != nil {
 		return fmt.Errorf("file written but failed to remove backup: %v", err)
 	}
 

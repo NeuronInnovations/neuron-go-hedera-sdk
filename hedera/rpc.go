@@ -6,6 +6,7 @@ import (
 	"log"
 	"math/big"
 	"os"
+	"time"
 
 	"github.com/NeuronInnovations/neuron-go-hedera-sdk/keylib"
 
@@ -135,9 +136,13 @@ type PeerInfo struct {
 // TODO: retry on failure. This one likes to return 502 bad gateway and eth rate limit exceeded.
 // however, currently we stop the world on failure but should keep retrying.
 func GetPeerInfo(hederaAccEvmAddress string) (PeerInfo, error) {
+	log.Println("getting contract info for ", hederaAccEvmAddress)
 	var peerInfo PeerInfo
 	var err error
-	for i := 0; i < 25; i++ {
+	maxRetries := 25
+	baseDelay := time.Second
+
+	for i := 0; i < maxRetries; i++ {
 		contractCaller := GetHRpcClient()
 		peerInfo, err = contractCaller.HederaAddressToPeer(
 			&bind.CallOpts{},
@@ -146,11 +151,11 @@ func GetPeerInfo(hederaAccEvmAddress string) (PeerInfo, error) {
 		if err == nil {
 			return peerInfo, nil
 		}
-		log.Println("Error getting rpc peer info, retrying:", i, "th time")
+		fmt.Println("Error getting rpc peer info, retrying:", i, "th time", err)
+		time.Sleep(baseDelay * (1 << i)) // Exponential backoff
 	}
 	return peerInfo, err
 }
-
 func GetAllPeers() ([]string, error) {
 	contractCaller := GetHRpcClient()
 

@@ -106,13 +106,14 @@ func GetLastMessageFromTopic(topicID hedera.TopicID) (HCSMessage, error) {
 	defer resp.Body.Close()
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		fmt.Println("Error:", err)
+		// print the body of the http error
+		fmt.Printf("Error talking to mirror: %v\nBody: %s\n", err, string(body))
 		return HCSMessage{}, err
 	}
 	var data map[string]interface{}
 	err = json.Unmarshal(body, &data)
 	if err != nil {
-		fmt.Println("Error:", err)
+		fmt.Printf("Error talking to mirror: %v\nBody: %s\n", err, string(body))
 		return HCSMessage{}, err
 	}
 	// get the last message
