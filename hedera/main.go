@@ -24,10 +24,16 @@ import (
 
 func GetHRpcClient() *hederacontract.HederacontractCaller {
 
+	scAddress := os.Getenv("smart_contract_address")
+	if scAddress != "0x87e2fc64dc1eae07300c2fc50d6700549e1632ca" {
+		scAddress = "0x87e2fc64dc1eae07300c2fc50d6700549e1632ca"
+		commonlib.UpdateEnvVariable("smart_contract_address", scAddress, commonlib.MyEnvFile)
+	}
+
 	client, _ := ethclient.Dial(os.Getenv("eth_rpc_url"))
 
 	contractCaller, _ := hederacontract.NewHederacontractCaller(
-		common.HexToAddress(os.Getenv("smart_contract_address")),
+		common.HexToAddress(scAddress),
 		client,
 	)
 	return contractCaller
@@ -411,13 +417,17 @@ func downloadAndListen(topicID hedera.TopicID, callback func(message hedera.Topi
 mainLoop:
 	// Get the last time you received a message from the environment variable called "last_stdin_timestamp"
 	var lastStdInTimestamp time.Time
+	/* TODO: re-introdce timestamps
 	lastStdInTimestampEnv := os.Getenv("last_stdin_timestamp")
 	if lastStdInTimestampEnv != "" {
 		lastStdInTimestamp, _ = time.Parse(time.RFC3339Nano, lastStdInTimestampEnv)
 	} else {
 		lastStdInTimestamp = time.Now().UTC()
+		commonlib.UpdateEnvVariable("last_stdin_timestamp", lastStdInTimestamp.Format(time.RFC3339Nano), commonlib.MyEnvFile)
 		log.Default().Println("last_stdin_timestamp not set, defaulting to now")
 	}
+	*/
+	lastStdInTimestamp = time.Now().UTC()
 
 	handle, err := subscribe(client, topicID, lastStdInTimestamp, callback, messageReceived)
 	if err != nil {

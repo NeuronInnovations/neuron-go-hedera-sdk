@@ -96,6 +96,13 @@ func HandleBuyerCase(ctx context.Context, p2pHost host.Host, buyerCase func(ctx 
 		fmt.Printf("received %s: ", topicMessage.Contents)
 
 		// TODO: is this someone I want to respond to? Have I asked him for services?
+
+		fmt.Printf("request from other side: %s ", topicMessage.Contents)
+
+		//lastStdInTimestamp := topicMessage.ConsensusTimestamp.Format(time.RFC3339Nano)
+
+		//commonlib.UpdateEnvVariable("last_stdin_timestamp", lastStdInTimestamp, commonlib.MyEnvFile)
+
 		validatorLib.IsRequestPermitted()
 		if !validatorLib.IsRequestPermitted() {
 			return
@@ -192,6 +199,8 @@ func HandleBuyerCase(ctx context.Context, p2pHost host.Host, buyerCase func(ctx 
 		listOfSellersLock sync.RWMutex
 	)
 
+	startSecondLoop := make(chan struct{})
+
 	// if the list of sellers source is the environment file the we get it from there (otherwise ask explorer)
 	if *flags.ListOfSellersSourceFlag == "env" {
 		var listOfSellersEnvList = os.Getenv("list_of_sellers")
@@ -200,39 +209,48 @@ func HandleBuyerCase(ctx context.Context, p2pHost host.Host, buyerCase func(ctx 
 			return
 		}
 
-		for _, seller := range strings.Split(listOfSellersEnvList, ",") {
-			sEvm := keylib.ConverHederaPublicKeyToEthereunAddress(seller)
-			peerInfo, err := hedera_helper.GetPeerInfo(sEvm)
-			if err != nil {
-				log.Fatal(err)
-			}
-
-			if m, ok := getPeerHeartbeatIfRecent(peerInfo); ok {
-				heartbeatMessage := new(commonlib.NeuronHeartBeatMsg)
-				base64Decoded, _ := base64.StdEncoding.DecodeString(m.Message)
-				err = json.Unmarshal([]byte(base64Decoded), &heartbeatMessage)
-				if err != nil {
-					log.Println("error unmarshalling heartbeat message: ", err)
-				} else {
-					// make a Seller object and fill it up
-					seller := Seller{
-						PublicKey: seller,
-						Lat:       heartbeatMessage.Location.Latitude,
-						Lon:       heartbeatMessage.Location.Longitude,
+		go func() {
+			for {
+				for _, seller := range strings.Split(listOfSellersEnvList, ",") {
+					sEvm := keylib.ConverHederaPublicKeyToEthereunAddress(seller)
+					peerInfo, err := hedera_helper.GetPeerInfo(sEvm)
+					if err != nil {
+						log.Fatal(err)
 					}
-					listOfSellersLock.Lock()
-					listOfSellers[seller] = true
-					listOfSellersLock.Unlock()
+
+					if m, ok := getPeerHeartbeatIfRecent(peerInfo); ok {
+						heartbeatMessage := new(commonlib.NeuronHeartBeatMsg)
+						base64Decoded, _ := base64.StdEncoding.DecodeString(m.Message)
+						err = json.Unmarshal([]byte(base64Decoded), &heartbeatMessage)
+						if err != nil {
+							log.Println("error unmarshalling heartbeat message: ", err)
+						} else {
+							// make a Seller object and fill it up
+							seller := Seller{
+								PublicKey: seller,
+								Lat:       heartbeatMessage.Location.Latitude,
+								Lon:       heartbeatMessage.Location.Longitude,
+							}
+							listOfSellersLock.Lock()
+							listOfSellers[seller] = true
+							listOfSellersLock.Unlock()
+						}
+					} else {
+						log.Println("Node heartbeat is not ok. I'll skip him in this round but will try again in 120 seconds  ", seller, peerInfo)
+					}
 				}
-			} else {
-				log.Fatal("Node heartbeat is not ok. Provide a list where every single node has a heartbeat:  ", seller, peerInfo)
+				select {
+				case startSecondLoop <- struct{}{}:
+				default:
+				}
+				time.Sleep(120 * time.Second)
 			}
-		}
+		}()
 	} else { // if the flag list-of-sellers is not set to env then get it from the explorer
 		go func() {
 			var limiter = rate.NewLimiter(5, 1)
 			for {
-				// get the list of devices from the explorer
+				// get the list of devices from the explorer  every 120 seconds
 				devices, err := hedera_helper.GetAllDevicesFromExplorer()
 				if err != nil {
 					log.Println("💀  GetAllPeers error: ", err)
@@ -308,6 +326,10 @@ func HandleBuyerCase(ctx context.Context, p2pHost host.Host, buyerCase func(ctx 
 						}
 					}
 				}
+				select {
+				case startSecondLoop <- struct{}{}:
+				default:
+				}
 				time.Sleep(120 * time.Second)
 			}
 		}()
@@ -321,6 +343,7 @@ func HandleBuyerCase(ctx context.Context, p2pHost host.Host, buyerCase func(ctx 
 	*/
 
 	go func() {
+		<-startSecondLoop
 		for {
 			listOfSellersLock.RLock()                            // Lock before reading the map
 			sellersCopy := make([]Seller, 0, len(listOfSellers)) // Slice to store copied keys

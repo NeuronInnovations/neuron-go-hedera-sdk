@@ -109,9 +109,9 @@ func HandleSellerCase(ctx context.Context, p2pHost host.Host, protocol protocol.
 
 			fmt.Printf("request from other side: %s ", message.Contents)
 
-			lastStdInTimestamp := message.ConsensusTimestamp.Format(time.RFC3339Nano)
+			//lastStdInTimestamp := message.ConsensusTimestamp.Format(time.RFC3339Nano)
 
-			commonlib.UpdateEnvVariable("last_stdin_timestamp", lastStdInTimestamp, commonlib.MyEnvFile)
+			//commonlib.UpdateEnvVariable("last_stdin_timestamp", lastStdInTimestamp, commonlib.MyEnvFile)
 
 			// TODO: check if the message sender exists on the network
 			validatorLib.IsRequestPermitted()
