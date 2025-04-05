@@ -418,7 +418,7 @@ func hederaAnnounceAndHeartBeat(ctx context.Context, p2pHost host.Host) (hedera.
 			peers := p2pHost.Network().Peers()
 			myPublicAddressesEverything := hostsPublicAddressesSorted(p2pHost)
 			if len(myPublicAddressesEverything) > 0 {
-				json.Unmarshal([]byte(os.Getenv("location")), &commonlib.MyLocation)
+				//json.Unmarshal([]byte(os.Getenv("location")), &commonlib.MyLocation)
 				heartbeatMessage := commonlib.NeuronHeartBeatMsg{
 					MessageType:        "NeuronHeartBeat",
 					Location:           commonlib.MyLocation,
