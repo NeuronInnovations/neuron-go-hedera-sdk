@@ -20,6 +20,8 @@ import (
 	"github.com/hashgraph/hedera-sdk-go/v2"
 	"github.com/multiformats/go-multiaddr"
 	"google.golang.org/grpc/status"
+
+	"github.com/NeuronInnovations/neuron-go-hedera-sdk/types"
 )
 
 func GetHRpcClient() *hederacontract.HederacontractCaller {
@@ -158,19 +160,17 @@ func BuyerPrepareServiceRequest(
 	toEthAddress string,
 	arbiterEthAddress string,
 	amount int64, // TODO: needs to match what is in the sla
-) (*commonlib.TopicPostalEnvelope, error) {
+) (*types.TopicPostalEnvelope, error) {
 	client := GetHederaClientUsingEnv()
 	defer client.Close()
 
 	// check if all keys are valid
-
 	fromHederaraID, err1 := hedera.AccountIDFromEvmAddress(0, 0, fromEthAddress)
 	toHederaraID, err2 := hedera.AccountIDFromEvmAddress(0, 0, toEthAddress)
 	arbiterHederaId, err3 := hedera.AccountIDFromEvmAddress(0, 0, arbiterEthAddress)
 
 	if err1 != nil || err2 != nil || err3 != nil {
 		return nil, errors.New("error:one of your keys cannot construct an account from a evm address")
-
 	}
 
 	// check if the accounts are valid by making account info queries
@@ -246,7 +246,7 @@ func BuyerPrepareServiceRequest(
 		Version:            "0.4",
 	}
 
-	ret := commonlib.TopicPostalEnvelope{
+	ret := types.TopicPostalEnvelope{
 		Message:         m,
 		OtherStdInTopic: toStdInTopic,
 	}
@@ -333,11 +333,11 @@ func BuyerCounterSignSchedule(scheduleID hedera.ScheduleID) error {
 	return sigerr
 }
 
-func PeerSendErrorMessage(otherSideStdIn hedera.TopicID, errorType commonlib.ErrorType, errorMessage string, recoverAction commonlib.RecoverAction) {
+func PeerSendErrorMessage(otherSideStdIn hedera.TopicID, errorType types.ErrorType, errorMessage string, recoverAction types.RecoverAction) {
 	go func() {
 		client := GetHederaClientUsingEnv()
 		defer client.Close()
-		m := &commonlib.NeuronPeerErrorMsg{
+		m := &types.NeuronPeerErrorMsg{
 			MessageType:   "peerError",
 			StdInTopic:    commonlib.MyStdIn.Topic,
 			PublicKey:     commonlib.MyPublicKey.StringRaw(),
@@ -359,11 +359,10 @@ func PeerSendErrorMessage(otherSideStdIn hedera.TopicID, errorType commonlib.Err
 	}()
 }
 
-func SendSelfErrorMessage(errorType commonlib.ErrorType, errorMessage string, recoverAction commonlib.RecoverAction) error {
-
+func SendSelfErrorMessage(errorType types.ErrorType, errorMessage string, recoverAction types.RecoverAction) error {
 	client := GetHederaClientUsingEnv()
 	defer client.Close()
-	m := &commonlib.NeuronSelfErrorMsg{
+	m := &types.NeuronSelfErrorMsg{
 		MessageType:   "selfError",
 		StdInTopic:    commonlib.MyStdIn.Topic,
 		ErrorType:     errorType,
@@ -381,7 +380,7 @@ func SendSelfErrorMessage(errorType commonlib.ErrorType, errorMessage string, re
 	return err
 }
 
-func SendTransactionEnvelope(tx commonlib.TopicPostalEnvelope) error {
+func SendTransactionEnvelope(tx types.TopicPostalEnvelope) error {
 	client := GetHederaClientUsingEnv()
 	defer client.Close()
 	jsonBytes, marshallingError := json.Marshal(tx.Message)

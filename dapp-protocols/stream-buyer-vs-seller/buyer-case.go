@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/NeuronInnovations/neuron-go-hedera-sdk/types"
 	"github.com/NeuronInnovations/neuron-go-hedera-sdk/whoami"
 
 	validatorLib "github.com/NeuronInnovations/neuron-go-hedera-sdk/validator-lib"
@@ -180,7 +181,7 @@ func HandleBuyerCase(ctx context.Context, p2pHost host.Host, buyerCase func(ctx 
 			default:
 				fmt.Println("Unknown error type: ", sellerError.ErrorType)
 				//TODO: penalize message sender.
-				hedera_helper.SendSelfErrorMessage(commonlib.BadMessageError, "I received a message that I don't understand", commonlib.StopSending)
+				hedera_helper.SendSelfErrorMessage(types.BadMessageError, "I received a message that I don't understand", types.StopSending)
 				return
 			}
 		default:
@@ -254,7 +255,7 @@ func HandleBuyerCase(ctx context.Context, p2pHost host.Host, buyerCase func(ctx 
 				devices, err := hedera_helper.GetAllDevicesFromExplorer()
 				if err != nil {
 					log.Println("💀  GetAllPeers error: ", err)
-					hedera_helper.SendSelfErrorMessage(commonlib.ExplorerReachError, "Could not get devices from the explorer", commonlib.RebootMe)
+					hedera_helper.SendSelfErrorMessage(types.ExplorerReachError, "Could not get devices from the explorer", types.RebootMe)
 					continue
 				}
 
@@ -364,16 +365,16 @@ func HandleBuyerCase(ctx context.Context, p2pHost host.Host, buyerCase func(ctx 
 
 }
 
-func prepareServiceRequestMsg(seller string, myReachableAddresses []multiaddr.Multiaddr) (commonlib.TopicPostalEnvelope, error) {
+func prepareServiceRequestMsg(seller string, myReachableAddresses []multiaddr.Multiaddr) (types.TopicPostalEnvelope, error) {
 	res, err := hedera_helper.BuyerPrepareServiceRequest(
-		myReachableAddresses, //HostsPublicAddressesSorted(p2pHost)[0],
+		myReachableAddresses,
 		os.Getenv("hedera_evm_id"),
 		keylib.ConverHederaPublicKeyToEthereunAddress(seller),
-		"e2436b1e019e993215e832762f9242020d199940", // that's the london address, yes; it's fixed for now but a parameter in env MyArbiterPublicKey in the future.
-		100, // millibar  price, every seller gets the same for now
+		"e2436b1e019e993215e832762f9242020d199940",
+		100,
 	)
 	if err != nil {
-		return commonlib.TopicPostalEnvelope{}, err
+		return types.TopicPostalEnvelope{}, err
 	}
 	return *res, err
 }
@@ -402,77 +403,62 @@ func processSeller(seller Seller, p2pHost host.Host, sellerBuffers *commonlib.No
 		return
 	}
 
-	//TODO: check if the remote peer has a heartbeat in the past 5 minutes
-
 	conns := p2pHost.Network().ConnsToPeer(peerID)
 
 	if len(conns) == 0 {
-
-		if !peerHasBuffer { // no cons and never requested
+		if !peerHasBuffer {
 			envelope, setupErr := prepareServiceRequestMsg(seller.PublicKey, myReachableAddresses)
 			if setupErr != nil {
-				sellerBuffers.AddBuffer2(peerID, envelope, false, commonlib.NotInitiated, neuronbuffers.LibP2PState(commonlib.BadMessageError))
+				sellerBuffers.AddBuffer2(peerID, envelope, false, types.NotInitiated, types.ConnectionLost)
 				log.Printf("💀 envelope setup error; seller %s will be blacklisted, err: %v \n", sellerEvnAddress, setupErr)
-				hedera_helper.SendSelfErrorMessage(neuronbuffers.BadMessageError, "Could not create envelope for: "+sellerEvnAddress, commonlib.DoNothing)
+				hedera_helper.SendSelfErrorMessage(types.BadMessageError, "Could not create envelope for: "+sellerEvnAddress, types.DoNothing)
 				return
 			}
 
 			sellerBuffers.IncrementReconnectAttempts(peerID)
 			if execErr := hedera_helper.SendTransactionEnvelope(envelope); execErr != nil {
-				// has errors
-				sellerBuffers.AddBuffer2(peerID, envelope, true, commonlib.SendFail, commonlib.Connecting)
+				sellerBuffers.AddBuffer2(peerID, envelope, true, types.SendFail, types.Connecting)
 				log.Printf("💀 send hedera transaction envelope error %s, will allow to try later %v \n", sellerEvnAddress, setupErr)
-				hedera_helper.SendSelfErrorMessage(neuronbuffers.ServiceError, "Could not send the reqquest to: "+sellerEvnAddress, commonlib.DoNothing)
+				hedera_helper.SendSelfErrorMessage(types.ServiceError, "Could not send the reqquest to: "+sellerEvnAddress, types.DoNothing)
 				return
 			}
-			// has no errors
-			sellerBuffers.AddBuffer2(peerID, envelope, true, commonlib.SendOK, commonlib.Connecting)
-
-		} else { // have buffer,  no cons and requested before: re-submit for up to backoff
-			if isTooEarly, _ := commonlib.IsRequestTooEarly(sellerBuffers, peerID); isTooEarly {
-				return
-			} else {
-				a, b, _ := sellerBuffers.GetReconnectInfo(peerID)
-				log.Println("re-submit because it's time now", isTooEarly, a, b)
-			}
-			sellerBuffers.IncrementReconnectAttempts(peerID)
-			secondExecError := hedera_helper.SendTransactionEnvelope(peerBuffer.RequestOrResponse)
-			if secondExecError != nil {
-				log.Printf("💀-2  skip that seller %s because ExecuteHederaTransaction error: %v", sellerEvnAddress, secondExecError)
-				// TODO: 💥 tell to myself that I could not send the transaction to the other side
-				hedera_helper.SendSelfErrorMessage(neuronbuffers.ServiceError, "Could not send the reqquest to: "+sellerEvnAddress, commonlib.DoNothing)
-				sellerBuffers.UpdateBufferRendezvousState(peerID, commonlib.SendFail)
-				sellerBuffers.UpdateBufferLibP2PState(peerID, commonlib.CanNotConnectUnknownReason)
-				return
-			}
-			sellerBuffers.UpdateBufferRendezvousState(peerID, commonlib.SendOK)
-			sellerBuffers.UpdateBufferLibP2PState(peerID, commonlib.Connecting)
+			sellerBuffers.AddBuffer2(peerID, envelope, true, types.SendOK, types.Connecting)
+		} else if isTooEarly, _ := commonlib.IsRequestTooEarly(sellerBuffers, peerID); isTooEarly {
+			return
+		} else {
+			a, b, _ := sellerBuffers.GetReconnectInfo(peerID)
+			log.Println("re-submit because it's time now", isTooEarly, a, b)
 		}
-	} else { // there are cons
-		if !peerHasBuffer {
-			// it's possible to not have a buffer when you reboot but people still talk to you and that's why you have cons.
-			// just close those cons and issue a new request, you can be lazy and let the loop do that in the next iteration.
-			fmt.Println("I am connected but have no buffer. .. i'll close the peer and just hang around for the loop to issue a fresh request ", peerID)
-			p2pHost.Network().ClosePeer(peerID)
+		sellerBuffers.IncrementReconnectAttempts(peerID)
+		secondExecError := hedera_helper.SendTransactionEnvelope(peerBuffer.RequestOrResponse)
+		if secondExecError != nil {
+			log.Printf("💀-2  skip that seller %s because ExecuteHederaTransaction error: %v", sellerEvnAddress, secondExecError)
+			hedera_helper.SendSelfErrorMessage(types.ServiceError, "Could not send the reqquest to: "+sellerEvnAddress, types.DoNothing)
+			sellerBuffers.UpdateBufferRendezvousState(peerID, types.SendFail)
+			sellerBuffers.UpdateBufferLibP2PState(peerID, types.CanNotConnectUnknownReason)
 			return
 		}
-
+		sellerBuffers.UpdateBufferRendezvousState(peerID, types.SendOK)
+		sellerBuffers.UpdateBufferLibP2PState(peerID, types.Connecting)
+	} else if !peerHasBuffer {
+		fmt.Println("I am connected but have no buffer. .. i'll close the peer and just hang around for the loop to issue a fresh request ", peerID)
+		p2pHost.Network().ClosePeer(peerID)
+		return
+	} else {
 		streams := 0
-		//log.Println("This one has cons", conns)
 		for _, conn := range conns {
 			streams += len(conn.GetStreams())
 		}
-		if streams == 0 { // there are cons but no streams
+		if streams == 0 {
 			log.Println("I am connected but have no streams. .. i'll  close the peer and just hang around ", peerID, streams)
 			p2pHost.Network().ClosePeer(peerID)
 			return
 		} else {
-			sellerBuffers.UpdateBufferRendezvousState(peerID, commonlib.SendOK)
-			sellerBuffers.UpdateBufferLibP2PState(peerID, commonlib.Connected)
-			sellerBuffers.SetLastOtherSideMultiAddress(peerID, conns[0].RemoteMultiaddr())
-
+			sellerBuffers.UpdateBufferRendezvousState(peerID, types.SendOK)
+			sellerBuffers.UpdateBufferLibP2PState(peerID, types.Connected)
+			sellerBuffers.SetLastOtherSideMultiAddress(peerID, conns[0].RemoteMultiaddr().String())
 		}
-	} // end if there are conns
+	}
 }
 
 func getPeerHeartbeatIfRecent(peerInfo hedera_helper.PeerInfo) (hedera_helper.HCSMessage, bool) {

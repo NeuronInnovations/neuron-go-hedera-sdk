@@ -9,17 +9,13 @@ import (
 	"strings"
 	"time"
 
-	validatorLib "github.com/NeuronInnovations/neuron-go-hedera-sdk/validator-lib"
-
-	"github.com/NeuronInnovations/neuron-go-hedera-sdk/keylib"
-
-	hedera_helper "github.com/NeuronInnovations/neuron-go-hedera-sdk/hedera"
-
-	neuronbuffers "github.com/NeuronInnovations/neuron-go-hedera-sdk/common-lib"
-
-	flags "github.com/NeuronInnovations/neuron-go-hedera-sdk/common-lib"
-
 	commonlib "github.com/NeuronInnovations/neuron-go-hedera-sdk/common-lib"
+	flags "github.com/NeuronInnovations/neuron-go-hedera-sdk/common-lib"
+	neuronbuffers "github.com/NeuronInnovations/neuron-go-hedera-sdk/common-lib"
+	hedera_helper "github.com/NeuronInnovations/neuron-go-hedera-sdk/hedera"
+	"github.com/NeuronInnovations/neuron-go-hedera-sdk/keylib"
+	"github.com/NeuronInnovations/neuron-go-hedera-sdk/types"
+	validatorLib "github.com/NeuronInnovations/neuron-go-hedera-sdk/validator-lib"
 
 	"github.com/hashgraph/hedera-sdk-go/v2"
 	"github.com/libp2p/go-libp2p/core/host"
@@ -41,7 +37,7 @@ func HandleSellerCase(ctx context.Context, p2pHost host.Host, protocol protocol.
 			for peerID, bufferInfo := range buyerBuffers.GetBufferMap() {
 
 				// skip if not connected
-				if bufferInfo.LibP2PState != neuronbuffers.Connected || !bufferInfo.IsOtherSideValidAccount {
+				if bufferInfo.LibP2PState != types.Connected || !bufferInfo.IsOtherSideValidAccount {
 					continue
 				}
 
@@ -120,23 +116,22 @@ func HandleSellerCase(ctx context.Context, p2pHost host.Host, protocol protocol.
 				return
 			}
 
-			messageType, ok := commonlib.CheckMessageType(message.Contents)
+			messageType, ok := types.CheckMessageType(message.Contents)
 			if !ok {
 				log.Println("NACK: Ignore message as it doesn't parse") // TODO: send to the other side
 				fmt.Println(message.Contents)
-				hedera_helper.SendSelfErrorMessage(commonlib.BadMessageError, "Error un-marshalling messa", commonlib.StopSending)
+				hedera_helper.SendSelfErrorMessage(types.BadMessageError, "Error un-marshalling messa", types.StopSending)
 				return
-
 			}
 
 			switch messageType {
 			case "serviceRequest":
-				requestMsgFromOtherSide := new(commonlib.NeuronServiceRequestMsg)
+				requestMsgFromOtherSide := new(types.NeuronServiceRequestMsg)
 				err := json.Unmarshal(message.Contents, &requestMsgFromOtherSide)
 				if err != nil {
 					log.Println("NACK: Ignore message as it doesn't parse") // TODO: send to the other side
 					// TODO: send to the other side
-					hedera_helper.SendSelfErrorMessage(commonlib.BadMessageError, fmt.Sprintf("Error un-marshalling message: %v from %s", message.Contents, message.TransactionID.AccountID), commonlib.StopSending)
+					hedera_helper.SendSelfErrorMessage(types.BadMessageError, fmt.Sprintf("Error un-marshalling message: %v from %s", message.Contents, message.TransactionID.AccountID), types.StopSending)
 					return
 				}
 
@@ -148,7 +143,7 @@ func HandleSellerCase(ctx context.Context, p2pHost host.Host, protocol protocol.
 
 				if requestMsgFromOtherSide.Version != "0.4" {
 					fmt.Println("NACK: Ignore message as it does not match the current version", requestMsgFromOtherSide.Version) // TODO: send to the other side
-					hedera_helper.PeerSendErrorMessage(otherSideStdIn, commonlib.VersionError, "I am ignoring your message because it's not matching the current version", commonlib.Upgrade)
+					hedera_helper.PeerSendErrorMessage(otherSideStdIn, types.VersionError, "I am ignoring your message because it's not matching the current version", types.Upgrade)
 					return
 				}
 
@@ -172,7 +167,7 @@ func HandleSellerCase(ctx context.Context, p2pHost host.Host, protocol protocol.
 				}
 
 				if buyerSharedAccountInfo.Balance.AsTinybar() < 100_000_000 {
-					hedera_helper.PeerSendErrorMessage(otherSideStdIn, commonlib.BalanceError, "Your balance is too low, but I will serve you anyway", commonlib.DoNothing)
+					hedera_helper.PeerSendErrorMessage(otherSideStdIn, types.BalanceError, "Your balance is too low, but I will serve you anyway", types.DoNothing)
 				}
 
 				otherPublicKey := requestMsgFromOtherSide.PublicKey
@@ -180,7 +175,7 @@ func HandleSellerCase(ctx context.Context, p2pHost host.Host, protocol protocol.
 				decryptedIpAddress, decodeErr := keylib.DecryptFromOtherside(requestMsgFromOtherSide.EncryptedIpAddress, os.Getenv("private_key"), otherPublicKey)
 				if decodeErr != nil {
 					log.Println("NACK: error decrypting address", decodeErr) // TODO: send to the other side
-					hedera_helper.PeerSendErrorMessage(otherSideStdIn, commonlib.IpDecryptionError, "I am ignoring your message because I can't figure out who to dial", commonlib.SendFreshHederaRequest)
+					hedera_helper.PeerSendErrorMessage(otherSideStdIn, types.IpDecryptionError, "I am ignoring your message because I can't figure out who to dial", types.SendFreshHederaRequest)
 					return
 				}
 				fmt.Printf("decrypted multi address, %s\n", decryptedIpAddress)
@@ -201,39 +196,38 @@ func HandleSellerCase(ctx context.Context, p2pHost host.Host, protocol protocol.
 				}
 				initiationError := commonlib.InitialConnect(ctx, p2pHost, *addrInfo, buyerBuffers, protocol)
 				if initiationError != nil {
-					hedera_helper.PeerSendErrorMessage(otherSideStdIn, commonlib.DialError, fmt.Sprintf("I tried to initialise a connection but got this error: %v", initiationError.Error()), commonlib.PunchMe)
+					hedera_helper.PeerSendErrorMessage(otherSideStdIn, types.DialError, fmt.Sprintf("I tried to initialise a connection but got this error: %v", initiationError.Error()), types.PunchMe)
 				}
 
 				envelope := commonlib.TopicPostalEnvelope{
 					OtherStdInTopic: otherSideStdIn,
 					Message:         requestMsgFromOtherSide,
 				}
-				buyerBuffers.SetLastOtherSideMultiAddress(addrInfo.ID, addrInfo.Addrs[0])
-				buyerBuffers.SetNeuronSellerRequest(addrInfo.ID, envelope)
+				buyerBuffers.SetLastOtherSideMultiAddress(addrInfo.ID, addrInfo.Addrs[0].String())
+				buyerBuffers.SetNeuronSellerRequest(addrInfo.ID, types.TopicPostalEnvelope(envelope))
 			case "peerError": // error from buyer
-
-				buyerError := new(commonlib.NeuronPeerErrorMsg)
+				buyerError := new(types.NeuronPeerErrorMsg)
 				err := json.Unmarshal(message.Contents, &buyerError)
 				if err != nil {
 					fmt.Println("Error un marshalling message service response message", err)
 					return
 				}
 				switch buyerError.ErrorType {
-				case commonlib.DialError:
-				case commonlib.FlushError:
-				case commonlib.DisconnectedError:
-				case commonlib.NoKnownAddressError:
-				case commonlib.HeartBeatError:
-				case commonlib.BalanceError:
-				case commonlib.VersionError:
-				case commonlib.WriteError:
-				case commonlib.StreamError:
-				case commonlib.IpDecryptionError:
-				case commonlib.ServiceError:
+				case types.DialError:
+				case types.FlushError:
+				case types.DisconnectedError:
+				case types.NoKnownAddressError:
+				case types.HeartBeatError:
+				case types.BalanceError:
+				case types.VersionError:
+				case types.WriteError:
+				case types.StreamError:
+				case types.IpDecryptionError:
+				case types.ServiceError:
 				default:
 					fmt.Println("Unknown error type: ", buyerError.ErrorType)
 					//TODO: penalize message sender.
-					hedera_helper.SendSelfErrorMessage(commonlib.BadMessageError, "I received a message that I don't understand", commonlib.StopSending)
+					hedera_helper.SendSelfErrorMessage(types.BadMessageError, "I received a message that I don't understand", types.StopSending)
 					return
 				}
 			default:
