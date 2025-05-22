@@ -28,13 +28,11 @@ package whoami
 
 import (
 	"errors"
-	"fmt"
+	"log"
 	"net"
-	"os"
 	"strconv"
 	"time"
 
-	"github.com/pion/logging"
 	"github.com/pion/stun"
 )
 
@@ -64,7 +62,6 @@ var (
 var (
 	addrStrPtr         = "stun.voipgate.com:3478"
 	timeoutPtr         = 3
-	log                logging.LeveledLogger
 	errResponseMessage = errors.New("error reading from response message channel")
 	errTimedOut        = errors.New("timed out waiting for response")
 	errNoOtherAddress  = errors.New("no OTHER-ADDRESS in message")
@@ -85,8 +82,8 @@ func GetNatInfoAndUpdateGlobals(portFlag *string) (string, string, int, bool) {
 		(mapDesc == "endpoint-independent" && filterDesc == "address-dependent")
 
 	// Optionally, print stunRetrievedPort for logging purposes
-	fmt.Println("STUN Retrieved Port:", stunRetrievedPort)
-	fmt.Println("Reachability", natIPAddress, natPort, stunRetrievedPort, natDeviceType, "reacheable:", natReachability)
+	log.Println("STUN Retrieved Port:", stunRetrievedPort)
+	log.Println("Reachability", natIPAddress, natPort, stunRetrievedPort, natDeviceType, "reacheable:", natReachability)
 
 	// Return the computed values
 
@@ -100,7 +97,6 @@ func GetNatInfoAndUpdateGlobals(portFlag *string) (string, string, int, bool) {
 }
 
 func getNatInfo(bind string) (string, string, string, string, int, error) {
-	log = logging.NewDefaultLeveledLoggerForScope("", logging.LogLevelInfo, os.Stdout)
 	mappingResult, mappingdetail, ipAddr, port, err := mappingTests(addrStrPtr, bind)
 	filterdatail, _ := filteringTests(addrStrPtr, bind)
 	return mappingResult, mappingdetail, filterdatail, ipAddr, port, err
@@ -110,13 +106,13 @@ func getNatInfo(bind string) (string, string, string, string, int, error) {
 func mappingTests(addrStr string, bind string) (string, string, string, int, error) {
 	mapTestConn, err := connect(addrStr, bind)
 	if err != nil {
-		log.Warnf("Error creating STUN connection: %s", err)
+		log.Printf("Error creating STUN connection: %s", err)
 		return "", "", "", -1, err
 	}
 	defer mapTestConn.Close()
 
 	// Test I: Regular binding request
-	log.Info("Mapping Test I: Regular binding request")
+	log.Println("Mapping Test I: Regular binding request")
 	request := stun.MustBuild(stun.TransactionID, stun.BindingRequest)
 
 	resp, err := mapTestConn.roundTrip(request, mapTestConn.RemoteAddr)
@@ -127,27 +123,27 @@ func mappingTests(addrStr string, bind string) (string, string, string, int, err
 	// Parse response message for XOR-MAPPED-ADDRESS and make sure OTHER-ADDRESS valid
 	resps1 := parse(resp)
 	if resps1.xorAddr == nil || resps1.otherAddr == nil {
-		log.Info("Error: NAT discovery feature not supported by this server")
+		log.Println("Error: NAT discovery feature not supported by this server")
 		return "", "", "", -1, errNoOtherAddress
 	}
 	addr, err := net.ResolveUDPAddr("udp4", resps1.otherAddr.String())
 	if err != nil {
-		log.Infof("Failed resolving OTHER-ADDRESS: %v", resps1.otherAddr)
+		log.Printf("Failed resolving OTHER-ADDRESS: %v", resps1.otherAddr)
 		return "", "", "", -1, err
 	}
 
 	mapTestConn.OtherAddr = addr
-	log.Infof("Received XOR-MAPPED-ADDRESS: %v", resps1.xorAddr)
-	log.Infof("Received MAPPED-ADDRESS: %v", resps1.mappedAddr)
+	log.Printf("Received XOR-MAPPED-ADDRESS: %v", resps1.xorAddr)
+	log.Printf("Received MAPPED-ADDRESS: %v", resps1.mappedAddr)
 
 	// Assert mapping behavior
 	if resps1.xorAddr.String() == mapTestConn.LocalAddr.String() {
-		log.Warn("=> NAT mapping behavior: endpoint independent (no NAT)")
+		log.Println("=> NAT mapping behavior: endpoint independent (no NAT)")
 		return "no-nat", "endpoint-independent", resps1.xorAddr.IP.String(), resps1.xorAddr.Port, nil
 	}
 
 	// Test II: Send binding request to the other address but primary port
-	log.Info("Mapping Test II: Send binding request to the other address but primary port")
+	log.Println("Mapping Test II: Send binding request to the other address but primary port")
 	oaddr := *mapTestConn.OtherAddr
 	oaddr.Port = mapTestConn.RemoteAddr.Port
 	resp, err = mapTestConn.roundTrip(request, &oaddr)
@@ -157,14 +153,14 @@ func mappingTests(addrStr string, bind string) (string, string, string, int, err
 
 	// Assert mapping behavior
 	resps2 := parse(resp)
-	log.Infof("Received XOR-MAPPED-ADDRESS: %v", resps2.xorAddr)
+	log.Printf("Received XOR-MAPPED-ADDRESS: %v", resps2.xorAddr)
 	if resps2.xorAddr.String() == resps1.xorAddr.String() {
-		log.Warn("=> NAT mapping behavior: endpoint independent")
+		log.Println("=> NAT mapping behavior: endpoint independent")
 		return "cone", "endpoint-independent", resps2.xorAddr.IP.String(), resps2.xorAddr.Port, nil
 	}
 
 	// Test III: Send binding request to the other address and port
-	log.Info("Mapping Test III: Send binding request to the other address and port")
+	log.Println("Mapping Test III: Send binding request to the other address and port")
 	resp, err = mapTestConn.roundTrip(request, mapTestConn.OtherAddr)
 	if err != nil {
 		return "", "", "", -1, err
@@ -174,15 +170,15 @@ func mappingTests(addrStr string, bind string) (string, string, string, int, err
 	resps3 := parse(resp)
 	var res1, res2 string
 
-	log.Infof("Received XOR-MAPPED-ADDRESS: %v", resps3.xorAddr)
+	log.Printf("Received XOR-MAPPED-ADDRESS: %v", resps3.xorAddr)
 	if resps3.xorAddr.String() == resps2.xorAddr.String() {
 		res1 = "port-restricted-cone"
 		res2 = "address-dependent"
-		log.Warn("=> NAT mapping behavior: address dependent")
+		log.Println("=> NAT mapping behavior: address dependent")
 	} else {
 		res1 = "symmetric"
 		res2 = "address-dependent and port dependent"
-		log.Warn("=> NAT mapping behavior: address and port dependent")
+		log.Println("=> NAT mapping behavior: address and port dependent")
 	}
 
 	return res1, res2, resps3.xorAddr.IP.String(), resps3.xorAddr.Port, mapTestConn.Close()
@@ -192,12 +188,12 @@ func mappingTests(addrStr string, bind string) (string, string, string, int, err
 func filteringTests(addrStr string, bind string) (string, error) {
 	mapTestConn, err := connect(addrStr, bind)
 	if err != nil {
-		log.Warnf("Error creating STUN connection: %s", err)
+		log.Printf("Error creating STUN connection: %s", err)
 		return "", err
 	}
 
 	// Test I: Regular binding request
-	log.Info("Filtering Test I: Regular binding request")
+	log.Println("Filtering Test I: Regular binding request")
 	request := stun.MustBuild(stun.TransactionID, stun.BindingRequest)
 
 	resp, err := mapTestConn.roundTrip(request, mapTestConn.RemoteAddr)
@@ -208,32 +204,32 @@ func filteringTests(addrStr string, bind string) (string, error) {
 
 	resps := parse(resp)
 	if resps.xorAddr == nil || resps.otherAddr == nil {
-		log.Warn("Error: NAT discovery feature not supported by this server")
+		log.Println("Error: NAT discovery feature not supported by this server")
 		return "", errNoOtherAddress
 	}
 	addr, err := net.ResolveUDPAddr("udp4", resps.otherAddr.String())
 	if err != nil {
-		log.Infof("Failed resolving OTHER-ADDRESS: %v", resps.otherAddr)
+		log.Printf("Failed resolving OTHER-ADDRESS: %v", resps.otherAddr)
 		return "", err
 	}
 	mapTestConn.OtherAddr = addr
 
 	// Test II: Request to change both IP and port
-	log.Info("Filtering Test II: Request to change both IP and port")
+	log.Println("Filtering Test II: Request to change both IP and port")
 	request = stun.MustBuild(stun.TransactionID, stun.BindingRequest)
 	request.Add(stun.AttrChangeRequest, []byte{0x00, 0x00, 0x00, 0x06})
 
 	resp, err = mapTestConn.roundTrip(request, mapTestConn.RemoteAddr)
 	if err == nil {
 		parse(resp) // just to print out the resp
-		log.Warn("=> NAT filtering behavior: endpoint independent")
+		log.Println("=> NAT filtering behavior: endpoint independent")
 		return "endpoint-independent", nil
 	} else if !errors.Is(err, errTimedOut) {
 		return "", err // something else went wrong
 	}
 
 	// Test III: Request to change port only
-	log.Info("Filtering Test III: Request to change port only")
+	log.Println("Filtering Test III: Request to change port only")
 	request = stun.MustBuild(stun.TransactionID, stun.BindingRequest)
 	request.Add(stun.AttrChangeRequest, []byte{0x00, 0x00, 0x00, 0x02})
 
@@ -241,10 +237,10 @@ func filteringTests(addrStr string, bind string) (string, error) {
 	var res string
 	if err == nil {
 		parse(resp) // just to print out the resp
-		log.Warn("=> NAT filtering behavior: address dependent")
+		log.Println("=> NAT filtering behavior: address dependent")
 		res = "address-dependent"
 	} else if errors.Is(err, errTimedOut) {
-		log.Warn("=> NAT filtering behavior: address and port dependent")
+		log.Println("=> NAT filtering behavior: address and port dependent")
 		res = "address-and-port-dependent"
 	}
 
@@ -281,12 +277,12 @@ func parse(msg *stun.Message) (ret struct {
 		ret.software = nil
 	}
 
-	log.Debugf("%v", msg)
-	log.Debugf("\tMAPPED-ADDRESS:     %v", ret.mappedAddr)
-	log.Debugf("\tXOR-MAPPED-ADDRESS: %v", ret.xorAddr)
-	log.Debugf("\tRESPONSE-ORIGIN:    %v", ret.respOrigin)
-	log.Debugf("\tOTHER-ADDRESS:      %v", ret.otherAddr)
-	log.Debugf("\tSOFTWARE: %v", ret.software)
+	log.Printf("%v", msg)
+	log.Printf("\tMAPPED-ADDRESS:     %v", ret.mappedAddr)
+	log.Printf("\tXOR-MAPPED-ADDRESS: %v", ret.xorAddr)
+	log.Printf("\tRESPONSE-ORIGIN:    %v", ret.respOrigin)
+	log.Printf("\tOTHER-ADDRESS:      %v", ret.otherAddr)
+	log.Printf("\tSOFTWARE: %v", ret.software)
 	for _, attr := range msg.Attributes {
 		switch attr.Type {
 		case
@@ -297,7 +293,7 @@ func parse(msg *stun.Message) (ret struct {
 			stun.AttrSoftware:
 			break //nolint:staticcheck
 		default:
-			log.Debugf("\t%v (l=%v)", attr, attr.Length)
+			log.Printf("\t%v (l=%v)", attr, attr.Length)
 		}
 	}
 	return ret
@@ -305,10 +301,10 @@ func parse(msg *stun.Message) (ret struct {
 
 // Given an address string, returns a StunServerConn
 func connect(addrStr string, bind string) (*stunServerConn, error) {
-	log.Infof("Connecting to STUN server: %s", addrStr)
+	log.Printf("Connecting to STUN server: %s", addrStr)
 	addr, err := net.ResolveUDPAddr("udp4", addrStr)
 	if err != nil {
-		log.Warnf("Error resolving address: %s", err)
+		log.Printf("Error resolving address: %s", err)
 		return nil, err
 	}
 
@@ -321,8 +317,8 @@ func connect(addrStr string, bind string) (*stunServerConn, error) {
 		return nil, err
 	}
 	//defer c.Close()
-	log.Infof("Local address: %s", c.LocalAddr())
-	log.Infof("Remote address: %s", addr.String())
+	log.Printf("Local address: %s", c.LocalAddr())
+	log.Printf("Remote address: %s", addr.String())
 
 	mChan := listen(c)
 
@@ -337,14 +333,14 @@ func connect(addrStr string, bind string) (*stunServerConn, error) {
 // Send request and wait for response or timeout
 func (c *stunServerConn) roundTrip(msg *stun.Message, addr net.Addr) (*stun.Message, error) {
 	_ = msg.NewTransactionID()
-	log.Infof("Sending to %v: (%v bytes)", addr, msg.Length+messageHeaderSize)
-	log.Debugf("%v", msg)
+	log.Printf("Sending to %v: (%v bytes)", addr, msg.Length+messageHeaderSize)
+	log.Printf("%v", msg)
 	for _, attr := range msg.Attributes {
-		log.Debugf("\t%v (l=%v)", attr, attr.Length)
+		log.Printf("\t%v (l=%v)", attr, attr.Length)
 	}
 	_, err := c.conn.WriteTo(msg.Raw, addr)
 	if err != nil {
-		log.Warnf("Error sending request to %v", addr)
+		log.Printf("Error sending request to %v", addr)
 		return nil, err
 	}
 
@@ -356,7 +352,7 @@ func (c *stunServerConn) roundTrip(msg *stun.Message, addr net.Addr) (*stun.Mess
 		}
 		return m, nil
 	case <-time.After(time.Duration(timeoutPtr) * time.Second):
-		log.Infof("Timed out waiting for response from server %v", addr)
+		log.Printf("Timed out waiting for response from server %v", addr)
 		return nil, errTimedOut
 	}
 }
@@ -373,14 +369,14 @@ func listen(conn *net.UDPConn) (messages chan *stun.Message) {
 				close(messages)
 				return
 			}
-			log.Infof("Response from %v: (%v bytes)", addr, n)
+			log.Printf("Response from %v: (%v bytes)", addr, n)
 			buf = buf[:n]
 
 			m := new(stun.Message)
 			m.Raw = buf
 			err = m.Decode()
 			if err != nil {
-				log.Infof("Error decoding message: %v", err)
+				log.Printf("Error decoding message: %v", err)
 				close(messages)
 				return
 			}

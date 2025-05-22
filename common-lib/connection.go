@@ -205,7 +205,7 @@ func WriteAndFlushBuffer(
 ) error {
 	if bufferInfo.Writer == nil {
 		bufferInfo.LibP2PState = ConnectionLost
-		return fmt.Errorf("%s:stream handler is nil", ConnectionLostWriteError)
+		return fmt.Errorf("%s:stream handler writer is nil", ConnectionLostWriteError)
 	}
 
 	if bufferInfo.LibP2PState == Connected {

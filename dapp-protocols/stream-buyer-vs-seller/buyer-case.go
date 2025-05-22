@@ -142,7 +142,7 @@ func HandleBuyerCase(ctx context.Context, p2pHost host.Host, buyerCase func(ctx 
 			}
 			sharedAcc, _ := hedera.AccountIDFromString(fmt.Sprintf("0.0.%d", scheduleSignRequest.SharedAccID))
 			fmt.Println("adding money to shared account for next round:", sharedAcc)
-			err = hedera_helper.DepositToSharedAccount(sharedAcc, 1)
+			err = hedera_helper.DepositToSharedAccount(sharedAcc, 0.1)
 			if err != nil {
 				fmt.Println("SELFERROR:could not deposit to shared account ", err)
 			}

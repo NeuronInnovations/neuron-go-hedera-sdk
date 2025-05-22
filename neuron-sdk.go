@@ -55,19 +55,17 @@ func init() {
 
 	commonlib.InitEnv()
 
-	myFigure := figure.NewFigure("NEURON NODE ", "doom", true)
-	myFigure.Print()
-
 	// check if the smart contract was loaded in the environment.
 	if os.Getenv("smart_contract_address") == "" {
-		log.Fatalf("smart_contract_address is not set in the %s file", commonlib.MyEnvFile)
+		log.Printf("smart_contract_address is not set in the %s file", commonlib.MyEnvFile)
+		os.Exit(1)
 	}
 	// check the reachability of the node.
 	if (flags.PortFlag == nil) || (*flags.PortFlag == "" || *flags.PortFlag == "0") {
-		log.Fatal("port is not set")
+		log.Printf("port is not set")
+		os.Exit(1)
 	}
 
-	whoami.GetNatInfoAndUpdateGlobals(flags.PortFlag)
 }
 
 // LaunchSDK serves as the entry point to the Neuron SDK, initializing core components,
@@ -109,6 +107,8 @@ func LaunchSDK(
 	// validatorCase func(ctx context.Context, p2pHost host.Host, buffers *neuronbuffers.NodeBuffers),
 ) {
 	ctx := context.Background()
+
+	whoami.GetNatInfoAndUpdateGlobals(flags.PortFlag)
 	Version = version
 	commonlib.MyProtocol = protocol
 
@@ -168,6 +168,10 @@ func LaunchSDK(
 	// The selected mode depends on the value of the flag, and the appropriate configuration
 	// and behavior for relay or peer mode is applied accordingly.
 	// The following sections explain the buyer and seller cases in detail.
+
+	myFigure := figure.NewFigure("NEURON  ", "doom", true)
+	myFigure.Print()
+
 	switch *flags.PeerOrRelayFlag {
 	case "relay": // ================================== RELAY MODE
 		// A relay node is intended to assist peers that are behind strict NATs (Network Address Translators)
