@@ -480,3 +480,43 @@ func getPeerHeartbeatIfRecent(peerInfo hedera_helper.PeerInfo) (hedera_helper.HC
 	}
 	return m, true
 }
+
+// AddSellerManually allows manually adding a seller and triggering the connection process immediately.
+// It takes the seller's public key, libp2p host instance, node buffers for tracking connections,
+// and a list of reachable addresses. The function verifies the seller's availability,
+// retrieves their heartbeat for location information, and processes them immediately.
+func AddSellerManually(sellerPublicKey string, p2pHost host.Host, sellerBuffers *commonlib.NodeBuffers, myReachableAddresses []multiaddr.Multiaddr) error {
+	// Create a Seller struct with the provided public key
+	seller := Seller{
+		PublicKey: sellerPublicKey,
+	}
+
+	// Get seller's EVM address
+	sellerEvnAddress := keylib.ConverHederaPublicKeyToEthereunAddress(seller.PublicKey)
+
+	// Get peer info to verify availability in SC
+	peerInfo, err := hedera_helper.GetPeerInfo(sellerEvnAddress)
+	if err != nil {
+		return fmt.Errorf("failed to get peer SC info: %w", err)
+	}
+	if !peerInfo.Available {
+		return fmt.Errorf("seller is not present in the network SC")
+	}
+
+	// Get the last heartbeat message to get location info
+	if m, ok := getPeerHeartbeatIfRecent(peerInfo); ok {
+		heartbeatMessage := new(commonlib.NeuronHeartBeatMsg)
+		base64Decoded, _ := base64.StdEncoding.DecodeString(m.Message)
+		err = json.Unmarshal([]byte(base64Decoded), &heartbeatMessage)
+		if err != nil {
+			return fmt.Errorf("failed to parse heartbeat message: %w", err)
+		}
+		// Update seller location from heartbeat
+		seller.Lat = heartbeatMessage.Location.Latitude
+		seller.Lon = heartbeatMessage.Location.Longitude
+	}
+
+	// Process the seller immediately
+	processSeller(seller, p2pHost, sellerBuffers, myReachableAddresses)
+	return nil
+}
