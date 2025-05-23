@@ -89,7 +89,7 @@ func HandleSellerCase(ctx context.Context, p2pHost host.Host, protocol protocol.
 				err2 := hedera_helper.SellerSendScheduledTransferRequest(sharedAccID, myParrentAccountID, myDeviceAccountID, buyerStdIn)
 
 				if err2 != nil {
-					log.Panic(err2)
+					log.Panic(err2, "error sending scheduled transfer request")
 				}
 
 			}

@@ -140,14 +140,29 @@ func LaunchSDK(
 
 		//libp2p.Security(noise.ID, noise.New),
 		libp2p.AddrsFactory(func(m []multiaddr.Multiaddr) []multiaddr.Multiaddr {
-			// advertise only public addresses for now.  TODO: reintroduce local addresses
-			filtered := multiaddr.FilterAddrs(m, manet.IsPublicAddr)
-			if flags.MyPublicIpFlag != nil && *flags.MyPublicIpFlag != "" && flags.MyPublicPortFlag != nil && *flags.MyPublicPortFlag != "" {
-				externalAddrUDP, _ := multiaddr.NewMultiaddr(fmt.Sprintf("/ip4/%s/udp/%s/quic-v1", *flags.MyPublicIpFlag, *flags.MyPublicPortFlag))
-				filtered = append(filtered, externalAddrUDP)
+			var filtered []multiaddr.Multiaddr
+
+			if *flags.UseLocalAddressFlag {
+				// When using local addresses, filter for local addresses only
+				filtered = multiaddr.FilterAddrs(m, func(addr multiaddr.Multiaddr) bool {
+					return !manet.IsPublicAddr(addr)
+				})
+
+				// Add localhost address if we have port flag
+				if flags.PortFlag != nil && *flags.PortFlag != "" { // we know the port flag is set and defaults to 0, is the check needed?
+					localAddr, _ := multiaddr.NewMultiaddr(fmt.Sprintf("/ip4/127.0.0.1/udp/%s/quic-v1", *flags.PortFlag))
+					filtered = append(filtered, localAddr)
+				}
 			} else {
-				discoveredAddrUDP, _ := multiaddr.NewMultiaddr(fmt.Sprintf("/ip4/%s/udp/%d/quic-v1", whoami.NatIPAddress, whoami.NatPort))
-				filtered = append(filtered, discoveredAddrUDP)
+				// Default behavior: use public addresses
+				filtered = multiaddr.FilterAddrs(m, manet.IsPublicAddr)
+				if flags.MyPublicIpFlag != nil && *flags.MyPublicIpFlag != "" && flags.MyPublicPortFlag != nil && *flags.MyPublicPortFlag != "" {
+					externalAddrUDP, _ := multiaddr.NewMultiaddr(fmt.Sprintf("/ip4/%s/udp/%s/quic-v1", *flags.MyPublicIpFlag, *flags.MyPublicPortFlag))
+					filtered = append(filtered, externalAddrUDP)
+				} else {
+					discoveredAddrUDP, _ := multiaddr.NewMultiaddr(fmt.Sprintf("/ip4/%s/udp/%d/quic-v1", whoami.NatIPAddress, whoami.NatPort))
+					filtered = append(filtered, discoveredAddrUDP)
+				}
 			}
 			return filtered
 		}),

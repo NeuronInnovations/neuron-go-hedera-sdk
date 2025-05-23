@@ -342,6 +342,11 @@ The `neuron-go-hedera-sdk` supports the following command-line flags for configu
    - **Default**: Not set
    - **Example**: `--my-public-port=9000`
 
+9. **`--use-local-address`**
+   - **Description**: Forces the node to use local addresses instead of public ones. This is useful for local network testing and development.
+   - **Default**: `false`
+   - **Example**: `--use-local-address`
+
 #### Buyer-Specific Flags
 
 1. **`--list-of-sellers-source`**
@@ -363,7 +368,7 @@ The `neuron-go-hedera-sdk` supports the following command-line flags for configu
       ./mydapp --mode=peer --buyer-or-seller=buyer --port=30088  --list-of-sellers-source=env
    ```
 
-   To run the program as a seller, you will need a separate environment file (e.g., .env-seller) to specify the seller’s keys and configuration. The --envFile flag allows you to explicitly define which environment file to use for each instance.
+   To run the program as a seller, you will need a separate environment file (e.g., .env-seller) to specify the seller's keys and configuration. The --envFile flag allows you to explicitly define which environment file to use for each instance.
 
    This setup makes it convenient to run both buyer and seller instances on the same machine for testing purposes. Simply specify a different --envFile value and ensure other parameters (like --port) do not conflict. This approach ensures that you can simulate both roles without any overlaps or configuration issues.          
    ```bash

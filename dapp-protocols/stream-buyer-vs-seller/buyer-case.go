@@ -394,6 +394,11 @@ func processSeller(seller Seller, p2pHost host.Host, sellerBuffers *commonlib.No
 
 	peerBuffer, peerHasBuffer := sellerBuffers.GetBuffer(peerID)
 
+	if peerHasBuffer && peerBuffer == nil {
+		log.Printf("Warning: Got nil peerBuffer for peer %s", peerID)
+		return
+	}
+
 	if peerHasBuffer && !peerBuffer.IsOtherSideValidAccount {
 		fmt.Printf("skipping invalid seller: evm address %s ", sellerEvnAddress)
 		return
@@ -430,16 +435,21 @@ func processSeller(seller Seller, p2pHost host.Host, sellerBuffers *commonlib.No
 			log.Println("re-submit because it's time now", isTooEarly, a, b)
 		}
 		sellerBuffers.IncrementReconnectAttempts(peerID)
-		secondExecError := hedera_helper.SendTransactionEnvelope(peerBuffer.RequestOrResponse)
-		if secondExecError != nil {
-			log.Printf("💀-2  skip that seller %s because ExecuteHederaTransaction error: %v", sellerEvnAddress, secondExecError)
-			hedera_helper.SendSelfErrorMessage(types.ServiceError, "Could not send the reqquest to: "+sellerEvnAddress, types.DoNothing)
-			sellerBuffers.UpdateBufferRendezvousState(peerID, types.SendFail)
-			sellerBuffers.UpdateBufferLibP2PState(peerID, types.CanNotConnectUnknownReason)
+		if peerBuffer != nil && peerBuffer.RequestOrResponse.Message != nil {
+			secondExecError := hedera_helper.SendTransactionEnvelope(peerBuffer.RequestOrResponse)
+			if secondExecError != nil {
+				log.Printf("💀-2  skip that seller %s because ExecuteHederaTransaction error: %v", sellerEvnAddress, secondExecError)
+				hedera_helper.SendSelfErrorMessage(types.ServiceError, "Could not send the reqquest to: "+sellerEvnAddress, types.DoNothing)
+				sellerBuffers.UpdateBufferRendezvousState(peerID, types.SendFail)
+				sellerBuffers.UpdateBufferLibP2PState(peerID, types.CanNotConnectUnknownReason)
+				return
+			}
+			sellerBuffers.UpdateBufferRendezvousState(peerID, types.SendOK)
+			sellerBuffers.UpdateBufferLibP2PState(peerID, types.Connecting)
+		} else {
+			log.Printf("Warning: peerBuffer or RequestOrResponse.Message is nil for peer %s", peerID)
 			return
 		}
-		sellerBuffers.UpdateBufferRendezvousState(peerID, types.SendOK)
-		sellerBuffers.UpdateBufferLibP2PState(peerID, types.Connecting)
 	} else if !peerHasBuffer {
 		fmt.Println("I am connected but have no buffer. .. i'll close the peer and just hang around for the loop to issue a fresh request ", peerID)
 		p2pHost.Network().ClosePeer(peerID)
