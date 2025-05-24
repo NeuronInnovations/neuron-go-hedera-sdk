@@ -67,7 +67,10 @@ func init() {
 		log.Fatal("port is not set")
 	}
 
-	whoami.GetNatInfoAndUpdateGlobals(flags.PortFlag)
+	// Only get NAT info if we're not using local addresses
+	if !*flags.UseLocalAddressFlag {
+		whoami.GetNatInfoAndUpdateGlobals(flags.PortFlag)
+	}
 }
 
 // LaunchSDK serves as the entry point to the Neuron SDK, initializing core components,
