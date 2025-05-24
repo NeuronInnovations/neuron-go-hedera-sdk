@@ -267,6 +267,13 @@ func (nb *NodeBuffers) dumpToJSON(filename string) error {
 	return nil
 }
 
+// set the stream handler
+func (nb *NodeBuffers) SetStreamHandler(peerID peer.ID, streamHandler *network.Stream) {
+	nb.mu.Lock()
+	defer nb.mu.Unlock()
+	nb.Buffers[peerID].StreamHandler = streamHandler
+}
+
 // SetLastGoodsReceivedTime sets the last time goods were received from a peer
 func (nb *NodeBuffers) SetLastGoodsReceivedTime(peerID peer.ID) {
 	nb.mu.Lock()
