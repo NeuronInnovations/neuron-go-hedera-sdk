@@ -23,6 +23,8 @@ require (
 
 require (
 	github.com/Microsoft/go-winio v0.6.2 // indirect
+	github.com/NeuronInnovations/neuron-go-hedera-sdkv2 v0.0.0-00010101000000-000000000000 // indirect
+	github.com/NeuronInnovations/neuron-go-tunnel-sdkv2 v0.0.0-00010101000000-000000000000 // indirect
 	github.com/StackExchange/wmi v1.2.1 // indirect
 	github.com/benbjohnson/clock v1.3.5 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
@@ -155,3 +157,7 @@ require (
 //replace github.com/bluvec/go-adsb => github.com/NeuronInnovations/go-adsb v0.0.0-20231106191027-54f5858b588a
 
 replace google.golang.org/protobuf v1.27.1 => google.golang.org/protobuf v1.26.1-0.20210525005349-febffdd88e85
+
+replace github.com/NeuronInnovations/neuron-go-tunnel-sdkv2 => ../../Repos/neuron-go-tunnel-sdkv2
+
+replace github.com/NeuronInnovations/neuron-go-hedera-sdkv2 => ../../Repos/neuron-go-hedera-sdkv2

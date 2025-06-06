@@ -82,6 +82,7 @@ func InitEnv() {
 	flag.CommandLine.ParseErrorsWhitelist.UnknownFlags = true
 	flag.Parse()
 	MyEnvFile = *envFile
+
 	if e := godotenv.Load(*envFile); e != nil {
 		log.Println("The supplied ", *envFile, " was not found...; This is bad but we'll continue anyway; maybe you're on kubernetes and keys are present in the os env ...")
 		//TODO: check if environment data is present in the os
