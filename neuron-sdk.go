@@ -9,13 +9,15 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
 	commonlib "github.com/NeuronInnovations/neuron-go-hedera-sdk/common-lib"
 	flags "github.com/NeuronInnovations/neuron-go-hedera-sdk/common-lib"
-	neuronbuffers "github.com/NeuronInnovations/neuron-go-hedera-sdk/common-lib"
 	hedera_helper "github.com/NeuronInnovations/neuron-go-hedera-sdk/hedera"
+	"github.com/NeuronInnovations/neuron-go-hedera-sdk/keylib"
+	"github.com/NeuronInnovations/neuron-go-hedera-sdk/types"
 	sdk "github.com/NeuronInnovations/neuron-go-hedera-sdkv2/sdk"
 	sdktypes "github.com/NeuronInnovations/neuron-go-hedera-sdkv2/types"
 	p2p "github.com/NeuronInnovations/neuron-go-tunnel-sdkv2/p2p"
@@ -28,7 +30,6 @@ import (
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/core/protocol"
 	"github.com/multiformats/go-multiaddr"
-	"github.com/umahmood/haversine"
 	"golang.org/x/time/rate"
 )
 
@@ -57,9 +58,9 @@ func LaunchSDK(
 	version string,
 	protocol protocol.ID,
 	keyAndLocationConfigurator func(envIsReady chan bool, envFile string) error,
-	buyerCase func(ctx context.Context, p2pHost host.Host, receivedData chan []byte),
+	buyerCase func(ctx context.Context, p2pHost host.Host, inboundData chan []byte),
 	buyerCaseTopicListener func(topicMessage hedera.TopicMessage),
-	sellerCase func(ctx context.Context, p2pHost host.Host, buffers *neuronbuffers.NodeBuffers),
+	sellerCase func(ctx context.Context, p2pHost host.Host, outboundData chan []byte, errorData chan types.SellerError),
 	sellerCaseTopicListener func(topicMessage hedera.TopicMessage),
 ) {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -87,7 +88,7 @@ func LaunchSDK(
 		case "buyer":
 			initBuyer(ctx, p2pHost, protocol, address, peerId, buyerCase)
 		case "seller":
-			initSeller(ctx, p2pHost)
+			initSeller(ctx, p2pHost, protocol, address, sellerCase)
 		default:
 			log.Panic("unknown buyerOrSellerFlag")
 		}
@@ -184,10 +185,17 @@ func initBuyer(ctx context.Context, p2pHost host.Host, protocol protocol.ID, add
 
 				log.Println("🔎  got ", len(devices), " devices from the explorer")
 
-				center := haversine.Coord{
-					Lat: commonlib.MyLocation.Latitude,
-					Lon: commonlib.MyLocation.Longitude,
-				}
+				// center := haversine.Coord{
+				// 	Lat: commonlib.MyLocation.Latitude,
+				// 	Lon: commonlib.MyLocation.Longitude,
+				// }
+
+				devices = make([]map[string]interface{}, 0)
+				devices = append(devices, map[string]interface{}{
+					"publickey":    "03effa7ea4ebb796d7699094dbf2e8087b0a01dfee4042b5e9c70ddc845104b5ed",
+					"devicerole":   float64(0),
+					"topic_stdout": "0.0.5114842",
+				})
 
 				for _, device := range devices {
 					publicKey, publicKeyOk := device["publickey"].(string)
@@ -221,7 +229,7 @@ func initBuyer(ctx context.Context, p2pHost host.Host, protocol protocol.ID, add
 					hpub, err := hedera.PublicKeyFromString(publicKey)
 
 					if err != nil {
-						log.Println("💀  hedera.PublicKeyFromString error: ", err)
+						fmt.Println("💀  hedera.PublicKeyFromString error: ", err)
 						continue
 					}
 
@@ -235,22 +243,22 @@ func initBuyer(ctx context.Context, p2pHost host.Host, protocol protocol.ID, add
 					}
 
 					// Check if the radius flag is set, if set then check if the seller is in the radius
-					if *flags.RadiusFlag > 0 {
-						radius := flags.RadiusFlag
+					// if *flags.RadiusFlag > 0 {
+					// 	radius := flags.RadiusFlag
 
-						// calculate the distance using the haversine formula
-						farPoint := haversine.Coord{
-							Lat: heartbeatMessage.Location.Latitude,
-							Lon: heartbeatMessage.Location.Longitude,
-						}
+					// 	// calculate the distance using the haversine formula
+					// 	farPoint := haversine.Coord{
+					// 		Lat: heartbeatMessage.Location.Latitude,
+					// 		Lon: heartbeatMessage.Location.Longitude,
+					// 	}
 
-						_, distanceKm := haversine.Distance(center, farPoint)
+					// 	_, distanceKm := haversine.Distance(center, farPoint)
 
-						// check if the distance is less than the radius
-						if int(distanceKm) > *radius {
-							continue
-						}
-					}
+					// 	// check if the distance is less than the radius
+					// 	if int(distanceKm) > *radius {
+					// 		continue
+					// 	}
+					// }
 
 					fmt.Println("Found valid seller", publicKey)
 
@@ -290,10 +298,137 @@ func initBuyer(ctx context.Context, p2pHost host.Host, protocol protocol.ID, add
 }
 
 func handleBuyerStdIn(message hedera.TopicMessage) {
-	fmt.Println("Received message from stdIn topic", message)
+	fmt.Println("Received message from buyer stdIn topic", message)
 }
 
-func initSeller(ctx context.Context, p2pHost host.Host) {
+var sellerP2pHost host.Host
+var sellerP2pBuffers *p2p.NodeBuffers
+
+func initSeller(ctx context.Context, p2pHost host.Host, protocol protocol.ID, address string, sellerCase func(ctx context.Context, p2pHost host.Host, outboundData chan []byte, errorData chan types.SellerError)) {
+	sellerP2pHost = p2pHost
+	sellerP2pBuffers = p2p.NewNodeBuffers()
+
+	addressMultiaddr, err := multiaddr.NewMultiaddr(address)
+
+	if err != nil {
+		log.Fatalf("Failed to create multiaddr: %v", err)
+	}
+
+	json.Unmarshal([]byte(os.Getenv("location")), &commonlib.MyLocation)
+
+	sellerHederaConfig := sdktypes.Config{
+		Version:         string(protocol),
+		Mode:            "seller",
+		PeerID:          p2pHost.ID(),
+		NatReachability: false,
+		Multiaddr:       []multiaddr.Multiaddr{addressMultiaddr},
+		ConnectedPeers:  []peer.ID{},
+		PhysicalLocation: sdktypes.PhysicalLocation{
+			Latitude:  commonlib.MyLocation.Latitude,
+			Longitude: commonlib.MyLocation.Longitude,
+			Altitude:  commonlib.MyLocation.Altitude,
+		},
+	}
+
+	sellerHostInfo := sdktypes.HostInfo{
+		ID:    sellerHederaConfig.PeerID,
+		Addrs: sellerHederaConfig.Multiaddr,
+		Peers: sellerHederaConfig.ConnectedPeers,
+	}
+
+	stdOutTopic, stdInTopic, stdErrTopic, err := sdk.InitialiseNode(ctx, sellerHederaConfig, sellerHostInfo, handleSellerStdIn)
+
+	if err != nil {
+		log.Fatalf("Failed to initialise node: %v", err)
+	}
+
+	sellerTopics := sdktypes.Topics{
+		StdOutTopic: *stdOutTopic,
+		StdInTopic:  *stdInTopic,
+		StdErrTopic: *stdErrTopic,
+	}
+
+	fmt.Println("sellerTopics", sellerTopics)
+
+	receivedData := make(chan []byte)
+	errorData := make(chan types.SellerError)
+
+	go sellerCase(ctx, p2pHost, receivedData, errorData)
+
+	for {
+		select {
+		case <-ctx.Done():
+			fmt.Println("Shutting down seller...")
+			return
+		case error := <-errorData:
+			fmt.Println("Received error from seller", error.Error)
+		case message := <-receivedData:
+			fmt.Println("Received message from seller", len(message))
+
+			//p2p.SendMessage(sellerP2pBuffers, p2pHost.ID(), protocol, message)
+		default:
+			time.Sleep(100 * time.Millisecond)
+		}
+	}
+}
+
+func handleSellerStdIn(message hedera.TopicMessage) {
+	// Parse the message contents as JSON into a map
+	var messageMap map[string]interface{}
+	err := json.Unmarshal(message.Contents, &messageMap)
+	if err != nil {
+		fmt.Printf("Error parsing message: %v\n", err)
+		return
+	}
+
+	fmt.Println("Received message from seller stdIn topic", messageMap)
+
+	// Check if this is a service request
+	if messageType, ok := messageMap["messageType"].(string); ok && messageType == "serviceRequest" {
+		fmt.Printf("Received service request with ID\n")
+		// Handle the service request here
+
+		topicId, _ := messageMap["o"].(string)
+		topicIdUint, _ := strconv.ParseUint(topicId, 10, 64)
+
+		otherSideStdIn := hedera.TopicID{
+			Shard: 0,
+			Realm: 0,
+			Topic: topicIdUint,
+		}
+
+		buyerPublicKey, _ := messageMap["k"].(string)
+		buyerEncryptedIp, _ := messageMap["i"].([]byte)
+
+		buyerPeerID := keylib.ConvertHederaPublicKeyToPeerID(buyerPublicKey)
+		fmt.Println("KEYS", os.Getenv("private_key"), buyerPublicKey)
+		decryptedIpAddress, decodeErr := keylib.DecryptFromOtherside(buyerEncryptedIp, os.Getenv("private_key"), buyerPublicKey)
+		if decodeErr != nil {
+			fmt.Println("NACK: error decrypting address", decodeErr) // TODO: send to the other side
+			hedera_helper.PeerSendErrorMessage(otherSideStdIn, commonlib.IpDecryptionError, "I am ignoring your message because I can't figure out who to dial", commonlib.SendFreshHederaRequest)
+			return
+		}
+
+		if buyerPeerID != "16Uiu2HAmRzidnmMs76pHQrqFEZaAF7ZAXZRom8iMPq6TRi97nc69" {
+			fmt.Println("Buyer not whitelisted")
+			return
+		}
+
+		fmt.Printf("Buyer Public Key: %s\n", buyerPeerID)
+		fmt.Printf("Buyer Peer ID: %s\n", buyerPeerID)
+		fmt.Printf("Decrypted Multiaddr: %s\n", decryptedIpAddress)
+
+		ctx := context.Background()
+
+		peerID, err := p2p.CreateConnection(ctx, sellerP2pHost, sellerP2pBuffers, string(decryptedIpAddress))
+
+		if err != nil {
+			fmt.Println("Error creating connection", err)
+			return
+		}
+
+		fmt.Printf("Connected to buyer with peer ID: %s\n", peerID)
+	}
 }
 
 func loadPrivateKey(keyHex string) (crypto.PrivKey, error) {
