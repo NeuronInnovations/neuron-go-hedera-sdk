@@ -3,15 +3,14 @@ package commonlib
 import (
 	"encoding/json"
 	"fmt"
-	"log"
 	"os"
 	"sync"
 	"time"
 
+	"github.com/NeuronInnovations/neuron-go-hedera-sdk/types"
 	"github.com/hashgraph/hedera-sdk-go/v2"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
-	"github.com/multiformats/go-multiaddr"
 )
 
 // Package-level variable for the BoltDB instance
@@ -22,19 +21,17 @@ var NodeBuffersInstance *NodeBuffers
 
 // Initialize the database in the package init function
 func StateManagerInit(buyerOrSellerFlag string, clearCacheFlag bool) {
-
 	NodeBuffersInstance = NewNodeBuffers()
 
 	// Dump database to JSON for debugging
 	//if err := NodeBuffersInstance.dumpToJSON(fmt.Sprintf("neuron-connections-startup-%s.json", buyerOrSellerFlag)); err != nil {
 	//	log.Printf("Warning: Failed to dump database to JSON: %v", err)
 	//}
-
 }
 
 type NodeBuffers struct {
-	mu      sync.Mutex
 	Buffers map[peer.ID]*NodeBufferInfo
+	mu      sync.RWMutex
 }
 
 // NewNodeBuffers creates a new instance of NodeBuffers
@@ -89,59 +86,37 @@ type TopicPostalEnvelope struct {
 
 // NodeBufferInfo holds runtime info related to a remote peer.
 type NodeBufferInfo struct {
-	Writer                         network.Stream      `json:"-"` //  TODO: only one needed
-	StreamHandler                  *network.Stream     `json:"-"`
-	LastOtherSideMultiAddress      string              `json:"last_other_side_multi_address"`
-	LibP2PState                    LibP2PState         `json:"lib_p2p_state"`
-	RendezvousState                RendezvousState     `json:"rendezvous_state"`
-	IsOtherSideValidAccount        bool                `json:"is_other_side_valid_account"`
-	NoOfConnectionAttempts         int                 `json:"no_of_connection_attempts"`
-	LastConnectionAttempt          time.Time           `json:"last_connection_attempt"`
-	NextScheduledConnectionAttempt time.Time           `json:"next_scheduled_connection_attempt"`
-	RequestOrResponse              TopicPostalEnvelope `json:"request_or_response"`
-	NextScheduleRequestTime        time.Time           `json:"next_schedule_request_time"`
-	LastGoodsReceivedTime          time.Time           `json:"last_goods_received_time"`
+	Writer                         network.Stream            `json:"-"`
+	StreamHandler                  *network.Stream           `json:"-"`
+	LastOtherSideMultiAddress      string                    `json:"last_other_side_multi_address"`
+	LibP2PState                    types.ConnectionState     `json:"lib_p2p_state"`
+	RendezvousState                types.RendezvousState     `json:"rendezvous_state"`
+	IsOtherSideValidAccount        bool                      `json:"is_other_side_valid_account"`
+	NoOfConnectionAttempts         int                       `json:"no_of_connection_attempts"`
+	LastConnectionAttempt          time.Time                 `json:"last_connection_attempt"`
+	NextScheduledConnectionAttempt time.Time                 `json:"next_scheduled_connection_attempt"`
+	RequestOrResponse              types.TopicPostalEnvelope `json:"request_or_response"`
+	NextScheduleRequestTime        time.Time                 `json:"next_schedule_request_time"`
+	LastGoodsReceivedTime          time.Time                 `json:"last_goods_received_time"`
 }
 
-func (sb *NodeBuffers) SetStreamHandler(sellerID peer.ID, streamHandler *network.Stream) {
-	sb.mu.Lock()
-	defer sb.mu.Unlock()
-	info, exists := sb.Buffers[sellerID]
-	if exists {
-		info.StreamHandler = streamHandler
-		// No need to persist StreamHandler as it's not serializable
-	} else {
-		log.Panic(sellerID, "does not exist")
+func (nb *NodeBuffers) AddBuffer2(peerID peer.ID, envelope types.TopicPostalEnvelope, isOtherSideValidAccount bool, rendezvousState types.RendezvousState, libP2PState types.ConnectionState) {
+	nb.mu.Lock()
+	defer nb.mu.Unlock()
+	nb.Buffers[peerID] = &NodeBufferInfo{
+		RequestOrResponse:              envelope,
+		IsOtherSideValidAccount:        isOtherSideValidAccount,
+		RendezvousState:                rendezvousState,
+		LibP2PState:                    libP2PState,
+		LastConnectionAttempt:          time.Now(),
+		NoOfConnectionAttempts:         1,
+		NextScheduledConnectionAttempt: time.Now().Add(time.Second * time.Duration(1<<1)),
+		NextScheduleRequestTime:        time.Now(),
 	}
-}
-
-// set the last other side multiaddress
-func (sb *NodeBuffers) SetLastOtherSideMultiAddress(sellerID peer.ID, lastOtherSideMultiAddress multiaddr.Multiaddr) {
-	sb.mu.Lock()
-	defer sb.mu.Unlock()
-	info, exists := sb.Buffers[sellerID]
-	if exists {
-		info.LastOtherSideMultiAddress = lastOtherSideMultiAddress.String()
-	}
-}
-
-func (sb *NodeBuffers) AddBuffer2(sellerID peer.ID, request TopicPostalEnvelope, isValidAccount bool, rendezvousState RendezvousState, libP2PState LibP2PState) {
-	sb.mu.Lock()
-	defer sb.mu.Unlock()
-	sb.Buffers[sellerID] = &NodeBufferInfo{
-		StreamHandler:           nil,
-		RendezvousState:         rendezvousState,
-		LibP2PState:             libP2PState,
-		IsOtherSideValidAccount: isValidAccount,
-		NoOfConnectionAttempts:  1,
-		LastConnectionAttempt:   time.Now(),
-		RequestOrResponse:       request,
-	}
-
 }
 
 // AddBuffer3 adds a new bufio.Writer for a buyerID with a specified state and a bufio.Writer
-func (bb *NodeBuffers) AddBuffer3(buyerID peer.ID, streamWriter network.Stream, rendezvousState RendezvousState, libP2PState LibP2PState) {
+func (bb *NodeBuffers) AddBuffer3(buyerID peer.ID, streamWriter network.Stream, rendezvousState types.RendezvousState, libP2PState types.ConnectionState) {
 	bb.mu.Lock()
 	defer bb.mu.Unlock()
 	bb.Buffers[buyerID] = &NodeBufferInfo{
@@ -151,11 +126,10 @@ func (bb *NodeBuffers) AddBuffer3(buyerID peer.ID, streamWriter network.Stream, 
 		IsOtherSideValidAccount:        true,
 		NoOfConnectionAttempts:         0,
 		LastConnectionAttempt:          time.Now(),
-		RequestOrResponse:              TopicPostalEnvelope{},
+		RequestOrResponse:              types.TopicPostalEnvelope{},
 		NextScheduleRequestTime:        time.Time{},
 		NextScheduledConnectionAttempt: time.Time{},
 	}
-
 }
 
 // UpdateBufferIsValidAccount updates account validity
@@ -169,126 +143,142 @@ func (bb *NodeBuffers) UpdateBufferIsValidAccount(buyerID peer.ID, isValidAccoun
 }
 
 // GetBuffer returns the NodeBufferInfo associated with a buyerID, if it exists
-func (bb *NodeBuffers) GetBuffer(buyerID peer.ID) (NodeBufferInfo, bool) {
-	bb.mu.Lock()
-	defer bb.mu.Unlock()
-	info, exists := bb.Buffers[buyerID]
-	if !exists {
-		return NodeBufferInfo{}, false
-	}
-	return *info, true
+func (nb *NodeBuffers) GetBuffer(peerID peer.ID) (*NodeBufferInfo, bool) {
+	nb.mu.RLock()
+	defer nb.mu.RUnlock()
+	buffer, ok := nb.Buffers[peerID]
+	return buffer, ok
 }
 
 // RemoveBuffer removes a buyerID and its associated NodeBufferInfo
-func (bb *NodeBuffers) RemoveBuffer(buyerID peer.ID) {
-	bb.mu.Lock()
-	defer bb.mu.Unlock()
-	delete(bb.Buffers, buyerID)
-
+func (nb *NodeBuffers) RemoveBuffer(peerID peer.ID) {
+	nb.mu.Lock()
+	defer nb.mu.Unlock()
+	delete(nb.Buffers, peerID)
 }
 
 // UpdateBufferLibP2PState updates the LibP2PState of a buffer for a given buyerID
-func (bb *NodeBuffers) UpdateBufferLibP2PState(buyerID peer.ID, state LibP2PState) bool {
-	bb.mu.Lock()
-	defer bb.mu.Unlock()
-	info, exists := bb.Buffers[buyerID]
-	if !exists {
-		return false
+func (nb *NodeBuffers) UpdateBufferLibP2PState(peerID peer.ID, state types.ConnectionState) {
+	nb.mu.Lock()
+	defer nb.mu.Unlock()
+	if buffer, ok := nb.Buffers[peerID]; ok {
+		buffer.LibP2PState = state
+		if state == types.Connected {
+			buffer.NoOfConnectionAttempts = 0
+		}
+		buffer.LastConnectionAttempt = time.Now()
 	}
-	info.LibP2PState = state
-	if state == Connected {
-		info.NoOfConnectionAttempts = 0
-	}
-	info.LastConnectionAttempt = time.Now()
-
-	return true
 }
 
 // UpdateBufferRendezvousState updates the RendezvousState of a buffer for a given buyerID
-func (bb *NodeBuffers) UpdateBufferRendezvousState(buyerID peer.ID, state RendezvousState) {
-	bb.mu.Lock()
-	defer bb.mu.Unlock()
-	info, exists := bb.Buffers[buyerID]
-	if exists {
-		info.RendezvousState = state
-
+func (nb *NodeBuffers) UpdateBufferRendezvousState(peerID peer.ID, state types.RendezvousState) {
+	nb.mu.Lock()
+	defer nb.mu.Unlock()
+	if buffer, ok := nb.Buffers[peerID]; ok {
+		buffer.RendezvousState = state
 	}
 }
 
 // IncrementReconnectAttempts increments the reconnection attempt count for a buffer
-func (bb *NodeBuffers) IncrementReconnectAttempts(buyerID peer.ID) {
-	bb.mu.Lock()
-	defer bb.mu.Unlock()
-	info, exists := bb.Buffers[buyerID]
-	if exists {
-		info.NoOfConnectionAttempts += 1
-		info.LastConnectionAttempt = time.Now()
-		info.NextScheduledConnectionAttempt = time.Now().Add(time.Second * time.Duration(1<<info.NoOfConnectionAttempts))
-
+func (nb *NodeBuffers) IncrementReconnectAttempts(peerID peer.ID) {
+	nb.mu.Lock()
+	defer nb.mu.Unlock()
+	if buffer, ok := nb.Buffers[peerID]; ok {
+		buffer.NoOfConnectionAttempts++
+		buffer.LastConnectionAttempt = time.Now()
+		buffer.NextScheduledConnectionAttempt = time.Now().Add(time.Second * time.Duration(1<<buffer.NoOfConnectionAttempts))
 	}
 }
 
 // SetNeuronSellerRequest sets the neuron seller request message
-func (bb *NodeBuffers) SetNeuronSellerRequest(buyerID peer.ID, msg TopicPostalEnvelope) {
+func (bb *NodeBuffers) SetNeuronSellerRequest(buyerID peer.ID, msg types.TopicPostalEnvelope) {
 	bb.mu.Lock()
 	defer bb.mu.Unlock()
 	info, exists := bb.Buffers[buyerID]
 	if exists {
 		info.RequestOrResponse = msg
-
 	}
 }
 
 // GetReconnectInfo returns the reconnection attempt count and last attempt time for a buffer
-func (bb *NodeBuffers) GetReconnectInfo(buyerID peer.ID) (int, time.Time, bool) {
-	bb.mu.Lock()
-	defer bb.mu.Unlock()
-	info, exists := bb.Buffers[buyerID]
-	if !exists {
-		return 0, time.Time{}, false
+func (nb *NodeBuffers) GetReconnectInfo(peerID peer.ID) (int, time.Time, bool) {
+	nb.mu.RLock()
+	defer nb.mu.RUnlock()
+	if buffer, ok := nb.Buffers[peerID]; ok {
+		return buffer.NoOfConnectionAttempts, buffer.LastConnectionAttempt, true
 	}
-	return info.NoOfConnectionAttempts, info.LastConnectionAttempt, true
+	return 0, time.Time{}, false
 }
 
-// GetBufferMap returns a copy of the internal map of buffers and their states
+// GetBufferMap returns a copy of the buffer map
 func (bb *NodeBuffers) GetBufferMap() map[peer.ID]*NodeBufferInfo {
-	bb.mu.Lock()
-	defer bb.mu.Unlock()
-	bufferMapCopy := make(map[peer.ID]*NodeBufferInfo, len(bb.Buffers))
+	bb.mu.RLock()
+	defer bb.mu.RUnlock()
+	bufferMap := make(map[peer.ID]*NodeBufferInfo)
 	for k, v := range bb.Buffers {
-		bufferMapCopy[k] = v
+		bufferMap[k] = v
 	}
-	return bufferMapCopy
+	return bufferMap
 }
 
-func (bb *NodeBuffers) SetLastGoodsReceivedTime(buyerID peer.ID) {
-	bb.mu.Lock()
-	defer bb.mu.Unlock()
-	info, exists := bb.Buffers[buyerID]
-	if exists {
-		info.LastGoodsReceivedTime = time.Now()
-
+// SetLastOtherSideMultiAddress sets the last known multi-address for a peer
+func (nb *NodeBuffers) SetLastOtherSideMultiAddress(peerID peer.ID, addr string) {
+	nb.mu.Lock()
+	defer nb.mu.Unlock()
+	if buffer, ok := nb.Buffers[peerID]; ok {
+		buffer.LastOtherSideMultiAddress = addr
 	}
 }
 
-// dumpToJSON dumps the contents of the NodeBuffers to a JSON file for debugging.
-func (sb *NodeBuffers) dumpToJSON(filename string) error {
-	sb.mu.Lock()
-	defer sb.mu.Unlock()
+// dumpToJSON dumps the buffer state to a JSON file
+func (nb *NodeBuffers) dumpToJSON(filename string) error {
+	nb.mu.RLock()
+	defer nb.mu.RUnlock()
 
-	// Create a map to hold the serializable version of NodeBuffers
-	serializableMap := make(map[string]*NodeBufferInfo)
-
-	for peerID, info := range sb.Buffers {
-		serializableMap[peerID.String()] = info
+	// Create a map to hold the serializable data
+	data := make(map[string]interface{})
+	for k, v := range nb.Buffers {
+		// Create a copy of the buffer info without the non-serializable fields
+		bufferInfo := map[string]interface{}{
+			"last_other_side_multi_address":     v.LastOtherSideMultiAddress,
+			"lib_p2p_state":                     v.LibP2PState,
+			"rendezvous_state":                  v.RendezvousState,
+			"is_other_side_valid_account":       v.IsOtherSideValidAccount,
+			"no_of_connection_attempts":         v.NoOfConnectionAttempts,
+			"last_connection_attempt":           v.LastConnectionAttempt,
+			"next_scheduled_connection_attempt": v.NextScheduledConnectionAttempt,
+			"next_schedule_request_time":        v.NextScheduleRequestTime,
+			"last_goods_received_time":          v.LastGoodsReceivedTime,
+		}
+		data[k.String()] = bufferInfo
 	}
 
-	// Marshal the map to JSON
-	data, err := json.MarshalIndent(serializableMap, "", "  ")
+	// Marshal the data to JSON
+	jsonData, err := json.MarshalIndent(data, "", "  ")
 	if err != nil {
-		return fmt.Errorf("failed to marshal NodeBuffers to JSON: %w", err)
+		return fmt.Errorf("error marshaling buffer state: %w", err)
 	}
 
-	// Write to file
-	return os.WriteFile(filename, data, 0644)
+	// Write the JSON data to the file
+	if err := os.WriteFile(filename, jsonData, 0644); err != nil {
+		return fmt.Errorf("error writing buffer state to file: %w", err)
+	}
+
+	return nil
+}
+
+// set the stream handler
+func (nb *NodeBuffers) SetStreamHandler(peerID peer.ID, streamHandler *network.Stream) {
+	nb.mu.Lock()
+	defer nb.mu.Unlock()
+	nb.Buffers[peerID].StreamHandler = streamHandler
+}
+
+// SetLastGoodsReceivedTime sets the last time goods were received from a peer
+func (nb *NodeBuffers) SetLastGoodsReceivedTime(peerID peer.ID) {
+	nb.mu.Lock()
+	defer nb.mu.Unlock()
+	if buffer, ok := nb.Buffers[peerID]; ok {
+		buffer.LastGoodsReceivedTime = time.Now()
+	}
 }

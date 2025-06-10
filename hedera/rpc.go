@@ -149,12 +149,17 @@ func GetPeerInfo(hederaAccEvmAddress string) (PeerInfo, error) {
 			common.HexToAddress(hederaAccEvmAddress),
 		)
 		if err == nil {
+			// Check if returned peerInfo is empty/default struct
+			if peerInfo == (PeerInfo{}) {
+				return peerInfo, fmt.Errorf("peer not found in the hedera contractfor address; peer must be a registered neuron node: %s", hederaAccEvmAddress)
+			}
 			return peerInfo, nil
 		}
 		fmt.Println("Error getting rpc peer info, retrying:", i, "th time", err)
 		time.Sleep(baseDelay * (1 << i)) // Exponential backoff
 	}
-	return peerInfo, err
+
+	return peerInfo, fmt.Errorf("max retries exceeded getting peer info: %v", err)
 }
 func GetAllPeers() ([]string, error) {
 	contractCaller := GetHRpcClient()

@@ -46,6 +46,9 @@ var RadiusFlag *int
 // ClearCacheFlag specifies whether the cache should be cleared before starting the node. Default is false.
 var ClearCacheFlag *bool
 
+// UseLocalAddressFlag allows forcing the use of local addresses instead of public ones, can only talk to local peers
+var UseLocalAddressFlag *bool
+
 func InitFlags() {
 	PeerOrRelayFlag = flag.String("mode", "peer", "Select peer, or relay")
 	ForceProtocolFlag = flag.String("force-protocol", "udp", "Force protocol: udp or tcp")
@@ -58,6 +61,7 @@ func InitFlags() {
 	ListOfSellersSourceFlag = flag.String("list-of-sellers-source", "explorer", "set where the list of sellers is to be obtained from:'explorer' or 'env'")
 	RadiusFlag = flag.Int("radius", -1, "set radius in Km to restrict seller lat lon when in buyer mode")
 	ClearCacheFlag = flag.Bool("clear-cache", false, "set clear cache flag to delete cache be")
+	UseLocalAddressFlag = flag.Bool("use-local-address", false, "force the use of local addresses instead of discovered public ones, can only talk to local peers")
 	flag.CommandLine.ParseErrorsWhitelist.UnknownFlags = true
 	flag.Parse()
 }
