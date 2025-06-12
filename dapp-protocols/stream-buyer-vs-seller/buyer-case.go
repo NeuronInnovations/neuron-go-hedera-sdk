@@ -31,6 +31,7 @@ import (
 	"github.com/hashgraph/hedera-sdk-go/v2"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/libp2p/go-libp2p/core/protocol"
 	"github.com/multiformats/go-multiaddr"
 	"github.com/umahmood/haversine"
 	"golang.org/x/time/rate"
@@ -42,7 +43,7 @@ type Seller struct {
 	Lon       float64
 }
 
-func HandleBuyerCase(ctx context.Context, p2pHost host.Host, buyerCase func(ctx context.Context, p2pHost host.Host, buffers *neuronbuffers.NodeBuffers), buyerCaseTopicCallBack func(topicMessage hedera.TopicMessage)) {
+func HandleBuyerCase(ctx context.Context, p2pHost host.Host, protocol protocol.ID, buyerCase func(ctx context.Context, p2pHost host.Host, buffers *neuronbuffers.NodeBuffers), buyerCaseTopicCallBack func(topicMessage hedera.TopicMessage)) {
 	fmt.Println("Acting as a data buyer (I'll be initiating a request and then waiting for data to come in)")
 
 	if !whoami.NatReachability {
@@ -171,7 +172,7 @@ func HandleBuyerCase(ctx context.Context, p2pHost host.Host, buyerCase func(ctx 
 				switch sellerError.RecoverAction {
 				case commonlib.SendFreshHederaRequest:
 					// look into the buffers, we have the request there and send it again
-					processSeller(Seller{PublicKey: sellerError.PublicKey}, p2pHost, sellerBuffers, constMyReachableAddresses)
+					processSeller(Seller{PublicKey: sellerError.PublicKey}, p2pHost, sellerBuffers, constMyReachableAddresses, protocol)
 				case commonlib.PunchMe:
 				case commonlib.DoNothing:
 				}
@@ -356,13 +357,12 @@ func HandleBuyerCase(ctx context.Context, p2pHost host.Host, buyerCase func(ctx 
 			listOfSellersLock.RUnlock() // Unlock after copying
 
 			for _, seller := range sellersCopy {
-				processSeller(seller, p2pHost, sellerBuffers, constMyReachableAddresses)
+				processSeller(seller, p2pHost, sellerBuffers, constMyReachableAddresses, protocol)
 			}
 
 			time.Sleep(60 * time.Second)
 		} // end for
 	}()
-
 }
 
 func prepareServiceRequestMsg(seller string, myReachableAddresses []multiaddr.Multiaddr) (types.TopicPostalEnvelope, error) {
@@ -379,7 +379,7 @@ func prepareServiceRequestMsg(seller string, myReachableAddresses []multiaddr.Mu
 	return *res, err
 }
 
-func processSeller(seller Seller, p2pHost host.Host, sellerBuffers *commonlib.NodeBuffers, myReachableAddresses []multiaddr.Multiaddr) {
+func processSeller(seller Seller, p2pHost host.Host, sellerBuffers *commonlib.NodeBuffers, myReachableAddresses []multiaddr.Multiaddr, protocolID protocol.ID) {
 	sellerEvnAddress := keylib.ConverHederaPublicKeyToEthereunAddress(seller.PublicKey)
 	peerIDStr := keylib.ConvertHederaPublicKeyToPeerID(seller.PublicKey)
 	peerID, _ := peer.Decode(peerIDStr)
@@ -460,10 +460,37 @@ func processSeller(seller Seller, p2pHost host.Host, sellerBuffers *commonlib.No
 			streams += len(conn.GetStreams())
 		}
 		if streams == 0 {
-			log.Println("I am connected but have no streams. .. i'll  close the peer and just hang around ", peerID, streams)
-			p2pHost.Network().ClosePeer(peerID)
-			return
+			log.Println("I am connected but have no streams. Attempting to create a new stream...", peerID, streams)
+			// Create a new stream using InitialConnect
+			addrInfo := peer.AddrInfo{
+				ID:    peerID,
+				Addrs: []multiaddr.Multiaddr{conns[0].RemoteMultiaddr()},
+			}
+			if err := commonlib.InitialConnect(context.Background(), p2pHost, addrInfo, sellerBuffers, protocolID); err != nil {
+				log.Printf("Failed to create stream: %v", err)
+				p2pHost.Network().ClosePeer(peerID)
+				return
+			}
+			// After successful InitialConnect, update the buffer state
+			sellerBuffers.UpdateBufferRendezvousState(peerID, types.SendOK)
+			sellerBuffers.UpdateBufferLibP2PState(peerID, types.Connected)
+			sellerBuffers.SetLastOtherSideMultiAddress(peerID, conns[0].RemoteMultiaddr().String())
 		} else {
+			// We have streams, make sure we have a writer set up
+			for _, conn := range conns {
+				for _, stream := range conn.GetStreams() {
+					if stream.Protocol() == protocolID {
+						// Update the buffer with the stream
+						if existingBuffer, exists := sellerBuffers.GetBuffer(peerID); exists {
+							existingBuffer.Writer = stream
+							existingBuffer.StreamHandler = &stream
+						} else {
+							sellerBuffers.AddBuffer3(peerID, stream, types.SendOK, types.Connected)
+						}
+						break
+					}
+				}
+			}
 			sellerBuffers.UpdateBufferRendezvousState(peerID, types.SendOK)
 			sellerBuffers.UpdateBufferLibP2PState(peerID, types.Connected)
 			sellerBuffers.SetLastOtherSideMultiAddress(peerID, conns[0].RemoteMultiaddr().String())
@@ -495,7 +522,7 @@ func getPeerHeartbeatIfRecent(peerInfo hedera_helper.PeerInfo) (hedera_helper.HC
 // It takes the seller's public key, libp2p host instance, node buffers for tracking connections,
 // and a list of reachable addresses. The function verifies the seller's availability,
 // retrieves their heartbeat for location information, and processes them immediately.
-func AddSellerManually(sellerPublicKey string, p2pHost host.Host, sellerBuffers *commonlib.NodeBuffers, myReachableAddresses []multiaddr.Multiaddr) error {
+func AddSellerManually(sellerPublicKey string, p2pHost host.Host, sellerBuffers *commonlib.NodeBuffers, myReachableAddresses []multiaddr.Multiaddr, protocolID protocol.ID) error {
 	// Create a Seller struct with the provided public key
 	seller := Seller{
 		PublicKey: sellerPublicKey,
@@ -527,6 +554,6 @@ func AddSellerManually(sellerPublicKey string, p2pHost host.Host, sellerBuffers 
 	}
 
 	// Process the seller immediately
-	processSeller(seller, p2pHost, sellerBuffers, myReachableAddresses)
+	processSeller(seller, p2pHost, sellerBuffers, myReachableAddresses, protocolID)
 	return nil
 }

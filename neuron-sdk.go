@@ -334,7 +334,7 @@ func launchBuyerVersusSellerApp(
 ) {
 	switch *flags.BuyerOrSellerFlag {
 	case "buyer":
-		streambuyervsseller.HandleBuyerCase(ctx, p2pHost, buyerCase, buyerCaseTopicCallBack)
+		streambuyervsseller.HandleBuyerCase(ctx, p2pHost, protocol, buyerCase, buyerCaseTopicCallBack)
 	case "seller":
 		streambuyervsseller.HandleSellerCase(ctx, p2pHost, protocol, sellerCase, sellerCaseTopicCallBack)
 	case "validator":
