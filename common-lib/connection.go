@@ -203,10 +203,45 @@ func WriteAndFlushBuffer(
 	peerID peer.ID,
 	connectedBuffersOfBuyers *NodeBuffers,
 	data []byte,
+	p2pHost host.Host,
+	protocol protocol.ID,
 ) error {
+
+	// Check if peer is connected
+	activeConns := p2pHost.Network().ConnsToPeer(peerID)
+	if len(activeConns) > 0 {
+		bufferInfo.LibP2PState = types.Connected
+	}
+
 	if bufferInfo.Writer == nil {
-		bufferInfo.LibP2PState = types.ConnectionLost
-		return fmt.Errorf("%s:stream handler is nil", types.ConnectionLostWriteError)
+		// Try to find an existing stream for this peer
+		conns, exists := connectedBuffersOfBuyers.GetBuffer(peerID)
+		if exists && conns != nil && conns.StreamHandler != nil {
+			// Found a stream handler, use it as the writer
+			bufferInfo.Writer = *conns.StreamHandler
+			bufferInfo.StreamHandler = conns.StreamHandler
+		} else {
+			// If no stream handler in buffer, check active connections
+			activeConns := p2pHost.Network().ConnsToPeer(peerID)
+			for _, conn := range activeConns {
+				for _, stream := range conn.GetStreams() {
+					if stream.Protocol() == protocol {
+						// Found an active stream, use it as the writer
+						bufferInfo.Writer = stream
+						bufferInfo.StreamHandler = &stream
+						// Update the buffer with the new stream
+						connectedBuffersOfBuyers.AddBuffer3(peerID, stream, types.SendOK, types.Connected)
+						break
+					}
+				}
+			}
+
+			// If still no writer found, mark as connection lost
+			if bufferInfo.Writer == nil {
+				bufferInfo.LibP2PState = types.ConnectionLost
+				return fmt.Errorf("%s:stream handler is nil", types.ConnectionLostWriteError)
+			}
+		}
 	}
 
 	if bufferInfo.LibP2PState == types.Connected {

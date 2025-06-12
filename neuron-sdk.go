@@ -8,6 +8,7 @@ import (
 	"log"
 
 	neuronbuffers "github.com/NeuronInnovations/neuron-go-hedera-sdk/common-lib"
+	"github.com/NeuronInnovations/neuron-go-hedera-sdk/types"
 
 	flags "github.com/NeuronInnovations/neuron-go-hedera-sdk/common-lib"
 
@@ -270,7 +271,26 @@ func LaunchSDK(
 					log.Println("peer connectednes", e.Connectedness.String())
 				case event.EvtPeerIdentificationCompleted:
 					log.Println("peer identification completed", e.Peer)
-
+					// Get active connections for the peer
+					activeConns := p2pHost.Network().ConnsToPeer(e.Peer)
+					if len(activeConns) > 0 {
+						// Check if we have a buffer for this peer
+						if buffer, exists := commonlib.NodeBuffersInstance.GetBuffer(e.Peer); exists {
+							// Look for a stream with our protocol
+							for _, conn := range activeConns {
+								for _, stream := range conn.GetStreams() {
+									if stream.Protocol() == commonlib.MyProtocol {
+										// Found a stream, update the buffer
+										buffer.Writer = stream
+										buffer.StreamHandler = &stream
+										buffer.LibP2PState = types.Connected
+										commonlib.NodeBuffersInstance.UpdateBufferLibP2PState(e.Peer, types.Connected)
+										break
+									}
+								}
+							}
+						}
+					}
 				default:
 					log.Println("unknown event", e)
 				}
