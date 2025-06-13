@@ -263,7 +263,7 @@ func SellerSendScheduledTransferRequest(
 ) error {
 	client := GetHederaClientUsingEnv()
 	defer client.Close()
-
+	// TODO: move the entire amount out of the shared account.
 	transferTx, err := hedera.NewTransferTransaction().
 		AddHbarTransfer(sharedAccID, hedera.HbarFrom(-0.1, hedera.HbarUnits.Hbar)).
 		AddHbarTransfer(toHederaParentID, hedera.HbarFrom(0.01, hedera.HbarUnits.Hbar)).
