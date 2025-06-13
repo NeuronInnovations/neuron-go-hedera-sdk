@@ -50,19 +50,13 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/NeuronInnovations/neuron-go-hedera-sdk/types"
 	"github.com/libp2p/go-libp2p/core/protocol"
 	flag "github.com/spf13/pflag"
 
 	"github.com/hashgraph/hedera-sdk-go/v2"
 	"github.com/joho/godotenv"
 )
-
-type EnvironmentVarLocation struct {
-	Latitude  float64 `json:"lat"`
-	Longitude float64 `json:"lon"`
-	Altitude  float64 `json:"alt"`
-	GPSFix    string  `json:"gpsfix"`
-}
 
 var (
 	MyEnvFile    string
@@ -72,7 +66,7 @@ var (
 	MyStdErr     hedera.TopicID
 	MyPublicKey  hedera.PublicKey
 	MyPrivateKey crypto.PrivateKey
-	MyLocation   EnvironmentVarLocation
+	MyLocation   types.EnvironmentVarLocation
 
 	// MyArbiterPublicKey  hedera.PublicKey
 )

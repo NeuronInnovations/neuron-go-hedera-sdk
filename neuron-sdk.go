@@ -8,6 +8,7 @@ import (
 	"log"
 
 	neuronbuffers "github.com/NeuronInnovations/neuron-go-hedera-sdk/common-lib"
+	"github.com/NeuronInnovations/neuron-go-hedera-sdk/types"
 
 	flags "github.com/NeuronInnovations/neuron-go-hedera-sdk/common-lib"
 
@@ -449,7 +450,7 @@ func hederaAnnounceAndHeartBeat(ctx context.Context, p2pHost host.Host) (hedera.
 			myPublicAddressesEverything := hostsPublicAddressesSorted(p2pHost)
 			if len(myPublicAddressesEverything) > 0 {
 				//json.Unmarshal([]byte(os.Getenv("location")), &commonlib.MyLocation)
-				heartbeatMessage := commonlib.NeuronHeartBeatMsg{
+				heartbeatMessage := types.NeuronHeartBeatMsg{
 					MessageType:        "NeuronHeartBeat",
 					Location:           commonlib.MyLocation,
 					NatDeviceType:      "", //natDeviceType_g,
@@ -524,7 +525,7 @@ func SetupKeysAndLocation(envFile string, forceLocationFlag *string, configurato
 }
 
 // LoadLocation tries to load the location JSON into the provided object.
-func LoadLocation(forceLocationFlag *string, location *commonlib.EnvironmentVarLocation) error {
+func LoadLocation(forceLocationFlag *string, location *types.EnvironmentVarLocation) error {
 	if *forceLocationFlag != "" {
 		return json.Unmarshal([]byte(*forceLocationFlag), location)
 	}

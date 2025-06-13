@@ -1,3 +1,22 @@
+// messages.go defines the messages that are published to Hedera topics, enabling peers to communicate
+// in a publicly visible manner. The messages are designed to facilitate decentralized coordination
+// while ensuring transparency, as validators and other network participants can inspect the content
+// to understand the intent and context of the messages.
+//
+// These public messages are distinct from the private communications that occur directly between peers
+// via P2P streams. While P2P streams are used for direct, low-latency interactions (e.g., data transfer
+// or rapid acknowledgments), Hedera topic messages serve as a more transparent and auditable mechanism
+// for broadcasting high-level operations or coordinating state transitions.
+//
+// Currently, the messages defined in this file are specific to the BuyerVsSeller protocol, which governs
+// interactions between buyers and sellers in the network. These include heartbeats, service requests,
+// schedule sign requests, and various error messages that peers may send to each other or to themselves.
+//
+// **Future Considerations**:
+// As the SDK evolves to support multiple protocols, each protocol will require its own tailored set of
+// messages. These messages will need to be added and extended in a modular way to ensure that they align
+// with the unique requirements of each protocol, while still adhering to the transparency and audibility
+// principles that Hedera topic communications are designed to provide.
 package types
 
 import (
@@ -7,9 +26,12 @@ import (
 )
 
 // EnvironmentVarLocation represents a location in the environment
+
 type EnvironmentVarLocation struct {
-	Latitude  float64 `json:"latitude"`
-	Longitude float64 `json:"longitude"`
+	Latitude  float64 `json:"lat"`
+	Longitude float64 `json:"lon"`
+	Altitude  float64 `json:"alt"`
+	GPSFix    string  `json:"gpsfix"`
 }
 
 // NeuronMessage interface for all messages

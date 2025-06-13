@@ -109,14 +109,14 @@ func HandleBuyerCase(ctx context.Context, p2pHost host.Host, protocol protocol.I
 		if !validatorLib.IsRequestPermitted() {
 			return
 		}
-		messageType, ok := commonlib.CheckMessageType(topicMessage.Contents)
+		messageType, ok := types.CheckMessageType(topicMessage.Contents)
 		if !ok {
 			fmt.Println("The message doesn't parse")
 			return
 		}
 		switch messageType {
 		case "scheduleSignRequest": // invoice from seller, schedule countersignature request
-			scheduleSignRequest := new(commonlib.NeuronScheduleSignRequestMsg)
+			scheduleSignRequest := new(types.NeuronScheduleSignRequestMsg)
 			err := json.Unmarshal(topicMessage.Contents, &scheduleSignRequest)
 			if err != nil {
 				fmt.Println("Error un marshalling message service response message", err)
@@ -149,36 +149,36 @@ func HandleBuyerCase(ctx context.Context, p2pHost host.Host, protocol protocol.I
 				fmt.Println("SELFERROR:could not deposit to shared account ", err)
 			}
 		case "peerError": // error from seller
-			sellerError := new(commonlib.NeuronPeerErrorMsg)
+			sellerError := new(types.NeuronPeerErrorMsg)
 			err := json.Unmarshal(topicMessage.Contents, &sellerError)
 			if err != nil {
 				fmt.Println("Error un marshalling message service response message", err)
 				return
 			}
 			switch sellerError.ErrorType {
-			case commonlib.DialError:
+			case types.DialError:
 				// get the public key of th sender
 				///peerIDStr := keylib.ConvertHederaPublicKeyToPeerID(acc.PublicKey)
 				//p2pHost.Network().ClosePeer(peer.ID(peerIDStr))
 				//log.Println("Response to dial error cleaning streams to: ", peer.ID(peerIDStr))
-			case commonlib.FlushError:
-			case commonlib.DisconnectedError:
-			case commonlib.NoKnownAddressError:
-			case commonlib.HeartBeatError:
-			case commonlib.BalanceError:
-			case commonlib.VersionError:
-			case commonlib.WriteError:
+			case types.FlushError:
+			case types.DisconnectedError:
+			case types.NoKnownAddressError:
+			case types.HeartBeatError:
+			case types.BalanceError:
+			case types.VersionError:
+			case types.WriteError:
 				fmt.Println("Write error: ", sellerError)
 				switch sellerError.RecoverAction {
-				case commonlib.SendFreshHederaRequest:
+				case types.SendFreshHederaRequest:
 					// look into the buffers, we have the request there and send it again
 					processSeller(Seller{PublicKey: sellerError.PublicKey}, p2pHost, sellerBuffers, constMyReachableAddresses, protocol)
-				case commonlib.PunchMe:
-				case commonlib.DoNothing:
+				case types.PunchMe:
+				case types.DoNothing:
 				}
-			case commonlib.StreamError:
-			case commonlib.IpDecryptionError:
-			case commonlib.ServiceError:
+			case types.StreamError:
+			case types.IpDecryptionError:
+			case types.ServiceError:
 			default:
 				fmt.Println("Unknown error type: ", sellerError.ErrorType)
 				//TODO: penalize message sender.
@@ -221,7 +221,7 @@ func HandleBuyerCase(ctx context.Context, p2pHost host.Host, protocol protocol.I
 					}
 
 					if m, ok := getPeerHeartbeatIfRecent(peerInfo); ok {
-						heartbeatMessage := new(commonlib.NeuronHeartBeatMsg)
+						heartbeatMessage := new(types.NeuronHeartBeatMsg)
 						base64Decoded, _ := base64.StdEncoding.DecodeString(m.Message)
 						err = json.Unmarshal([]byte(base64Decoded), &heartbeatMessage)
 						if err != nil {
@@ -287,7 +287,7 @@ func HandleBuyerCase(ctx context.Context, p2pHost host.Host, protocol protocol.I
 								// finally, include the seller in the list
 
 								publicKey = hpub.StringRaw()
-								heartbeatMessage := new(commonlib.NeuronHeartBeatMsg)
+								heartbeatMessage := new(types.NeuronHeartBeatMsg)
 								base64Decoded, _ := base64.StdEncoding.DecodeString(m.Message)
 								err = json.Unmarshal([]byte(base64Decoded), &heartbeatMessage)
 								if err != nil {
@@ -531,7 +531,7 @@ func AddSellerManually(sellerPublicKey string, p2pHost host.Host, sellerBuffers 
 
 	// Get the last heartbeat message to get location info
 	if m, ok := getPeerHeartbeatIfRecent(peerInfo); ok {
-		heartbeatMessage := new(commonlib.NeuronHeartBeatMsg)
+		heartbeatMessage := new(types.NeuronHeartBeatMsg)
 		base64Decoded, _ := base64.StdEncoding.DecodeString(m.Message)
 		err = json.Unmarshal([]byte(base64Decoded), &heartbeatMessage)
 		if err != nil {

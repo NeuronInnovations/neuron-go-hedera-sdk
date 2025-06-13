@@ -234,7 +234,7 @@ func BuyerPrepareServiceRequest(
 		log.Panic(err)
 	}
 
-	m := &commonlib.NeuronServiceRequestMsg{
+	m := &types.NeuronServiceRequestMsg{
 		MessageType:        "serviceRequest",
 		SlaAgreed:          1,
 		ServiceType:        string(commonlib.MyProtocol),
@@ -310,7 +310,7 @@ func SellerSendScheduledTransferRequest(
 
 	// prepare message and send to the buyer's topic.
 
-	m := &commonlib.NeuronScheduleSignRequestMsg{
+	m := &types.NeuronScheduleSignRequestMsg{
 		MessageType: "scheduleSignRequest",
 		ScheduleID:  scheduleId.Schedule,
 		SharedAccID: sharedAccID.Account,

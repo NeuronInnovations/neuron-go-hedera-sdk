@@ -19,7 +19,6 @@ import (
 
 	"github.com/hashgraph/hedera-sdk-go/v2"
 	"github.com/libp2p/go-libp2p/core/host"
-	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/core/protocol"
 )
@@ -32,41 +31,42 @@ func HandleSellerCase(ctx context.Context, p2pHost host.Host, protocol protocol.
 		buyerBuffers = commonlib.NewNodeBuffers()
 	}
 
-	// Periodically check for active streams and update buffer writers
-	go func() {
-		for {
-			time.Sleep(5 * time.Second) // Check every 5 seconds
-			// Get all active connections
-			for peerID, bufferInfo := range buyerBuffers.GetBufferMap() {
-				// Skip if already connected and has a valid stream
-				if bufferInfo.LibP2PState == types.Connected &&
-					bufferInfo.StreamHandler != nil &&
-					!network.Stream.Conn(*bufferInfo.StreamHandler).IsClosed() {
-					continue
-				}
+	/*
+		// Periodically check for active streams and update buffer writers
+		go func() {
+			for {
+				time.Sleep(5 * time.Second) // Check every 5 seconds
+				// Get all active connections
+				for peerID, bufferInfo := range buyerBuffers.GetBufferMap() {
+					// Skip if already connected and has a valid stream
+					if bufferInfo.LibP2PState == types.Connected &&
+						bufferInfo.StreamHandler != nil &&
+						!network.Stream.Conn(*bufferInfo.StreamHandler).IsClosed() {
+						continue
+					}
 
-				// Check active connections for this peer
-				activeConns := p2pHost.Network().ConnsToPeer(peerID)
-				for _, conn := range activeConns {
-					for _, stream := range conn.GetStreams() {
-						if stream.Protocol() == protocol {
-							// Found a matching stream, update the buffer
-							if existingBuffer, exists := buyerBuffers.GetBuffer(peerID); exists {
-								existingBuffer.Writer = stream
-								existingBuffer.StreamHandler = &stream
-								existingBuffer.LibP2PState = types.Connected
-								log.Printf("Updated stream handler for peer: %s", peerID)
-							} else {
-								log.Println("the stream protocol is not the same as the protocol we are listening to", stream.Protocol(), protocol)
+					// Check active connections for this peer
+					activeConns := p2pHost.Network().ConnsToPeer(peerID)
+					for _, conn := range activeConns {
+						for _, stream := range conn.GetStreams() {
+							if stream.Protocol() == protocol {
+								// Found a matching stream, update the buffer
+								if existingBuffer, exists := buyerBuffers.GetBuffer(peerID); exists {
+									existingBuffer.Writer = stream
+									existingBuffer.StreamHandler = &stream
+									existingBuffer.LibP2PState = types.Connected
+									log.Printf("Updated stream handler for peer: %s", peerID)
+								} else {
+									log.Println("the stream protocol is not the same as the protocol we are listening to", stream.Protocol(), protocol)
+								}
+								break
 							}
-							break
 						}
 					}
 				}
 			}
-		}
-	}()
-
+		}()
+	*/
 	// for each connected buyer send out invoices
 	go func() {
 		for {
@@ -77,7 +77,7 @@ func HandleSellerCase(ctx context.Context, p2pHost host.Host, protocol protocol.
 					continue
 				}
 
-				var requestMsgFromOtherSide commonlib.NeuronServiceRequestMsg
+				var requestMsgFromOtherSide types.NeuronServiceRequestMsg
 				switch message := bufferInfo.RequestOrResponse.Message.(type) {
 				case *types.NeuronServiceRequestMsg:
 					// Convert types.NeuronServiceRequestMsg to commonlib.NeuronServiceRequestMsg
@@ -86,7 +86,7 @@ func HandleSellerCase(ctx context.Context, p2pHost host.Host, protocol protocol.
 				case map[string]interface{}:
 					// Handle the case where the Message is a map[string]interface{}
 					fmt.Println("Message is a map[string]interface{}:", message)
-					requestMsgFromOtherSide := commonlib.NeuronServiceRequestMsg{}
+					requestMsgFromOtherSide := types.NeuronServiceRequestMsg{}
 					messageBytes, err := json.Marshal(message)
 					if err != nil {
 						log.Panic("Error marshaling message: ", err)
