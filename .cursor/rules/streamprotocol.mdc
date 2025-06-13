@@ -1,0 +1,126 @@
+---
+description: 
+globs: 
+alwaysApply: true
+---
+
+# libp2p Stream & Protocol Model
+
+## Quick Summary
+
+- One physical connection (TCP, QUIC, WebTransport, etc)
+- Many multiplexed logical streams over that connection
+- Each stream has:
+  - An internal **Stream ID** (assigned by the multiplexer)
+  - An application-level **Protocol ID** (string you specify)
+
+---
+
+## Stream Creation
+
+- `host.NewStream(ctx, peerID, protocolID)`
+  - Opens a new logical stream over the existing connection.
+  - Negotiates the Protocol ID.
+  - Assigns internal Stream ID (managed by the multiplexer).
+
+- The remote peer's `SetStreamHandler(protocolID, handler)` is invoked.
+
+---
+
+## Visual Model
+
+libp2p Host (peer A)
+└── Single Connection (TCP/QUIC)
+├── Stream #1 (Stream ID: 3)
+│     └── Protocol ID: “/control/1.0.0”
+├── Stream #2 (Stream ID: 5)
+│     └── Protocol ID: “/data/1.0.0”
+├── Stream #3 (Stream ID: 7)
+│     └── Protocol ID: “/data/1.0.0” (another one)
+
+---
+
+## Key Rules
+
+| Concept | Behavior |
+|---------|----------|
+| Stream ID | Internal to multiplexer (yamux/mplex), unique per connection |
+| Protocol ID | Application-level string, used for dispatch |
+| Multiple streams with same Protocol ID? | ✅ Allowed, fully independent |
+| Bidirectional? | ✅ All streams are bidirectional |
+
+---
+
+## Stream Management Patterns
+
+### 1. Stream Registry
+
+Map active streams per peer, e.g.:
+
+```go
+map[peer.ID]map[string]network.Stream
+
+2. Application-Level Stream UUIDs
+
+Generate your own IDs:
+
+streamID := uuid.New().String()
+
+Exchange at start of stream for tracking.
+
+3. Supervisors
+
+Per-peer goroutines handle reconnects, retries, backoffs, etc.
+
+4. Logical Multiplexing
+
+Use one long-lived stream per peer, multiplex logical channels at application level.
+
+type Envelope struct {
+  Type string
+  Payload []byte
+}
+
+
+⸻
+
+Mental Model TLDR
+	•	Connection: physical socket
+	•	Stream: logical channel (internal ID)
+	•	Protocol ID: handler selector
+	•	Stream ID: not exposed via Go API
+	•	Both sides can read/write bidirectionally
+
+⸻
+
+Example Lifecycle
+
+1️⃣ NewStream(peerID, "/my/protocol/1.0.0")
+
+2️⃣ Multiplexer assigns Stream ID (e.g. 5)
+
+3️⃣ Protocol negotiation passes Protocol ID
+
+4️⃣ Remote SetStreamHandler("/my/protocol/1.0.0", handler) invoked
+
+5️⃣ Both sides read/write freely
+
+⸻
+
+Debugging Tip
+	•	Stream IDs are only visible by digging into multiplexer internals.
+	•	For app-level debugging: always log Peer ID, Protocol ID, and optionally your own stream UUID.
+
+---
+
+You can literally copy-paste this straight into your Cursor `.mdc` or any markdown doc.
+
+---
+
+If you want, I can also prepare you a **libp2p agent scaffold**, fully ready for:
+
+- reconnections  
+- stream supervision  
+- protocol management
+
+Shall I? 🚀 (This is stuff you’ll absolutely reuse across projects.)

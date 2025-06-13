@@ -144,7 +144,7 @@ func HandleBuyerCase(ctx context.Context, p2pHost host.Host, protocol protocol.I
 			}
 			sharedAcc, _ := hedera.AccountIDFromString(fmt.Sprintf("0.0.%d", scheduleSignRequest.SharedAccID))
 			fmt.Println("adding money to shared account for next round:", sharedAcc)
-			err = hedera_helper.DepositToSharedAccount(sharedAcc, 0.1)
+			err = hedera_helper.DepositToSharedAccount(sharedAcc, 100)
 			if err != nil {
 				fmt.Println("SELFERROR:could not deposit to shared account ", err)
 			}
@@ -371,7 +371,7 @@ func prepareServiceRequestMsg(seller string, myReachableAddresses []multiaddr.Mu
 		os.Getenv("hedera_evm_id"),
 		keylib.ConverHederaPublicKeyToEthereunAddress(seller),
 		"e2436b1e019e993215e832762f9242020d199940",
-		100,
+		100, // 100 milli hbar
 	)
 	if err != nil {
 		return types.TopicPostalEnvelope{}, err
@@ -408,9 +408,9 @@ func processSeller(seller Seller, p2pHost host.Host, sellerBuffers *commonlib.No
 		return
 	}
 
-	conns := p2pHost.Network().ConnsToPeer(peerID)
+	connsToPeer := p2pHost.Network().ConnsToPeer(peerID)
 
-	if len(conns) == 0 {
+	if len(connsToPeer) == 0 {
 		if !peerHasBuffer {
 			envelope, setupErr := prepareServiceRequestMsg(seller.PublicKey, myReachableAddresses)
 			if setupErr != nil {
@@ -456,28 +456,17 @@ func processSeller(seller Seller, p2pHost host.Host, sellerBuffers *commonlib.No
 		return
 	} else {
 		streams := 0
-		for _, conn := range conns {
+		for _, conn := range connsToPeer {
 			streams += len(conn.GetStreams())
 		}
 		if streams == 0 {
-			log.Println("I am connected but have no streams. Attempting to create a new stream...", peerID, streams)
-			// Create a new stream using InitialConnect
-			addrInfo := peer.AddrInfo{
-				ID:    peerID,
-				Addrs: []multiaddr.Multiaddr{conns[0].RemoteMultiaddr()},
-			}
-			if err := commonlib.InitialConnect(context.Background(), p2pHost, addrInfo, sellerBuffers, protocolID); err != nil {
-				log.Printf("Failed to create stream: %v", err)
-				p2pHost.Network().ClosePeer(peerID)
-				return
-			}
-			// After successful InitialConnect, update the buffer state
-			sellerBuffers.UpdateBufferRendezvousState(peerID, types.SendOK)
-			sellerBuffers.UpdateBufferLibP2PState(peerID, types.Connected)
-			sellerBuffers.SetLastOtherSideMultiAddress(peerID, conns[0].RemoteMultiaddr().String())
+			log.Println("I am connected but have no streams. Because I'm a buyer, I'll just hang around for the loop to issue a fresh request. I am not supposed to do newStream - the seller is responsible for that.", peerID, streams)
+
 		} else {
+			log.Println("I am coonnected and have streams. I'll make sure the writer is stored in the buffer.", peerID, streams)
+
 			// We have streams, make sure we have a writer set up
-			for _, conn := range conns {
+			for _, conn := range connsToPeer {
 				for _, stream := range conn.GetStreams() {
 					if stream.Protocol() == protocolID {
 						// Update the buffer with the stream
@@ -485,7 +474,7 @@ func processSeller(seller Seller, p2pHost host.Host, sellerBuffers *commonlib.No
 							existingBuffer.Writer = stream
 							existingBuffer.StreamHandler = &stream
 						} else {
-							sellerBuffers.AddBuffer3(peerID, stream, types.SendOK, types.Connected)
+							log.Println("I don't know what to do with this stream. I'll just hang around for the loop to issue a fresh request. I am not supposed to do newStream - the seller is responsible for that.", peerID, streams)
 						}
 						break
 					}
@@ -493,7 +482,7 @@ func processSeller(seller Seller, p2pHost host.Host, sellerBuffers *commonlib.No
 			}
 			sellerBuffers.UpdateBufferRendezvousState(peerID, types.SendOK)
 			sellerBuffers.UpdateBufferLibP2PState(peerID, types.Connected)
-			sellerBuffers.SetLastOtherSideMultiAddress(peerID, conns[0].RemoteMultiaddr().String())
+			sellerBuffers.SetLastOtherSideMultiAddress(peerID, connsToPeer[0].RemoteMultiaddr().String())
 		}
 	}
 }

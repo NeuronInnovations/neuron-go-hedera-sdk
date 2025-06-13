@@ -21,6 +21,8 @@ import (
 	"github.com/libp2p/go-libp2p/core/protocol"
 )
 
+// Note: Only the seller can perform the initial connection. The buyer initiates the request
+// but the seller must establish the actual connection and stream.
 func InitialConnect(ctx context.Context, p2pHost host.Host, addrInfo peer.AddrInfo, buyerBuffers *NodeBuffers, protocol protocol.ID) error {
 
 	// show address info

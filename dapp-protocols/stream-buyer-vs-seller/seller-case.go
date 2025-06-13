@@ -57,8 +57,7 @@ func HandleSellerCase(ctx context.Context, p2pHost host.Host, protocol protocol.
 								existingBuffer.LibP2PState = types.Connected
 								log.Printf("Updated stream handler for peer: %s", peerID)
 							} else {
-								buyerBuffers.AddBuffer3(peerID, stream, types.ReceivedOK, types.Connected)
-								log.Printf("Created new buffer with stream for peer: %s", peerID)
+								log.Println("the stream protocol is not the same as the protocol we are listening to", stream.Protocol(), protocol)
 							}
 							break
 						}
@@ -80,10 +79,10 @@ func HandleSellerCase(ctx context.Context, p2pHost host.Host, protocol protocol.
 
 				var requestMsgFromOtherSide commonlib.NeuronServiceRequestMsg
 				switch message := bufferInfo.RequestOrResponse.Message.(type) {
-				case *commonlib.NeuronServiceRequestMsg:
-					// Handle the case where the Message is already a NeuronServiceRequestMsg
-					fmt.Println("Message is already a NeuronServiceRequestMsg:", message)
-					requestMsgFromOtherSide = *message
+				case *types.NeuronServiceRequestMsg:
+					// Convert types.NeuronServiceRequestMsg to commonlib.NeuronServiceRequestMsg
+					msgBytes, _ := json.Marshal(message)
+					json.Unmarshal(msgBytes, &requestMsgFromOtherSide)
 				case map[string]interface{}:
 					// Handle the case where the Message is a map[string]interface{}
 					fmt.Println("Message is a map[string]interface{}:", message)
@@ -130,7 +129,7 @@ func HandleSellerCase(ctx context.Context, p2pHost host.Host, protocol protocol.
 				}
 
 			}
-			time.Sleep(45 * time.Minute)
+			time.Sleep(1 * time.Minute)
 		}
 	}()
 

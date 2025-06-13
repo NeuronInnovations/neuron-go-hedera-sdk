@@ -263,12 +263,24 @@ func SellerSendScheduledTransferRequest(
 ) error {
 	client := GetHederaClientUsingEnv()
 	defer client.Close()
-	// TODO: move the entire amount out of the shared account.
+
+	// Get the current balance of the shared account
+	accountInfo, err := GetAccountInfoFromNetwork(sharedAccID)
+	if err != nil {
+		return fmt.Errorf("failed to get account balance: %v", err)
+	}
+
+	totalAmount := accountInfo.Balance.As(hedera.HbarUnits.Millibar)
+	log.Printf("Shared account balance: %f millibar", totalAmount)
+
+	// Move the entire amount out of the shared account with 60/40 split
+	sixtyPercent := float64(totalAmount) * 0.6
+	fortyPercent := float64(totalAmount) * 0.4
+
 	transferTx, err := hedera.NewTransferTransaction().
-		AddHbarTransfer(sharedAccID, hedera.HbarFrom(-0.1, hedera.HbarUnits.Hbar)).
-		AddHbarTransfer(toHederaParentID, hedera.HbarFrom(0.01, hedera.HbarUnits.Hbar)).
-		AddHbarTransfer(toHederaDeviceID, hedera.HbarFrom(0.09, hedera.HbarUnits.Hbar)).
-		// TODO: AddTokenTransfer() transfer tokens to  other fee and reward accounts.
+		AddHbarTransfer(sharedAccID, hedera.HbarFrom(-float64(totalAmount), hedera.HbarUnits.Millibar)).
+		AddHbarTransfer(toHederaParentID, hedera.HbarFrom(sixtyPercent, hedera.HbarUnits.Millibar)). // 60% of total
+		AddHbarTransfer(toHederaDeviceID, hedera.HbarFrom(fortyPercent, hedera.HbarUnits.Millibar)). // 40% of total
 		SetTransactionMemo(uuid.New().String()).
 		FreezeWith(client)
 
@@ -570,8 +582,8 @@ func DepositToSharedAccount(sharedAccountID hedera.AccountID, amount float64) er
 	client := GetHederaClientUsingEnv()
 	defer client.Close()
 	_, err := hedera.NewTransferTransaction().
-		AddHbarTransfer(client.GetOperatorAccountID(), hedera.HbarFrom(-amount, hedera.HbarUnits.Hbar)). // Send 3 HBAR
-		AddHbarTransfer(sharedAccountID, hedera.HbarFrom(amount, hedera.HbarUnits.Hbar)).                // Receive 3 HBAR
+		AddHbarTransfer(client.GetOperatorAccountID(), hedera.HbarFrom(-amount, hedera.HbarUnits.Millibar)). // Send 3 HBAR
+		AddHbarTransfer(sharedAccountID, hedera.HbarFrom(amount, hedera.HbarUnits.Millibar)).                // Receive 3 HBAR
 		Execute(client)
 	return err
 }

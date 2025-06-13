@@ -23,13 +23,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-)
 
-// NeuronMessage interface for all messages
-type NeuronMessage interface {
-	GetMessageType() string
-	GetVersion() string
-}
+	"github.com/NeuronInnovations/neuron-go-hedera-sdk/types"
+)
 
 // MessageType represents different types of messages
 type MessageType string
@@ -168,7 +164,7 @@ func CheckMessageType(jsonData []byte) (string, bool) {
 }
 
 // UnmarshalNeuronMessage function unmarshals JSON data into the correct NeuronMessage type based on the "messageType" field
-func UnmarshalNeuronMessage(jsonData []byte) (NeuronMessage, error) {
+func UnmarshalNeuronMessage(jsonData []byte) (types.NeuronMessage, error) {
 	// Get the message type from the JSON data
 	messageType, ok := CheckMessageType(jsonData)
 	if !ok {
