@@ -19,6 +19,7 @@ import (
 
 	"github.com/hashgraph/hedera-sdk-go/v2"
 	"github.com/libp2p/go-libp2p/core/host"
+	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/core/protocol"
 )
@@ -30,6 +31,42 @@ func HandleSellerCase(ctx context.Context, p2pHost host.Host, protocol protocol.
 	if buyerBuffers == nil {
 		buyerBuffers = commonlib.NewNodeBuffers()
 	}
+
+	// Periodically check for active streams and update buffer writers
+	go func() {
+		for {
+			time.Sleep(5 * time.Second) // Check every 5 seconds
+			// Get all active connections
+			for peerID, bufferInfo := range buyerBuffers.GetBufferMap() {
+				// Skip if already connected and has a valid stream
+				if bufferInfo.LibP2PState == types.Connected &&
+					bufferInfo.StreamHandler != nil &&
+					!network.Stream.Conn(*bufferInfo.StreamHandler).IsClosed() {
+					continue
+				}
+
+				// Check active connections for this peer
+				activeConns := p2pHost.Network().ConnsToPeer(peerID)
+				for _, conn := range activeConns {
+					for _, stream := range conn.GetStreams() {
+						if stream.Protocol() == protocol {
+							// Found a matching stream, update the buffer
+							if existingBuffer, exists := buyerBuffers.GetBuffer(peerID); exists {
+								existingBuffer.Writer = stream
+								existingBuffer.StreamHandler = &stream
+								existingBuffer.LibP2PState = types.Connected
+								log.Printf("Updated stream handler for peer: %s", peerID)
+							} else {
+								buyerBuffers.AddBuffer3(peerID, stream, types.ReceivedOK, types.Connected)
+								log.Printf("Created new buffer with stream for peer: %s", peerID)
+							}
+							break
+						}
+					}
+				}
+			}
+		}
+	}()
 
 	// for each connected buyer send out invoices
 	go func() {

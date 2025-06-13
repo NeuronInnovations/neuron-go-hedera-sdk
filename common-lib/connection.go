@@ -59,7 +59,7 @@ func InitialConnect(ctx context.Context, p2pHost host.Host, addrInfo peer.AddrIn
 	defer cancel()
 
 	for _, conn := range p2pHost.Network().ConnsToPeer(addrInfo.ID) {
-		log.Println("Connection to %s open with muxer: %s", addrInfo.ID, conn.ConnState())
+		log.Printf("Connection to %s open with muxer: %v", addrInfo.ID, conn.ConnState())
 	}
 
 	s, strErr := p2pHost.NewStream(streamCtx, addrInfo.ID, protocol)
