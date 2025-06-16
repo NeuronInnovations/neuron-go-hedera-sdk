@@ -129,7 +129,7 @@ func HandleSellerCase(ctx context.Context, p2pHost host.Host, protocol protocol.
 				}
 
 			}
-			time.Sleep(1 * time.Minute)
+			time.Sleep(60 * time.Minute)
 		}
 	}()
 
@@ -202,7 +202,7 @@ func HandleSellerCase(ctx context.Context, p2pHost host.Host, protocol protocol.
 					return
 				}
 
-				if buyerSharedAccountInfo.Balance.AsTinybar() < 100_000_000 {
+				if buyerSharedAccountInfo.Balance.AsTinybar() < 100 {
 					hedera_helper.PeerSendErrorMessage(otherSideStdIn, types.BalanceError, "Your balance is too low, but I will serve you anyway", types.DoNothing)
 				}
 

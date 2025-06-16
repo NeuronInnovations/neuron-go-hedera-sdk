@@ -9,7 +9,6 @@ import (
 
 	"github.com/NeuronInnovations/neuron-go-hedera-sdk/types"
 	"github.com/hashgraph/hedera-sdk-go/v2"
-	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 )
 
@@ -86,8 +85,6 @@ type TopicPostalEnvelope struct {
 
 // NodeBufferInfo holds runtime info related to a remote peer.
 type NodeBufferInfo struct {
-	Writer                         network.Stream            `json:"-"`
-	StreamHandler                  *network.Stream           `json:"-"`
 	LastOtherSideMultiAddress      string                    `json:"last_other_side_multi_address"`
 	LibP2PState                    types.ConnectionState     `json:"lib_p2p_state"`
 	RendezvousState                types.RendezvousState     `json:"rendezvous_state"`
@@ -115,12 +112,11 @@ func (nb *NodeBuffers) AddBuffer2(peerID peer.ID, envelope types.TopicPostalEnve
 	}
 }
 
-// AddBuffer3 adds a new bufio.Writer for a buyerID with a specified state and a bufio.Writer
-func (bb *NodeBuffers) AddBuffer3(buyerID peer.ID, streamWriter network.Stream, rendezvousState types.RendezvousState, libP2PState types.ConnectionState) {
+// AddBuffer3 adds a new buffer for a buyerID with specified states
+func (bb *NodeBuffers) AddBuffer3(buyerID peer.ID, rendezvousState types.RendezvousState, libP2PState types.ConnectionState) {
 	bb.mu.Lock()
 	defer bb.mu.Unlock()
 	bb.Buffers[buyerID] = &NodeBufferInfo{
-		Writer:                         streamWriter,
 		RendezvousState:                rendezvousState,
 		LibP2PState:                    libP2PState,
 		IsOtherSideValidAccount:        true,
@@ -265,13 +261,6 @@ func (nb *NodeBuffers) dumpToJSON(filename string) error {
 	}
 
 	return nil
-}
-
-// set the stream handler
-func (nb *NodeBuffers) SetStreamHandler(peerID peer.ID, streamHandler *network.Stream) {
-	nb.mu.Lock()
-	defer nb.mu.Unlock()
-	nb.Buffers[peerID].StreamHandler = streamHandler
 }
 
 // SetLastGoodsReceivedTime sets the last time goods were received from a peer

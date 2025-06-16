@@ -463,23 +463,8 @@ func processSeller(seller Seller, p2pHost host.Host, sellerBuffers *commonlib.No
 			log.Println("I am connected but have no streams. Because I'm a buyer, I'll just hang around for the loop to issue a fresh request. I am not supposed to do newStream - the seller is responsible for that.", peerID, streams)
 
 		} else {
-			log.Println("I am coonnected and have streams. I'll make sure the writer is stored in the buffer.", peerID, streams)
+			log.Println("I am connected and have streams..", peerID, streams)
 
-			// We have streams, make sure we have a writer set up
-			for _, conn := range connsToPeer {
-				for _, stream := range conn.GetStreams() {
-					if stream.Protocol() == protocolID {
-						// Update the buffer with the stream
-						if existingBuffer, exists := sellerBuffers.GetBuffer(peerID); exists {
-							existingBuffer.Writer = stream
-							existingBuffer.StreamHandler = &stream
-						} else {
-							log.Println("I don't know what to do with this stream. I'll just hang around for the loop to issue a fresh request. I am not supposed to do newStream - the seller is responsible for that.", peerID, streams)
-						}
-						break
-					}
-				}
-			}
 			sellerBuffers.UpdateBufferRendezvousState(peerID, types.SendOK)
 			sellerBuffers.UpdateBufferLibP2PState(peerID, types.Connected)
 			sellerBuffers.SetLastOtherSideMultiAddress(peerID, connsToPeer[0].RemoteMultiaddr().String())
