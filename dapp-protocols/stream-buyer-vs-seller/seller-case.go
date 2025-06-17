@@ -207,7 +207,17 @@ func HandleSellerCase(ctx context.Context, p2pHost host.Host, protocol protocol.
 				}
 
 				otherPublicKey := requestMsgFromOtherSide.PublicKey
-				otherPeerID := keylib.ConvertHederaPublicKeyToPeerID(otherPublicKey)
+				// Convert other peer's public key to peer ID
+				otherPeerIDStr, err := keylib.ConvertHederaPublicKeyToPeerID(otherPublicKey)
+				if err != nil {
+					log.Printf("Error converting other peer's public key to peer ID: %v", err)
+					return
+				}
+				otherPeerID, err := peer.Decode(otherPeerIDStr)
+				if err != nil {
+					log.Printf("Error decoding other peer's ID: %v", err)
+					return
+				}
 				decryptedIpAddress, decodeErr := keylib.DecryptFromOtherside(requestMsgFromOtherSide.EncryptedIpAddress, os.Getenv("private_key"), otherPublicKey)
 				if decodeErr != nil {
 					log.Println("NACK: error decrypting address", decodeErr) // TODO: send to the other side

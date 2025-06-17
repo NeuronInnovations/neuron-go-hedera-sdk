@@ -381,8 +381,17 @@ func prepareServiceRequestMsg(seller string, myReachableAddresses []multiaddr.Mu
 
 func processSeller(seller Seller, p2pHost host.Host, sellerBuffers *commonlib.NodeBuffers, myReachableAddresses []multiaddr.Multiaddr, protocolID protocol.ID) {
 	sellerEvnAddress := keylib.ConverHederaPublicKeyToEthereunAddress(seller.PublicKey)
-	peerIDStr := keylib.ConvertHederaPublicKeyToPeerID(seller.PublicKey)
-	peerID, _ := peer.Decode(peerIDStr)
+	// Convert seller's public key to peer ID
+	peerIDStr, err := keylib.ConvertHederaPublicKeyToPeerID(seller.PublicKey)
+	if err != nil {
+		log.Printf("Error converting seller public key to peer ID: %v", err)
+		return
+	}
+	targetPeerID, err := peer.Decode(peerIDStr)
+	if err != nil {
+		log.Printf("Error decoding peer ID: %v", err)
+		return
+	}
 	perrInfo, err := hedera_helper.GetPeerInfo(sellerEvnAddress)
 
 	if err != nil {
@@ -392,10 +401,10 @@ func processSeller(seller Seller, p2pHost host.Host, sellerBuffers *commonlib.No
 		return
 	}
 
-	peerBuffer, peerHasBuffer := sellerBuffers.GetBuffer(peerID)
+	peerBuffer, peerHasBuffer := sellerBuffers.GetBuffer(targetPeerID)
 
 	if peerHasBuffer && peerBuffer == nil {
-		log.Printf("Warning: Got nil peerBuffer for peer %s", peerID)
+		log.Printf("Warning: Got nil peerBuffer for peer %s", targetPeerID)
 		return
 	}
 
@@ -408,51 +417,51 @@ func processSeller(seller Seller, p2pHost host.Host, sellerBuffers *commonlib.No
 		return
 	}
 
-	connsToPeer := p2pHost.Network().ConnsToPeer(peerID)
+	connsToPeer := p2pHost.Network().ConnsToPeer(targetPeerID)
 
 	if len(connsToPeer) == 0 {
 		if !peerHasBuffer {
 			envelope, setupErr := prepareServiceRequestMsg(seller.PublicKey, myReachableAddresses)
 			if setupErr != nil {
-				sellerBuffers.AddBuffer2(peerID, envelope, false, types.NotInitiated, types.ConnectionLost)
+				sellerBuffers.AddBuffer2(targetPeerID, envelope, false, types.NotInitiated, types.ConnectionLost)
 				log.Printf("💀 envelope setup error; seller %s will be blacklisted, err: %v \n", sellerEvnAddress, setupErr)
 				hedera_helper.SendSelfErrorMessage(types.BadMessageError, "Could not create envelope for: "+sellerEvnAddress, types.DoNothing)
 				return
 			}
 
-			sellerBuffers.IncrementReconnectAttempts(peerID)
+			sellerBuffers.IncrementReconnectAttempts(targetPeerID)
 			if execErr := hedera_helper.SendTransactionEnvelope(envelope); execErr != nil {
-				sellerBuffers.AddBuffer2(peerID, envelope, true, types.SendFail, types.Connecting)
+				sellerBuffers.AddBuffer2(targetPeerID, envelope, true, types.SendFail, types.Connecting)
 				log.Printf("💀 send hedera transaction envelope error %s, will allow to try later %v \n", sellerEvnAddress, setupErr)
 				hedera_helper.SendSelfErrorMessage(types.ServiceError, "Could not send the reqquest to: "+sellerEvnAddress, types.DoNothing)
 				return
 			}
-			sellerBuffers.AddBuffer2(peerID, envelope, true, types.SendOK, types.Connecting)
-		} else if isTooEarly, _ := commonlib.IsRequestTooEarly(sellerBuffers, peerID); isTooEarly {
+			sellerBuffers.AddBuffer2(targetPeerID, envelope, true, types.SendOK, types.Connecting)
+		} else if isTooEarly, _ := commonlib.IsRequestTooEarly(sellerBuffers, targetPeerID); isTooEarly {
 			return
 		} else {
-			a, b, _ := sellerBuffers.GetReconnectInfo(peerID)
+			a, b, _ := sellerBuffers.GetReconnectInfo(targetPeerID)
 			log.Println("re-submit because it's time now", isTooEarly, a, b)
 		}
-		sellerBuffers.IncrementReconnectAttempts(peerID)
+		sellerBuffers.IncrementReconnectAttempts(targetPeerID)
 		if peerBuffer != nil && peerBuffer.RequestOrResponse.Message != nil {
 			secondExecError := hedera_helper.SendTransactionEnvelope(peerBuffer.RequestOrResponse)
 			if secondExecError != nil {
 				log.Printf("💀-2  skip that seller %s because ExecuteHederaTransaction error: %v", sellerEvnAddress, secondExecError)
 				hedera_helper.SendSelfErrorMessage(types.ServiceError, "Could not send the reqquest to: "+sellerEvnAddress, types.DoNothing)
-				sellerBuffers.UpdateBufferRendezvousState(peerID, types.SendFail)
-				sellerBuffers.UpdateBufferLibP2PState(peerID, types.CanNotConnectUnknownReason)
+				sellerBuffers.UpdateBufferRendezvousState(targetPeerID, types.SendFail)
+				sellerBuffers.UpdateBufferLibP2PState(targetPeerID, types.CanNotConnectUnknownReason)
 				return
 			}
-			sellerBuffers.UpdateBufferRendezvousState(peerID, types.SendOK)
-			sellerBuffers.UpdateBufferLibP2PState(peerID, types.Connecting)
+			sellerBuffers.UpdateBufferRendezvousState(targetPeerID, types.SendOK)
+			sellerBuffers.UpdateBufferLibP2PState(targetPeerID, types.Connecting)
 		} else {
-			log.Printf("Warning: peerBuffer or RequestOrResponse.Message is nil for peer %s", peerID)
+			log.Printf("Warning: peerBuffer or RequestOrResponse.Message is nil for peer %s", targetPeerID)
 			return
 		}
 	} else if !peerHasBuffer {
-		fmt.Println("I am connected but have no buffer. .. i'll close the peer and just hang around for the loop to issue a fresh request ", peerID)
-		p2pHost.Network().ClosePeer(peerID)
+		fmt.Println("I am connected but have no buffer. .. i'll close the peer and just hang around for the loop to issue a fresh request ", targetPeerID)
+		p2pHost.Network().ClosePeer(targetPeerID)
 		return
 	} else {
 		streams := 0
@@ -460,14 +469,14 @@ func processSeller(seller Seller, p2pHost host.Host, sellerBuffers *commonlib.No
 			streams += len(conn.GetStreams())
 		}
 		if streams == 0 {
-			log.Println("I am connected but have no streams. Because I'm a buyer, I'll just hang around for the loop to issue a fresh request. I am not supposed to do newStream - the seller is responsible for that.", peerID, streams)
+			log.Println("I am connected but have no streams. Because I'm a buyer, I'll just hang around for the loop to issue a fresh request. I am not supposed to do newStream - the seller is responsible for that.", targetPeerID, streams)
 
 		} else {
-			log.Println("I am connected and have streams..", peerID, streams)
+			log.Println("I am connected and have streams..", targetPeerID, streams)
 
-			sellerBuffers.UpdateBufferRendezvousState(peerID, types.SendOK)
-			sellerBuffers.UpdateBufferLibP2PState(peerID, types.Connected)
-			sellerBuffers.SetLastOtherSideMultiAddress(peerID, connsToPeer[0].RemoteMultiaddr().String())
+			sellerBuffers.UpdateBufferRendezvousState(targetPeerID, types.SendOK)
+			sellerBuffers.UpdateBufferLibP2PState(targetPeerID, types.Connected)
+			sellerBuffers.SetLastOtherSideMultiAddress(targetPeerID, connsToPeer[0].RemoteMultiaddr().String())
 		}
 	}
 }
