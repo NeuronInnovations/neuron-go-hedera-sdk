@@ -34,3 +34,18 @@ type NodeBufferInfo struct {
 type NodeBuffers struct {
 	Buffers map[peer.ID]*NodeBufferInfo
 }
+
+// PeerStatusInfo contains detailed information about a peer's connection status
+type PeerStatusInfo struct {
+	PublicKey                      string    `json:"publicKey"`
+	PeerID                         string    `json:"peerID"`
+	LibP2PState                    string    `json:"libP2PState"`
+	RendezvousState                string    `json:"rendezvousState"`
+	IsOtherSideValidAccount        bool      `json:"isOtherSideValidAccount"`
+	NoOfConnectionAttempts         int       `json:"noOfConnectionAttempts"`
+	LastConnectionAttempt          time.Time `json:"lastConnectionAttempt"`
+	NextScheduledConnectionAttempt time.Time `json:"nextScheduledConnectionAttempt"`
+	LastGoodsReceivedTime          time.Time `json:"lastGoodsReceivedTime"`
+	LastOtherSideMultiAddress      string    `json:"lastOtherSideMultiAddress"`
+	ConnectionStatus               string    `json:"connectionStatus"` // "Connected", "Connecting", "Disconnected", "Error"
+}

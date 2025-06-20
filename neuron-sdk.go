@@ -594,7 +594,14 @@ func ReplaceSellersAuto(sellerPublicKeys []string, p2pHost host.Host, sellerBuff
 }
 
 // ShowCurrentPeerStatus extracts the current sellers from the seller buffers
-// by converting peer IDs back to public keys and creating Seller structs
-func ShowCurrentPeerStatus(sellerBuffers *commonlib.NodeBuffers) map[streambuyervsseller.Seller]bool {
-	return streambuyervsseller.ShowCurrentPeerStatus(sellerBuffers)
+func ShowCurrentPeerStatus(b *commonlib.NodeBuffers) map[streambuyervsseller.Seller]bool {
+	return streambuyervsseller.ShowCurrentPeerStatus(b)
 }
+
+// ShowDetailedPeerStatus extracts detailed status information for all peers
+func ShowDetailedPeerStatus(b *commonlib.NodeBuffers, h host.Host) []types.PeerStatusInfo {
+	return b.ShowDetailedPeerStatus(h)
+}
+
+// PeerStatusInfo contains detailed information about a peer's connection status
+type PeerStatusInfo = types.PeerStatusInfo
