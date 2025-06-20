@@ -103,7 +103,7 @@ func init() {
 // eventually be required to handle application-specific validation and logic at the dApp level.
 func LaunchSDK(
 	version string,
-	protocol protocol.ID,
+	protocol protocol.ID, // eg. "/adsb/v1", or "/radiation/v1"
 	keyAndLocationConfigurator func(envIsReady chan bool, envFile string) error,
 	buyerCase func(ctx context.Context, p2pHost host.Host, buffers *neuronbuffers.NodeBuffers),
 	buyerCaseTopicListener func(topicMessage hedera.TopicMessage),
