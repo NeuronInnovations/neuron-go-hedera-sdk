@@ -50,6 +50,9 @@ var fixPrivKey_g crypto.PrivKey
 
 var Version string
 
+// Seller represents a seller node with public key and location information
+type Seller = streambuyervsseller.Seller
+
 func init() {
 
 	commonlib.InitFlags()
@@ -571,4 +574,27 @@ func HandleFallbackConfigurator(envFile string, configurator func(envIsReady cha
 		return nil, fmt.Errorf("failed to load location after configurator: %w", err)
 	}
 	return LoadPrivateKey(os.Getenv("private_key"))
+}
+
+// ReplaceSellers updates the connected sellers list with the provided list of seller public keys.
+// It handles three scenarios:
+// - When a seller was there already: keep him, do nothing
+// - When a seller wasn't there before: add him and processSeller
+// - When a seller was there but is not in the update list: remove him from the buffer, disconnect him
+// Returns the updated seller list and any error that occurred
+// If currentSellers is nil, it will automatically determine current sellers from the buffers
+func ReplaceSellers(sellerPublicKeys []string, currentSellers map[streambuyervsseller.Seller]bool, p2pHost host.Host, sellerBuffers *commonlib.NodeBuffers, myReachableAddresses []multiaddr.Multiaddr, protocolID protocol.ID) (map[streambuyervsseller.Seller]bool, error) {
+	return streambuyervsseller.ReplaceSellers(sellerPublicKeys, currentSellers, p2pHost, sellerBuffers, myReachableAddresses, protocolID)
+}
+
+// ReplaceSellersAuto automatically determines current sellers from buffers and updates them
+// with the provided list of seller public keys. This is the most convenient version to use.
+func ReplaceSellersAuto(sellerPublicKeys []string, p2pHost host.Host, sellerBuffers *commonlib.NodeBuffers, myReachableAddresses []multiaddr.Multiaddr, protocolID protocol.ID) error {
+	return streambuyervsseller.ReplaceSellersAuto(sellerPublicKeys, p2pHost, sellerBuffers, myReachableAddresses, protocolID)
+}
+
+// ShowCurrentPeerStatus extracts the current sellers from the seller buffers
+// by converting peer IDs back to public keys and creating Seller structs
+func ShowCurrentPeerStatus(sellerBuffers *commonlib.NodeBuffers) map[streambuyervsseller.Seller]bool {
+	return streambuyervsseller.ShowCurrentPeerStatus(sellerBuffers)
 }
