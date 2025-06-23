@@ -21,6 +21,27 @@ import (
 	"github.com/libp2p/go-libp2p/core/protocol"
 )
 
+// GetStreamHandler finds and returns the stream for a given peer and protocol ID
+func GetStreamHandler(p2pHost host.Host, peerID peer.ID, protocolID protocol.ID) (*network.Stream, error) {
+	// Get all connections to the peer
+	conns := p2pHost.Network().ConnsToPeer(peerID)
+	if len(conns) == 0 {
+		return nil, fmt.Errorf("no connections found for peer %s", peerID)
+	}
+
+	// Check each connection for a matching stream
+	for _, conn := range conns {
+		for _, stream := range conn.GetStreams() {
+			if stream.Protocol() == protocolID {
+				log.Println("found stream for protocol", protocolID, "with peer", peerID, "stream id", stream.ID())
+				return &stream, nil
+			}
+		}
+	}
+
+	return nil, fmt.Errorf("no stream found for protocol %s with peer %s", protocolID, peerID)
+}
+
 // Note: Only the seller can perform the initial connection. The buyer initiates the request
 // but the seller must establish the actual connection and stream.
 func InitialConnect(ctx context.Context, p2pHost host.Host, addrInfo peer.AddrInfo, buyerBuffers *NodeBuffers, protocol protocol.ID) error {
@@ -32,7 +53,14 @@ func InitialConnect(ctx context.Context, p2pHost host.Host, addrInfo peer.AddrIn
 
 	if exists && info.LibP2PState == types.Connected {
 		if p2pHost.Network().Connectedness(addrInfo.ID) == network.Connected {
-			if info.StreamHandler != nil && !network.Stream.Conn(*info.StreamHandler).IsClosed() {
+
+			stream, err := GetStreamHandler(p2pHost, addrInfo.ID, protocol)
+			if err != nil {
+				log.Println("error getting stream", err)
+				return fmt.Errorf("%s:error getting stream: %w", types.CanNotConnectStreamError, err)
+			}
+
+			if stream != nil && !network.Stream.Conn(*stream).IsClosed() {
 				fmt.Printf("😍😍 Thanks, we're good, connected and pumping %s -> ! 😍😍\n", addrInfo.ID)
 				return nil
 			}
@@ -57,19 +85,19 @@ func InitialConnect(ctx context.Context, p2pHost host.Host, addrInfo peer.AddrIn
 	// --------  stuck here
 
 	// Create a context with a timeout for the NewStream operation
-	streamCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
+	//streamCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	//defer cancel()
 
 	for _, conn := range p2pHost.Network().ConnsToPeer(addrInfo.ID) {
 		log.Printf("Connection to %s open with muxer: %v", addrInfo.ID, conn.ConnState())
 	}
 
-	s, strErr := p2pHost.NewStream(streamCtx, addrInfo.ID, protocol)
+	newStream, strErr := p2pHost.NewStream(ctx, addrInfo.ID, protocol)
 	if strErr != nil {
 		log.Printf("First attempt failed, resetting connection and retrying: %v", strErr)
 		p2pHost.Network().ClosePeer(addrInfo.ID)
 		time.Sleep(1 * time.Second) // Brief delay before retry
-		s, strErr = p2pHost.NewStream(ctx, addrInfo.ID, protocol)
+		newStream, strErr = p2pHost.NewStream(ctx, addrInfo.ID, protocol)
 		if strErr != nil {
 			log.Println("failed to create a new stream in InitialConnect. ", strErr)
 			log.Println("this is what we know about the buffer:  exists:", exists, " bufferrInfo", info)
@@ -77,98 +105,15 @@ func InitialConnect(ctx context.Context, p2pHost host.Host, addrInfo peer.AddrIn
 		}
 		//continue
 	}
-	fmt.Printf("😍😍 Stream connected and pumping %s -> %s ! 😍😍\n", addrInfo, p2pHost.ID())
+	fmt.Printf("😍😍 Stream connected and pumping %s -> %s ! 😍😍 %v\n", addrInfo, p2pHost.ID(), newStream)
 	//streamWriter := bufio.NewWriterSize(s, 100)
 	//streamWriter := bufio.NewWriter(s)
 
-	// start pass the map to the jetvision.
-	buyerBuffers.AddBuffer3(addrInfo.ID, s, types.SendOK, types.Connected)
+	newStream.Write(nil)
+	buyerBuffers.AddBuffer3(addrInfo.ID, types.SendOK, types.Connected)
 
 	return nil
 
-}
-
-// ReconnectPeersIfNeeded attempts to re-establish a connection to a peer if its current state
-// indicates it is not connected. This function is specifically utilized by the SELLER role.
-//
-// **Interaction with InitialConnect**:
-// While `InitialConnect` is responsible for establishing a connection with a peer, including setting
-// up a stream and writing data, `ReconnectPeersIfNeeded` focuses on recovering connections that were
-// previously active but have transitioned to a disconnected state. This function assumes that the peer's
-// address is already in the address book, making it effective for scenarios where the peer has restarted
-// or temporarily gone offline.
-//
-// **Behavior**:
-//   - If the peer's state is explicitly marked as `ConnectionLost`, it will not attempt reconnection, as
-//     the system expects the peer to initiate a new request. In such cases, the buffer is removed, and an
-//     error is returned.
-//   - If sufficient backoff time has not passed since the last reconnect attempt, the function will skip
-//     the reconnection to prevent excessive retries, as determined by `IsRequestTooEarly`.
-//   - If the peer is already connected and its stream is valid, the state is updated to `Connected`.
-//   - If reconnection is deemed necessary and viable, the function attempts to create a new stream to
-//     the peer using the `NewStream` method of the LibP2P host.
-//
-// **Outcome**:
-//   - Upon successful reconnection, the function updates the buffers with a new stream writer and sets
-//     the peer's state to `Connected`.
-//   - If reconnection fails, it increments the retry attempt counter and respects the backoff logic
-//     defined in `IsRequestTooEarly`.
-//
-// This function complements the `InitialConnect` logic by ensuring resiliency in maintaining peer
-// connections, particularly for long-lived seller nodes communicating with buyers.
-func ReconnectPeersIfNeeded(ctx context.Context, p2pHost host.Host, peerID peer.ID, bufferInfo NodeBufferInfo, connectedBuffersOfBuyers *NodeBuffers, protocol protocol.ID) error {
-	if bufferInfo.LibP2PState == types.Connected {
-		// check if the adress book truly has a connection otherwise the state is not valid.
-		if p2pHost.Network().Connectedness(peerID) == network.Connected {
-			return nil
-		} else {
-			connectedBuffersOfBuyers.UpdateBufferLibP2PState(peerID, types.Reconnecting)
-
-		}
-	}
-	if bufferInfo.LibP2PState == types.ConnectionLost {
-		// remove the buffer, even if this means you loose the shared account id or last IP address.
-		connectedBuffersOfBuyers.RemoveBuffer(peerID)
-		return fmt.Errorf("%s:we will not try to connect to %s, he is explicitly disconnected and expect him to issue a new request", bufferInfo.LibP2PState, peerID)
-	}
-
-	tooEarly, tooEarlyError := IsRequestTooEarly(connectedBuffersOfBuyers, peerID)
-	if tooEarly {
-		return tooEarlyError
-	}
-
-	// check if we're connected in the meantime
-	if p2pHost.Network().Connectedness(peerID) == network.Connected {
-		fmt.Println("Peer is already connected:", peerID)
-		// check if the stream we have is closed
-		if bufferInfo.StreamHandler != nil && !network.Stream.Conn(*bufferInfo.StreamHandler).IsClosed() {
-			fmt.Println("Stream is already connected:", peerID)
-			// Mark the buffer as connected
-			connectedBuffersOfBuyers.UpdateBufferLibP2PState(peerID, types.Connected)
-			return nil
-		}
-	}
-
-	// Attempt to reconnect. TODO: there's a case where we don't have an address after reboot. Remember last address and merge from bufferstate.
-	fmt.Println("Attempting to reconnect to peer:", peerID)
-	s, err := p2pHost.NewStream(ctx, peerID, protocol)
-	if err != nil {
-		log.Println("Stream creation failed to", peerID, ":", err)
-		connectedBuffersOfBuyers.IncrementReconnectAttempts(peerID)
-
-		if bufferInfo.NoOfConnectionAttempts > 20 {
-			connectedBuffersOfBuyers.RemoveBuffer(peerID)
-		}
-		return fmt.Errorf("%s:stream creation failed: %w", types.CanNotConnectStreamError, err)
-	}
-
-	// Successfully reconnected
-	fmt.Printf("😍 -> Stream reconnected to %s\n", peerID)
-	//streamWriter := bufio.NewWriterSize(s, 100)
-	//streamWriter := bufio.NewWriter(s)
-
-	connectedBuffersOfBuyers.AddBuffer3(peerID, s, types.ReceivedOK, types.Connected)
-	return nil
 }
 
 func IsRequestTooEarly(connectedBuffersOfBuyers *NodeBuffers, peerID peer.ID) (bool, error) {
@@ -213,74 +158,50 @@ func WriteAndFlushBuffer(
 	activeConns := p2pHost.Network().ConnsToPeer(peerID)
 	if len(activeConns) > 0 {
 		bufferInfo.LibP2PState = types.Connected
+	} else {
+		bufferInfo.LibP2PState = types.ConnectionLost
+		return fmt.Errorf("%s:peer is not connected", types.ConnectionLostWriteError)
+	}
+	stream, err := GetStreamHandler(p2pHost, peerID, protocol)
+	if err != nil {
+		log.Println("error getting stream", err)
+		return fmt.Errorf("%s:error getting stream: %w", types.CanNotConnectStreamError, err)
+	}
+	if stream == nil {
+		bufferInfo.LibP2PState = types.ConnectionLost
+		return fmt.Errorf("%s:stream handler is nil", types.ConnectionLostWriteError)
+
 	}
 
-	if bufferInfo.Writer == nil {
-		// Try to find an existing stream for this peer
-		conns, exists := connectedBuffersOfBuyers.GetBuffer(peerID)
-		if exists && conns != nil && conns.StreamHandler != nil {
-			// Found a stream handler, use it as the writer
-			bufferInfo.Writer = *conns.StreamHandler
-			bufferInfo.StreamHandler = conns.StreamHandler
-		} else {
-			// If no stream handler in buffer, check active connections
-			activeConns := p2pHost.Network().ConnsToPeer(peerID)
-			for _, conn := range activeConns {
-				for _, stream := range conn.GetStreams() {
-					if stream.Protocol() == protocol {
-						// Found an active stream, use it as the writer
-						bufferInfo.Writer = stream
-						bufferInfo.StreamHandler = &stream
-						// Update the buffer with the new stream
-						connectedBuffersOfBuyers.AddBuffer3(peerID, stream, types.SendOK, types.Connected)
-						break
-					}
-				}
-			}
+	// Short write deadline to avoid blocking too long
+	//stream.SetWriteDeadline(time.Now().Add(20 * time.Millisecond))
 
-			// If still no writer found, mark as connection lost
-			if bufferInfo.Writer == nil {
-				bufferInfo.LibP2PState = types.ConnectionLost
-				return fmt.Errorf("%s:stream handler is nil", types.ConnectionLostWriteError)
-			}
-		}
-	}
+	//writeStart := time.Now()
+	writer := *stream
+	bytesWritten, writeErr := writer.Write(data)
+	log.Println("bytes written", bytesWritten)
 
-	if bufferInfo.LibP2PState == types.Connected {
-		// Short write deadline to avoid blocking too long
-		bufferInfo.Writer.SetWriteDeadline(time.Now().Add(20 * time.Millisecond))
-
-		writeStart := time.Now()
-		_, writeErr := bufferInfo.Writer.Write(data)
-		writeDuration := time.Since(writeStart)
-
-		// Log a warning if we took >10ms to return from the write call
-		if writeDuration > 10*time.Millisecond {
-			log.Printf("⚠️ High write latency: %v. Receiver may be slow.", writeDuration)
-		}
-
-		if writeErr != nil {
-			// If we timed out, treat that as "not ready yet"
-			if netErr, ok := writeErr.(net.Error); ok && netErr.Timeout() {
-				log.Printf("Write skipped: Receiver not ready (timeout). Resseting stream.")
-				// reset stream
-				bufferInfo.Writer.Reset()
-				connectedBuffersOfBuyers.RemoveBuffer(peerID)
-				return fmt.Errorf("%s:error writing to stream - 1:  %w", types.ConnectionLostWriteError, writeErr)
-
-			}
-			// Otherwise, update state & increment reconnect attempts
-			bufferInfo.Writer.Reset()
-
-			connectedBuffersOfBuyers.UpdateBufferLibP2PState(peerID, types.ConnectionLost)
-			connectedBuffersOfBuyers.IncrementReconnectAttempts(peerID)
+	if writeErr != nil {
+		// If we timed out, treat that as "not ready yet"
+		if netErr, ok := writeErr.(net.Error); ok && netErr.Timeout() {
+			log.Printf("Write skipped: Receiver not ready (timeout). Resseting stream.")
+			// reset stream
+			//stream.Reset()
 			connectedBuffersOfBuyers.RemoveBuffer(peerID)
-			return fmt.Errorf("%s:error writing to stream - 2:  %w", types.ConnectionLostWriteError, writeErr)
-		}
+			return fmt.Errorf("%s:error writing to stream - 1:  %w", types.ConnectionLostWriteError, writeErr)
 
-		return nil
+		}
+		// Otherwise, update state & increment reconnect attempts
+		//stream.Reset()
+
+		connectedBuffersOfBuyers.UpdateBufferLibP2PState(peerID, types.ConnectionLost)
+		connectedBuffersOfBuyers.IncrementReconnectAttempts(peerID)
+		connectedBuffersOfBuyers.RemoveBuffer(peerID)
+		return fmt.Errorf("%s:error writing to stream - 2:  %w", types.ConnectionLostWriteError, writeErr)
 	}
-	return fmt.Errorf("%s:buffer is not Connected %v", bufferInfo.LibP2PState, peerID)
+
+	return nil
+
 }
 
 func HolePunchConnectIfNotConnected(ctx context.Context, p2pHost host.Host, pi peer.AddrInfo, isClient bool) error {

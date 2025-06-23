@@ -92,6 +92,10 @@ func EnsureTopicsAndNotifyContract(p2pHost host.Host) (hedera.TopicID, hedera.To
 
 				c := GetHederaClientUsingEnv()
 				defer c.Close()
+				peerIDStr, err := keylib.ConvertHederaPublicKeyToPeerID(string(hostPubKeyStr))
+				if err != nil {
+					log.Panic("Error converting host public key to peer ID: ", err)
+				}
 				callResult, err := hedera.NewContractExecuteTransaction().
 					SetContractID(newContractID).
 					SetTransactionMemo("broadcast liveness topic for self").
@@ -100,7 +104,7 @@ func EnsureTopicsAndNotifyContract(p2pHost host.Host) (hedera.TopicID, hedera.To
 						AddUint64(stdOutTopicID.Topic).
 						AddUint64(stdInTopicID.Topic).
 						AddUint64(stdErrTopicID.Topic).
-						AddString(keylib.ConvertHederaPublicKeyToPeerID(string(hostPubKeyStr)))).
+						AddString(peerIDStr)).
 					Execute(c)
 				if err != nil {
 					log.Panic(err, ": error calling the smart contract function")

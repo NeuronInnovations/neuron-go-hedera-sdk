@@ -2,6 +2,7 @@ package keylib
 
 import (
 	"encoding/hex"
+	"fmt"
 	"log"
 	"strings"
 
@@ -12,25 +13,23 @@ import (
 	"github.com/libp2p/go-libp2p/core/peer"
 )
 
-func ConvertHederaPublicKeyToPeerID(hederaPublicKey string) string {
+func ConvertHederaPublicKeyToPeerID(hederaPublicKey string) (string, error) {
 	hpub, err := hedera.PublicKeyFromString(hederaPublicKey)
-
 	if err != nil {
-		log.Fatal(err)
+		return "", fmt.Errorf("error converting hedera public key to peer ID: %v", err)
 	}
 
 	libp2pPubKey, err := libp2pcrypto.UnmarshalSecp256k1PublicKey(hpub.BytesRaw())
 	if err != nil {
-		panic(err)
+		return "", fmt.Errorf("error unmarshaling public key: %v", err)
 	}
 
 	peerID, err := peer.IDFromPublicKey(libp2pPubKey)
 	if err != nil {
-		panic(err)
+		return "", fmt.Errorf("error creating peer ID: %v", err)
 	}
 
-	return peerID.String()
-
+	return peerID.String(), nil
 }
 
 func ConverHederaPublicKeyToEthereunAddress(hederaPublicKey string) string {

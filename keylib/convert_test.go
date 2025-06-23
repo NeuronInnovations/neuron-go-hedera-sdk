@@ -9,9 +9,10 @@ func TestConvertHederaPublicKeyToPeerID(t *testing.T) {
 		hederaPublicKey string
 	}
 	tests := []struct {
-		name string
-		args args
-		want string
+		name    string
+		args    args
+		want    string
+		wantErr bool
 	}{
 		{
 			name: "ConvertEthPublicKeyToPeerID",
@@ -21,8 +22,13 @@ func TestConvertHederaPublicKeyToPeerID(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := ConvertHederaPublicKeyToPeerID(tt.args.hederaPublicKey); got != tt.want {
-				t.Errorf("ConvertEthPublicKeyToPeerID() = %v, want %v", got, tt.want)
+			got, err := ConvertHederaPublicKeyToPeerID(tt.args.hederaPublicKey)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("ConvertHederaPublicKeyToPeerID() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			if got != tt.want {
+				t.Errorf("ConvertHederaPublicKeyToPeerID() = %v, want %v", got, tt.want)
 			}
 		})
 	}

@@ -7,9 +7,11 @@ import (
 	"sync"
 	"time"
 
+	"log"
+
 	"github.com/NeuronInnovations/neuron-go-hedera-sdk/types"
 	"github.com/hashgraph/hedera-sdk-go/v2"
-	"github.com/libp2p/go-libp2p/core/network"
+	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/peer"
 )
 
@@ -86,8 +88,6 @@ type TopicPostalEnvelope struct {
 
 // NodeBufferInfo holds runtime info related to a remote peer.
 type NodeBufferInfo struct {
-	Writer                         network.Stream            `json:"-"`
-	StreamHandler                  *network.Stream           `json:"-"`
 	LastOtherSideMultiAddress      string                    `json:"last_other_side_multi_address"`
 	LibP2PState                    types.ConnectionState     `json:"lib_p2p_state"`
 	RendezvousState                types.RendezvousState     `json:"rendezvous_state"`
@@ -115,12 +115,11 @@ func (nb *NodeBuffers) AddBuffer2(peerID peer.ID, envelope types.TopicPostalEnve
 	}
 }
 
-// AddBuffer3 adds a new bufio.Writer for a buyerID with a specified state and a bufio.Writer
-func (bb *NodeBuffers) AddBuffer3(buyerID peer.ID, streamWriter network.Stream, rendezvousState types.RendezvousState, libP2PState types.ConnectionState) {
+// AddBuffer3 adds a new buffer for a buyerID with specified states
+func (bb *NodeBuffers) AddBuffer3(buyerID peer.ID, rendezvousState types.RendezvousState, libP2PState types.ConnectionState) {
 	bb.mu.Lock()
 	defer bb.mu.Unlock()
 	bb.Buffers[buyerID] = &NodeBufferInfo{
-		Writer:                         streamWriter,
 		RendezvousState:                rendezvousState,
 		LibP2PState:                    libP2PState,
 		IsOtherSideValidAccount:        true,
@@ -267,13 +266,6 @@ func (nb *NodeBuffers) dumpToJSON(filename string) error {
 	return nil
 }
 
-// set the stream handler
-func (nb *NodeBuffers) SetStreamHandler(peerID peer.ID, streamHandler *network.Stream) {
-	nb.mu.Lock()
-	defer nb.mu.Unlock()
-	nb.Buffers[peerID].StreamHandler = streamHandler
-}
-
 // SetLastGoodsReceivedTime sets the last time goods were received from a peer
 func (nb *NodeBuffers) SetLastGoodsReceivedTime(peerID peer.ID) {
 	nb.mu.Lock()
@@ -281,4 +273,72 @@ func (nb *NodeBuffers) SetLastGoodsReceivedTime(peerID peer.ID) {
 	if buffer, ok := nb.Buffers[peerID]; ok {
 		buffer.LastGoodsReceivedTime = time.Now()
 	}
+}
+
+// ShowDetailedPeerStatus extracts detailed status information for all peers
+func (nb *NodeBuffers) ShowDetailedPeerStatus(p2pHost host.Host) []types.PeerStatusInfo {
+	nb.mu.RLock()
+	defer nb.mu.RUnlock()
+
+	var peerStatusList []types.PeerStatusInfo
+
+	for peerID, bufferInfo := range nb.Buffers {
+		// Extract public key from peer ID
+		pubKey, err := peerID.ExtractPublicKey()
+		if err != nil {
+			log.Printf("Error extracting public key for peer %s: %v", peerID, err)
+			continue
+		}
+
+		pubKeyBytes, err := pubKey.Raw()
+		if err != nil {
+			log.Printf("Error converting public key to bytes for peer %s: %v", peerID, err)
+			continue
+		}
+
+		// Convert to hex string (this is the Hedera public key format)
+		pubKeyStr := fmt.Sprintf("%x", pubKeyBytes)
+
+		// Determine connection status based on LibP2P state and actual network connection
+		connectionStatus := "Unknown"
+		switch bufferInfo.LibP2PState {
+		case types.Connected:
+			// Check if actually connected
+			connsToPeer := p2pHost.Network().ConnsToPeer(peerID)
+			if len(connsToPeer) > 0 {
+				connectionStatus = "Connected"
+			} else {
+				connectionStatus = "Disconnected"
+			}
+		case types.Connecting:
+			connectionStatus = "Connecting"
+		case types.Reconnecting:
+			connectionStatus = "Reconnecting"
+		case types.ConnectionLost, types.ConnectionLostFlushError, types.ConnectionLostWriteError:
+			connectionStatus = "Disconnected"
+		case types.CanNotConnectUnknownReason, types.CanNotConnectStreamError:
+			connectionStatus = "Error"
+		default:
+			connectionStatus = "Unknown"
+		}
+
+		peerStatus := types.PeerStatusInfo{
+			PublicKey:                      pubKeyStr,
+			PeerID:                         peerID.String(),
+			LibP2PState:                    string(bufferInfo.LibP2PState),
+			RendezvousState:                string(bufferInfo.RendezvousState),
+			IsOtherSideValidAccount:        bufferInfo.IsOtherSideValidAccount,
+			NoOfConnectionAttempts:         bufferInfo.NoOfConnectionAttempts,
+			LastConnectionAttempt:          bufferInfo.LastConnectionAttempt,
+			NextScheduledConnectionAttempt: bufferInfo.NextScheduledConnectionAttempt,
+			LastGoodsReceivedTime:          bufferInfo.LastGoodsReceivedTime,
+			LastOtherSideMultiAddress:      bufferInfo.LastOtherSideMultiAddress,
+			ConnectionStatus:               connectionStatus,
+		}
+
+		peerStatusList = append(peerStatusList, peerStatus)
+		log.Printf("Found peer with status: %s (peer ID: %s, connection: %s)", pubKeyStr, peerID.String(), connectionStatus)
+	}
+
+	return peerStatusList
 }

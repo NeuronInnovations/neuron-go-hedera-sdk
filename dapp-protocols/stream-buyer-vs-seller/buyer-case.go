@@ -381,8 +381,17 @@ func prepareServiceRequestMsg(seller string, myReachableAddresses []multiaddr.Mu
 
 func processSeller(seller Seller, p2pHost host.Host, sellerBuffers *commonlib.NodeBuffers, myReachableAddresses []multiaddr.Multiaddr, protocolID protocol.ID) {
 	sellerEvnAddress := keylib.ConverHederaPublicKeyToEthereunAddress(seller.PublicKey)
-	peerIDStr := keylib.ConvertHederaPublicKeyToPeerID(seller.PublicKey)
-	peerID, _ := peer.Decode(peerIDStr)
+	// Convert seller's public key to peer ID
+	peerIDStr, err := keylib.ConvertHederaPublicKeyToPeerID(seller.PublicKey)
+	if err != nil {
+		log.Printf("Error converting seller public key to peer ID: %v", err)
+		return
+	}
+	targetPeerID, err := peer.Decode(peerIDStr)
+	if err != nil {
+		log.Printf("Error decoding peer ID: %v", err)
+		return
+	}
 	perrInfo, err := hedera_helper.GetPeerInfo(sellerEvnAddress)
 
 	if err != nil {
@@ -392,10 +401,10 @@ func processSeller(seller Seller, p2pHost host.Host, sellerBuffers *commonlib.No
 		return
 	}
 
-	peerBuffer, peerHasBuffer := sellerBuffers.GetBuffer(peerID)
+	peerBuffer, peerHasBuffer := sellerBuffers.GetBuffer(targetPeerID)
 
 	if peerHasBuffer && peerBuffer == nil {
-		log.Printf("Warning: Got nil peerBuffer for peer %s", peerID)
+		log.Printf("Warning: Got nil peerBuffer for peer %s", targetPeerID)
 		return
 	}
 
@@ -408,51 +417,51 @@ func processSeller(seller Seller, p2pHost host.Host, sellerBuffers *commonlib.No
 		return
 	}
 
-	connsToPeer := p2pHost.Network().ConnsToPeer(peerID)
+	connsToPeer := p2pHost.Network().ConnsToPeer(targetPeerID)
 
 	if len(connsToPeer) == 0 {
 		if !peerHasBuffer {
 			envelope, setupErr := prepareServiceRequestMsg(seller.PublicKey, myReachableAddresses)
 			if setupErr != nil {
-				sellerBuffers.AddBuffer2(peerID, envelope, false, types.NotInitiated, types.ConnectionLost)
+				sellerBuffers.AddBuffer2(targetPeerID, envelope, false, types.NotInitiated, types.ConnectionLost)
 				log.Printf("💀 envelope setup error; seller %s will be blacklisted, err: %v \n", sellerEvnAddress, setupErr)
 				hedera_helper.SendSelfErrorMessage(types.BadMessageError, "Could not create envelope for: "+sellerEvnAddress, types.DoNothing)
 				return
 			}
 
-			sellerBuffers.IncrementReconnectAttempts(peerID)
+			sellerBuffers.IncrementReconnectAttempts(targetPeerID)
 			if execErr := hedera_helper.SendTransactionEnvelope(envelope); execErr != nil {
-				sellerBuffers.AddBuffer2(peerID, envelope, true, types.SendFail, types.Connecting)
+				sellerBuffers.AddBuffer2(targetPeerID, envelope, true, types.SendFail, types.Connecting)
 				log.Printf("💀 send hedera transaction envelope error %s, will allow to try later %v \n", sellerEvnAddress, setupErr)
 				hedera_helper.SendSelfErrorMessage(types.ServiceError, "Could not send the reqquest to: "+sellerEvnAddress, types.DoNothing)
 				return
 			}
-			sellerBuffers.AddBuffer2(peerID, envelope, true, types.SendOK, types.Connecting)
-		} else if isTooEarly, _ := commonlib.IsRequestTooEarly(sellerBuffers, peerID); isTooEarly {
+			sellerBuffers.AddBuffer2(targetPeerID, envelope, true, types.SendOK, types.Connecting)
+		} else if isTooEarly, _ := commonlib.IsRequestTooEarly(sellerBuffers, targetPeerID); isTooEarly {
 			return
 		} else {
-			a, b, _ := sellerBuffers.GetReconnectInfo(peerID)
+			a, b, _ := sellerBuffers.GetReconnectInfo(targetPeerID)
 			log.Println("re-submit because it's time now", isTooEarly, a, b)
 		}
-		sellerBuffers.IncrementReconnectAttempts(peerID)
+		sellerBuffers.IncrementReconnectAttempts(targetPeerID)
 		if peerBuffer != nil && peerBuffer.RequestOrResponse.Message != nil {
 			secondExecError := hedera_helper.SendTransactionEnvelope(peerBuffer.RequestOrResponse)
 			if secondExecError != nil {
 				log.Printf("💀-2  skip that seller %s because ExecuteHederaTransaction error: %v", sellerEvnAddress, secondExecError)
 				hedera_helper.SendSelfErrorMessage(types.ServiceError, "Could not send the reqquest to: "+sellerEvnAddress, types.DoNothing)
-				sellerBuffers.UpdateBufferRendezvousState(peerID, types.SendFail)
-				sellerBuffers.UpdateBufferLibP2PState(peerID, types.CanNotConnectUnknownReason)
+				sellerBuffers.UpdateBufferRendezvousState(targetPeerID, types.SendFail)
+				sellerBuffers.UpdateBufferLibP2PState(targetPeerID, types.CanNotConnectUnknownReason)
 				return
 			}
-			sellerBuffers.UpdateBufferRendezvousState(peerID, types.SendOK)
-			sellerBuffers.UpdateBufferLibP2PState(peerID, types.Connecting)
+			sellerBuffers.UpdateBufferRendezvousState(targetPeerID, types.SendOK)
+			sellerBuffers.UpdateBufferLibP2PState(targetPeerID, types.Connecting)
 		} else {
-			log.Printf("Warning: peerBuffer or RequestOrResponse.Message is nil for peer %s", peerID)
+			log.Printf("Warning: peerBuffer or RequestOrResponse.Message is nil for peer %s", targetPeerID)
 			return
 		}
 	} else if !peerHasBuffer {
-		fmt.Println("I am connected but have no buffer. .. i'll close the peer and just hang around for the loop to issue a fresh request ", peerID)
-		p2pHost.Network().ClosePeer(peerID)
+		fmt.Println("I am connected but have no buffer. .. i'll close the peer and just hang around for the loop to issue a fresh request ", targetPeerID)
+		p2pHost.Network().ClosePeer(targetPeerID)
 		return
 	} else {
 		streams := 0
@@ -460,29 +469,14 @@ func processSeller(seller Seller, p2pHost host.Host, sellerBuffers *commonlib.No
 			streams += len(conn.GetStreams())
 		}
 		if streams == 0 {
-			log.Println("I am connected but have no streams. Because I'm a buyer, I'll just hang around for the loop to issue a fresh request. I am not supposed to do newStream - the seller is responsible for that.", peerID, streams)
+			log.Println("I am connected but have no streams. Because I'm a buyer, I'll just hang around for the loop to issue a fresh request. I am not supposed to do newStream - the seller is responsible for that.", targetPeerID, streams)
 
 		} else {
-			log.Println("I am coonnected and have streams. I'll make sure the writer is stored in the buffer.", peerID, streams)
+			log.Println("I am connected and have streams..", targetPeerID, streams)
 
-			// We have streams, make sure we have a writer set up
-			for _, conn := range connsToPeer {
-				for _, stream := range conn.GetStreams() {
-					if stream.Protocol() == protocolID {
-						// Update the buffer with the stream
-						if existingBuffer, exists := sellerBuffers.GetBuffer(peerID); exists {
-							existingBuffer.Writer = stream
-							existingBuffer.StreamHandler = &stream
-						} else {
-							log.Println("I don't know what to do with this stream. I'll just hang around for the loop to issue a fresh request. I am not supposed to do newStream - the seller is responsible for that.", peerID, streams)
-						}
-						break
-					}
-				}
-			}
-			sellerBuffers.UpdateBufferRendezvousState(peerID, types.SendOK)
-			sellerBuffers.UpdateBufferLibP2PState(peerID, types.Connected)
-			sellerBuffers.SetLastOtherSideMultiAddress(peerID, connsToPeer[0].RemoteMultiaddr().String())
+			sellerBuffers.UpdateBufferRendezvousState(targetPeerID, types.SendOK)
+			sellerBuffers.UpdateBufferLibP2PState(targetPeerID, types.Connected)
+			sellerBuffers.SetLastOtherSideMultiAddress(targetPeerID, connsToPeer[0].RemoteMultiaddr().String())
 		}
 	}
 }
@@ -507,42 +501,320 @@ func getPeerHeartbeatIfRecent(peerInfo hedera_helper.PeerInfo) (hedera_helper.HC
 	return m, true
 }
 
-// AddSellerManually allows manually adding a seller and triggering the connection process immediately.
-// It takes the seller's public key, libp2p host instance, node buffers for tracking connections,
-// and a list of reachable addresses. The function verifies the seller's availability,
-// retrieves their heartbeat for location information, and processes them immediately.
-func AddSellerManually(sellerPublicKey string, p2pHost host.Host, sellerBuffers *commonlib.NodeBuffers, myReachableAddresses []multiaddr.Multiaddr, protocolID protocol.ID) error {
-	// Create a Seller struct with the provided public key
-	seller := Seller{
-		PublicKey: sellerPublicKey,
+// ReplaceSellers updates the connected sellers list with the provided list of seller public keys.
+// It handles three scenarios:
+// - When a seller was there already: keep him, do nothing
+// - When a seller wasn't there before: add him and processSeller
+// - When a seller was there but is not in the update list: remove him from the buffer, disconnect him
+// Returns the updated seller list and any error that occurred
+// If currentSellers is nil, it will automatically determine current sellers from the buffers
+func ReplaceSellers(sellerPublicKeys []string, currentSellers map[Seller]bool, p2pHost host.Host, sellerBuffers *commonlib.NodeBuffers, myReachableAddresses []multiaddr.Multiaddr, protocolID protocol.ID) (map[Seller]bool, error) {
+	// If currentSellers is nil, automatically determine them from buffers
+	if currentSellers == nil {
+		currentSellers = ShowCurrentPeerStatus(sellerBuffers)
+		log.Printf("Automatically determined %d current sellers from buffers", len(currentSellers))
 	}
 
-	// Get seller's EVM address
-	sellerEvnAddress := keylib.ConverHederaPublicKeyToEthereunAddress(seller.PublicKey)
+	// Create a map of new sellers for efficient lookup
+	newSellersMap := make(map[string]Seller)
 
-	// Get peer info to verify availability in SC
-	peerInfo, err := hedera_helper.GetPeerInfo(sellerEvnAddress)
-	if err != nil {
-		return fmt.Errorf("failed to get peer SC info: %w", err)
-	}
-	if !peerInfo.Available {
-		return fmt.Errorf("seller is not present in the network SC")
-	}
-
-	// Get the last heartbeat message to get location info
-	if m, ok := getPeerHeartbeatIfRecent(peerInfo); ok {
-		heartbeatMessage := new(types.NeuronHeartBeatMsg)
-		base64Decoded, _ := base64.StdEncoding.DecodeString(m.Message)
-		err = json.Unmarshal([]byte(base64Decoded), &heartbeatMessage)
-		if err != nil {
-			return fmt.Errorf("failed to parse heartbeat message: %w", err)
+	// Process each seller public key in the input list
+	for _, sellerPublicKey := range sellerPublicKeys {
+		// Create a Seller struct with the provided public key
+		seller := Seller{
+			PublicKey: sellerPublicKey,
 		}
-		// Update seller location from heartbeat
-		seller.Lat = heartbeatMessage.Location.Latitude
-		seller.Lon = heartbeatMessage.Location.Longitude
+
+		// Get seller's EVM address
+		sellerEvnAddress := keylib.ConverHederaPublicKeyToEthereunAddress(seller.PublicKey)
+
+		// Get peer info to verify availability in SC
+		peerInfo, err := hedera_helper.GetPeerInfo(sellerEvnAddress)
+		if err != nil {
+			log.Printf("Failed to get peer SC info for %s: %v", sellerPublicKey, err)
+			continue // Skip this seller but continue with others
+		}
+		if !peerInfo.Available {
+			log.Printf("Seller %s is not present in the network SC", sellerPublicKey)
+			continue // Skip this seller but continue with others
+		}
+
+		// Get the last heartbeat message to get location info
+		if m, ok := getPeerHeartbeatIfRecent(peerInfo); ok {
+			heartbeatMessage := new(types.NeuronHeartBeatMsg)
+			base64Decoded, _ := base64.StdEncoding.DecodeString(m.Message)
+			err = json.Unmarshal([]byte(base64Decoded), &heartbeatMessage)
+			if err != nil {
+				log.Printf("Failed to parse heartbeat message for %s: %v", sellerPublicKey, err)
+				// Continue without location info
+			} else {
+				// Update seller location from heartbeat
+				seller.Lat = heartbeatMessage.Location.Latitude
+				seller.Lon = heartbeatMessage.Location.Longitude
+			}
+		}
+
+		// Add to new sellers map
+		newSellersMap[sellerPublicKey] = seller
 	}
 
-	// Process the seller immediately
-	processSeller(seller, p2pHost, sellerBuffers, myReachableAddresses, protocolID)
+	// Create the new seller list
+	updatedSellers := make(map[Seller]bool)
+
+	// Process new sellers that weren't there before
+	for sellerPublicKey, seller := range newSellersMap {
+		// Convert seller's public key to peer ID
+		peerIDStr, err := keylib.ConvertHederaPublicKeyToPeerID(seller.PublicKey)
+		if err != nil {
+			log.Printf("Error converting seller public key to peer ID: %v", err)
+			continue
+		}
+		targetPeerID, err := peer.Decode(peerIDStr)
+		if err != nil {
+			log.Printf("Error decoding peer ID: %v", err)
+			continue
+		}
+
+		// Check if this seller is already in our current sellers list
+		sellerExists := false
+		for currentSeller := range currentSellers {
+			if currentSeller.PublicKey == seller.PublicKey {
+				sellerExists = true
+				// Keep the existing seller (with potentially different location data)
+				updatedSellers[currentSeller] = true
+				log.Printf("Seller already exists, keeping: %s", sellerPublicKey)
+				break
+			}
+		}
+
+		if !sellerExists {
+			// Check if this seller is already in our buffers
+			_, peerHasBuffer := sellerBuffers.GetBuffer(targetPeerID)
+
+			if !peerHasBuffer {
+				// New seller - add and process
+				log.Printf("Adding new seller: %s", sellerPublicKey)
+				processSeller(seller, p2pHost, sellerBuffers, myReachableAddresses, protocolID)
+			} else {
+				log.Printf("Seller has buffer but not in current list, adding: %s", sellerPublicKey)
+			}
+
+			// Add to updated sellers list
+			updatedSellers[seller] = true
+		}
+	}
+
+	// Remove sellers that are no longer in the new list
+	for currentSeller := range currentSellers {
+		found := false
+		for _, newSeller := range newSellersMap {
+			if currentSeller.PublicKey == newSeller.PublicKey {
+				found = true
+				break
+			}
+		}
+
+		if !found {
+			// This seller is no longer in the list - remove and disconnect
+			log.Printf("Removing seller no longer in list: %s", currentSeller.PublicKey)
+
+			// Convert seller's public key to peer ID
+			peerIDStr, err := keylib.ConvertHederaPublicKeyToPeerID(currentSeller.PublicKey)
+			if err != nil {
+				log.Printf("Error converting seller public key to peer ID for removal: %v", err)
+				continue
+			}
+			targetPeerID, err := peer.Decode(peerIDStr)
+			if err != nil {
+				log.Printf("Error decoding peer ID for removal: %v", err)
+				continue
+			}
+
+			// Close the connection
+			p2pHost.Network().ClosePeer(targetPeerID)
+
+			// Remove from buffers
+			sellerBuffers.RemoveBuffer(targetPeerID)
+		}
+	}
+
+	return updatedSellers, nil
+}
+
+// ReplaceSellersSimple is a simplified version of ReplaceSellers that works with the seller buffers
+// to determine current connections. It's easier to use as a drop-in replacement but may not be
+// as precise as the full ReplaceSellers function.
+func ReplaceSellersSimple(sellerPublicKeys []string, p2pHost host.Host, sellerBuffers *commonlib.NodeBuffers, myReachableAddresses []multiaddr.Multiaddr, protocolID protocol.ID) error {
+	// Create a map of new sellers for efficient lookup
+	newSellersMap := make(map[string]Seller)
+
+	// Process each seller public key in the input list
+	for _, sellerPublicKey := range sellerPublicKeys {
+		// Create a Seller struct with the provided public key
+		seller := Seller{
+			PublicKey: sellerPublicKey,
+		}
+
+		// Get seller's EVM address
+		sellerEvnAddress := keylib.ConverHederaPublicKeyToEthereunAddress(seller.PublicKey)
+
+		// Get peer info to verify availability in SC
+		peerInfo, err := hedera_helper.GetPeerInfo(sellerEvnAddress)
+		if err != nil {
+			log.Printf("Failed to get peer SC info for %s: %v", sellerPublicKey, err)
+			continue // Skip this seller but continue with others
+		}
+		if !peerInfo.Available {
+			log.Printf("Seller %s is not present in the network SC", sellerPublicKey)
+			continue // Skip this seller but continue with others
+		}
+
+		// Get the last heartbeat message to get location info
+		if m, ok := getPeerHeartbeatIfRecent(peerInfo); ok {
+			heartbeatMessage := new(types.NeuronHeartBeatMsg)
+			base64Decoded, _ := base64.StdEncoding.DecodeString(m.Message)
+			err = json.Unmarshal([]byte(base64Decoded), &heartbeatMessage)
+			if err != nil {
+				log.Printf("Failed to parse heartbeat message for %s: %v", sellerPublicKey, err)
+				// Continue without location info
+			} else {
+				// Update seller location from heartbeat
+				seller.Lat = heartbeatMessage.Location.Latitude
+				seller.Lon = heartbeatMessage.Location.Longitude
+			}
+		}
+
+		// Add to new sellers map
+		newSellersMap[sellerPublicKey] = seller
+	}
+
+	// Get current peer IDs from buffers
+	currentPeerIDs := make(map[string]peer.ID)
+	for peerID := range sellerBuffers.GetBufferMap() {
+		peerIDStr := peerID.String()
+		currentPeerIDs[peerIDStr] = peerID
+	}
+
+	// Process new sellers that weren't there before
+	for sellerPublicKey, seller := range newSellersMap {
+		// Convert seller's public key to peer ID
+		peerIDStr, err := keylib.ConvertHederaPublicKeyToPeerID(seller.PublicKey)
+		if err != nil {
+			log.Printf("Error converting seller public key to peer ID: %v", err)
+			continue
+		}
+		targetPeerID, err := peer.Decode(peerIDStr)
+		if err != nil {
+			log.Printf("Error decoding peer ID: %v", err)
+			continue
+		}
+
+		// Check if this seller is already in our buffers
+		_, peerHasBuffer := sellerBuffers.GetBuffer(targetPeerID)
+
+		if !peerHasBuffer {
+			// New seller - add and process
+			log.Printf("Adding new seller: %s", sellerPublicKey)
+			processSeller(seller, p2pHost, sellerBuffers, myReachableAddresses, protocolID)
+		} else {
+			// Seller already exists - do nothing (keep him)
+			log.Printf("Seller already exists, keeping: %s", sellerPublicKey)
+		}
+	}
+
+	// Remove sellers that are no longer in the new list
+	for peerIDStr, targetPeerID := range currentPeerIDs {
+		// Check if this peer ID corresponds to any of our new sellers
+		found := false
+		for _, seller := range newSellersMap {
+			peerIDStrForSeller, err := keylib.ConvertHederaPublicKeyToPeerID(seller.PublicKey)
+			if err != nil {
+				continue
+			}
+			if peerIDStrForSeller == peerIDStr {
+				found = true
+				break
+			}
+		}
+
+		if !found {
+			// This seller is no longer in the list - remove and disconnect
+			log.Printf("Removing seller no longer in list: %s", peerIDStr)
+
+			// Close the connection
+			p2pHost.Network().ClosePeer(targetPeerID)
+
+			// Remove from buffers
+			sellerBuffers.RemoveBuffer(targetPeerID)
+		}
+	}
+
 	return nil
 }
+
+// ShowCurrentPeerStatus extracts the current sellers from the seller buffers
+// by converting peer IDs back to public keys and creating Seller structs
+func ShowCurrentPeerStatus(sellerBuffers *commonlib.NodeBuffers) map[Seller]bool {
+	currentSellers := make(map[Seller]bool)
+
+	for peerID := range sellerBuffers.GetBufferMap() {
+		// Extract public key from peer ID
+		pubKey, err := peerID.ExtractPublicKey()
+		if err != nil {
+			log.Printf("Error extracting public key for peer %s: %v", peerID, err)
+			continue
+		}
+
+		pubKeyBytes, err := pubKey.Raw()
+		if err != nil {
+			log.Printf("Error converting public key to bytes for peer %s: %v", peerID, err)
+			continue
+		}
+
+		// Convert to hex string (this is the Hedera public key format)
+		pubKeyStr := fmt.Sprintf("%x", pubKeyBytes)
+
+		// Create a Seller struct with the extracted public key
+		seller := Seller{
+			PublicKey: pubKeyStr,
+			// Note: We don't have location info here, so Lat/Lon will be 0
+			// This is acceptable since the main purpose is to identify existing sellers
+		}
+
+		currentSellers[seller] = true
+		log.Printf("Found current seller: %s (peer ID: %s)", pubKeyStr, peerID.String())
+	}
+
+	return currentSellers
+}
+
+// ReplaceSellersAuto automatically determines current sellers from buffers and updates them
+// with the provided list of seller public keys. This is the most convenient version to use.
+func ReplaceSellersAuto(sellerPublicKeys []string, p2pHost host.Host, sellerBuffers *commonlib.NodeBuffers, myReachableAddresses []multiaddr.Multiaddr, protocolID protocol.ID) error {
+	// Automatically get current sellers from buffers
+	currentSellers := ShowCurrentPeerStatus(sellerBuffers)
+
+	// Use the full ReplaceSellers function with the automatically determined current sellers
+	_, err := ReplaceSellers(sellerPublicKeys, currentSellers, p2pHost, sellerBuffers, myReachableAddresses, protocolID)
+	return err
+}
+
+/*
+Usage Examples:
+
+1. ReplaceSellersAuto (Recommended - simplest):
+   err := ReplaceSellersAuto(sellerPublicKeys, p2pHost, sellerBuffers, myReachableAddresses, protocolID)
+
+2. ReplaceSellers with automatic current seller detection:
+   updatedSellers, err := ReplaceSellers(sellerPublicKeys, nil, p2pHost, sellerBuffers, myReachableAddresses, protocolID)
+
+3. ReplaceSellers with manual current seller management:
+   currentSellers := ShowCurrentPeerStatus(sellerBuffers)
+   updatedSellers, err := ReplaceSellers(sellerPublicKeys, currentSellers, p2pHost, sellerBuffers, myReachableAddresses, protocolID)
+
+4. ShowCurrentPeerStatus for debugging:
+   currentSellers := ShowCurrentPeerStatus(sellerBuffers)
+   for seller := range currentSellers {
+       fmt.Printf("Current seller: %s\n", seller.PublicKey)
+   }
+*/
