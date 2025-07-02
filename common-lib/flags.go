@@ -49,6 +49,10 @@ var ClearCacheFlag *bool
 // UseLocalAddressFlag allows forcing the use of local addresses instead of public ones, can only talk to local peers
 var UseLocalAddressFlag *bool
 
+// SmartContractAddressFlag allows overriding the smart contract address from the command line.
+// This takes precedence over the environment variable smart_contract_address.
+var SmartContractAddressFlag *string
+
 func InitFlags() {
 	PeerOrRelayFlag = flag.String("mode", "peer", "Select peer, or relay")
 	ForceProtocolFlag = flag.String("force-protocol", "udp", "Force protocol: udp or tcp")
@@ -62,6 +66,7 @@ func InitFlags() {
 	RadiusFlag = flag.Int("radius", -1, "set radius in Km to restrict seller lat lon when in buyer mode")
 	ClearCacheFlag = flag.Bool("clear-cache", false, "set clear cache flag to delete cache be")
 	UseLocalAddressFlag = flag.Bool("use-local-address", false, "force the use of local addresses instead of discovered public ones, can only talk to local peers")
+	SmartContractAddressFlag = flag.String("smart-contract-address", "", "Smart contract address (overrides environment variable)")
 	flag.CommandLine.ParseErrorsWhitelist.UnknownFlags = true
 	flag.Parse()
 }

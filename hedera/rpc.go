@@ -8,6 +8,7 @@ import (
 	"os"
 	"time"
 
+	commonlib "github.com/NeuronInnovations/neuron-go-hedera-sdk/common-lib"
 	"github.com/NeuronInnovations/neuron-go-hedera-sdk/keylib"
 
 	"github.com/ethereum/go-ethereum/accounts/abi/bind"
@@ -123,9 +124,20 @@ func EnsureTopicsAndNotifyContract(p2pHost host.Host) (hedera.TopicID, hedera.To
 func GetPeerArraySize() (*big.Int, error) {
 	contractCaller := GetHRpcClient()
 
+	// Get the smart contract address for error reporting
+	var scAddress string
+	if commonlib.SmartContractAddressFlag != nil && *commonlib.SmartContractAddressFlag != "" {
+		scAddress = *commonlib.SmartContractAddressFlag
+	} else {
+		scAddress = os.Getenv("smart_contract_address")
+	}
+
 	size, error := contractCaller.GetPeerArraySize(
 		&bind.CallOpts{},
 	)
+	if error != nil {
+		return nil, fmt.Errorf("failed to get peer array size [contract: %s]: %v", scAddress, error)
+	}
 	return size, error
 }
 
@@ -146,6 +158,14 @@ func GetPeerInfo(hederaAccEvmAddress string) (PeerInfo, error) {
 	maxRetries := 25
 	baseDelay := time.Second
 
+	// Get the smart contract address for error reporting
+	var scAddress string
+	if commonlib.SmartContractAddressFlag != nil && *commonlib.SmartContractAddressFlag != "" {
+		scAddress = *commonlib.SmartContractAddressFlag
+	} else {
+		scAddress = os.Getenv("smart_contract_address")
+	}
+
 	for i := 0; i < maxRetries; i++ {
 		contractCaller := GetHRpcClient()
 		peerInfo, err = contractCaller.HederaAddressToPeer(
@@ -155,18 +175,26 @@ func GetPeerInfo(hederaAccEvmAddress string) (PeerInfo, error) {
 		if err == nil {
 			// Check if returned peerInfo is empty/default struct
 			if peerInfo == (PeerInfo{}) {
-				return peerInfo, fmt.Errorf("peer not found in the hedera contractfor address; peer must be a registered neuron node: %s", hederaAccEvmAddress)
+				return peerInfo, fmt.Errorf("peer not found in the hedera contract for address; peer must be a registered neuron node: %s (contract: %s)", hederaAccEvmAddress, scAddress)
 			}
 			return peerInfo, nil
 		}
-		fmt.Println("Error getting rpc peer info, retrying:", i, "th time", err)
+		fmt.Printf("Error getting rpc peer info, retrying: %d th time [contract: %s] - %v\n", i, scAddress, err)
 		time.Sleep(baseDelay * (1 << i)) // Exponential backoff
 	}
 
-	return peerInfo, fmt.Errorf("max retries exceeded getting peer info: %v", err)
+	return peerInfo, fmt.Errorf("max retries exceeded getting peer info [contract: %s]: %v", scAddress, err)
 }
 func GetAllPeers() ([]string, error) {
 	contractCaller := GetHRpcClient()
+
+	// Get the smart contract address for error reporting
+	var scAddress string
+	if commonlib.SmartContractAddressFlag != nil && *commonlib.SmartContractAddressFlag != "" {
+		scAddress = *commonlib.SmartContractAddressFlag
+	} else {
+		scAddress = os.Getenv("smart_contract_address")
+	}
 
 	peerArraySize, error := GetPeerArraySize()
 	if error != nil {
@@ -179,7 +207,7 @@ func GetAllPeers() ([]string, error) {
 
 		perrInfo, err2 := GetPeerInfo(address.String())
 		if err1 != nil || err2 != nil {
-			return nil, err1
+			return nil, fmt.Errorf("failed to get peer list at index %d [contract: %s]: %v", i, scAddress, err1)
 		}
 		// check if the address bytes start with 0x0000000, that is a lot of zeros
 		// then it's not an address that has been derived by a private key

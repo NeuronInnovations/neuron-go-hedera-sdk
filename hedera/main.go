@@ -26,11 +26,17 @@ import (
 
 func GetHRpcClient() *hederacontract.HederacontractCaller {
 
-	scAddress := os.Getenv("smart_contract_address")
+	// Check command-line flag first (highest priority), then environment variable
+	var scAddress string
+	if commonlib.SmartContractAddressFlag != nil && *commonlib.SmartContractAddressFlag != "" {
+		scAddress = *commonlib.SmartContractAddressFlag
+	} else {
+		scAddress = os.Getenv("smart_contract_address")
+	}
 
 	// Validate smart contract address format
 	if scAddress == "" {
-		log.Fatal("smart_contract_address environment variable is not set")
+		log.Fatal("smart_contract_address is not set. Please provide it via --smart-contract-address flag or smart_contract_address environment variable")
 	}
 
 	if !keylib.IsValidEthereumAddress(scAddress) {

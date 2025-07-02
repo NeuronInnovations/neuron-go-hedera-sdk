@@ -1,6 +1,6 @@
 ---
-description:
-globs:
+description: 
+globs: 
 alwaysApply: false
 ---
 # Smart Contract Address Configuration Plan
@@ -49,22 +49,22 @@ Currently, the smart contract address `0x87e2fc64dc1eae07300c2fc50d6700549e1632c
 **Goal:** Add a command-line flag that takes precedence over environment variables.
 
 ### Tasks:
-- [ ] **2.1** Add smart contract address flag to flags.go
+- [x] **2.1** Add smart contract address flag to flags.go
   - **File:** `neuron-go-hedera-sdk/common-lib/flags.go`
   - **Action:** Add new flag variable and initialization
   - **Flag name:** `--smart-contract-address`
   - **Description:** "Smart contract address (overrides environment variable)"
 
-- [ ] **2.2** Update flag initialization in flags.go
+- [x] **2.2** Update flag initialization in flags.go
   - **File:** `neuron-go-hedera-sdk/common-lib/flags.go`
   - **Action:** Add flag initialization in `InitFlags()` function
 
-- [ ] **2.3** Modify smart contract address resolution logic
+- [x] **2.3** Modify smart contract address resolution logic
   - **File:** `neuron-go-hedera-sdk/hedera/main.go`
   - **Action:** Update `GetHRpcClient()` to check flag first, then environment variable
   - **Precedence order:** Flag > Environment Variable > Error (no default)
 
-- [ ] **2.4** Update validation logic in neuron-sdk.go
+- [x] **2.4** Update validation logic in neuron-sdk.go
   - **File:** `neuron-go-hedera-sdk/neuron-sdk.go`
   - **Action:** Update validation to check both flag and environment variable
 
@@ -122,7 +122,7 @@ Currently, the smart contract address `0x87e2fc64dc1eae07300c2fc50d6700549e1632c
 ## Files to Modify
 1. `neuron-go-hedera-sdk/hedera/main.go` ✅
 2. `neuron-go-hedera-sdk/neuron-sdk.go` ✅
-3. `neuron-go-hedera-sdk/common-lib/flags.go`
+3. `neuron-go-hedera-sdk/common-lib/flags.go` ✅
 4. `neuron-go-hedera-sdk/README.md`
 5. `neuron-nodered-sdk-wrapper/README.md`
 6. `neuron-nodered-sdk-wrapper/.buyer-env.template`
