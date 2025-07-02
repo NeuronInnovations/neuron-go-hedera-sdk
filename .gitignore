@@ -13,3 +13,5 @@ __debug*
 sdk
 neuron-sdk
 /.personal
+/.cursor**
+
