@@ -60,8 +60,15 @@ func init() {
 	commonlib.InitEnv()
 
 	// check if the smart contract was loaded in the environment.
-	if os.Getenv("smart_contract_address") == "" {
+	scAddress := os.Getenv("smart_contract_address")
+	if scAddress == "" {
 		log.Printf("smart_contract_address is not set in the %s file", commonlib.MyEnvFile)
+		os.Exit(1)
+	}
+
+	// Validate smart contract address format
+	if !keylib.IsValidEthereumAddress(scAddress) {
+		log.Printf("invalid smart_contract_address format in %s file: %s. Must be a valid Ethereum address (0x + 40 hex characters)", commonlib.MyEnvFile, scAddress)
 		os.Exit(1)
 	}
 	// check the reachability of the node.

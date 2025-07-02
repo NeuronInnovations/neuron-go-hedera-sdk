@@ -47,3 +47,21 @@ func ConverHederaPublicKeyToEthereunAddress(hederaPublicKey string) string {
 	// return string with 0x prefix removed
 	return strings.ToLower(ethaddress.String()[2:])
 }
+
+// IsValidEthereumAddress validates if the given string is a valid Ethereum address format
+func IsValidEthereumAddress(address string) bool {
+	// Check if address starts with "0x" and has correct length (0x + 40 hex characters = 42 total)
+	if len(address) != 42 || !strings.HasPrefix(address, "0x") {
+		return false
+	}
+
+	// Check if the remaining characters are valid hex
+	for i := 2; i < len(address); i++ {
+		c := address[i]
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+			return false
+		}
+	}
+
+	return true
+}

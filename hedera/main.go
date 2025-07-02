@@ -27,9 +27,14 @@ import (
 func GetHRpcClient() *hederacontract.HederacontractCaller {
 
 	scAddress := os.Getenv("smart_contract_address")
-	if scAddress != "0x87e2fc64dc1eae07300c2fc50d6700549e1632ca" {
-		scAddress = "0x87e2fc64dc1eae07300c2fc50d6700549e1632ca"
-		commonlib.UpdateEnvVariable("smart_contract_address", scAddress, commonlib.MyEnvFile)
+
+	// Validate smart contract address format
+	if scAddress == "" {
+		log.Fatal("smart_contract_address environment variable is not set")
+	}
+
+	if !keylib.IsValidEthereumAddress(scAddress) {
+		log.Fatalf("invalid smart contract address format: %s. Must be a valid Ethereum address (0x + 40 hex characters)", scAddress)
 	}
 
 	client, _ := ethclient.Dial(os.Getenv("eth_rpc_url"))
