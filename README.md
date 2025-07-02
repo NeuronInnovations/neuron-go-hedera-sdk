@@ -166,8 +166,10 @@ Below is an explanation of the environment variables required for the `neuron-go
 
 9. **`smart_contract_address`**:
    - **Description**: The EVM-compatible address of the Neuron smart contract.
-   - **Fixed Value**: `0x87e2fc64dc1eae07300c2fc50d6700549e1632ca`
+   - **Format**: Must be a valid Ethereum address (0x + 40 hex characters)
+   - **Example**: `0x1234567890123456789012345678901234567890`
    - **Purpose**: Used for interactions with the smart contract, such as registering devices or querying SLA information.
+   - **Note**: Can also be specified via `--smart-contract-address` flag (takes precedence over environment variable)
 
 #### Optional/Derived Information:
 - The `list_of_sellers` is only useful for data buyers and can be left empty if discovery is handled dynamically (see flags section)
@@ -347,6 +349,12 @@ The `neuron-go-hedera-sdk` supports the following command-line flags for configu
    - **Default**: `false`
    - **Example**: `--use-local-address`
 
+10. **`--smart-contract-address`**
+    - **Description**: Overrides the smart contract address from the environment variable. This flag takes precedence over the `smart_contract_address` environment variable.
+    - **Format**: Must be a valid Ethereum address (0x + 40 hex characters)
+    - **Default**: Not set (uses environment variable if available)
+    - **Example**: `--smart-contract-address=0x1234567890123456789012345678901234567890`
+
 #### Buyer-Specific Flags
 
 1. **`--list-of-sellers-source`**
@@ -375,4 +383,35 @@ The `neuron-go-hedera-sdk` supports the following command-line flags for configu
       go build -o mydapp
       ./mydapp --mode=peer --buyer-or-seller=seller --envFile=.env-seller --port=20088 
    ```
+
+#### Smart Contract Address Usage Examples
+
+The smart contract address can be configured in multiple ways with the following precedence order:
+
+1. **Command-line flag** (highest priority)
+2. **Environment variable** (fallback)
+
+**Example 1: Using command-line flag**
+```bash
+./mydapp --smart-contract-address=0x1234567890123456789012345678901234567890 --buyer-or-seller=buyer
+```
+
+**Example 2: Using environment variable**
+```bash
+# In .env file
+smart_contract_address=0x1234567890123456789012345678901234567890
+
+# Run without flag
+./mydapp --buyer-or-seller=buyer
+```
+
+**Example 3: Flag overrides environment variable**
+```bash
+# In .env file
+smart_contract_address=0x1111111111111111111111111111111111111111
+
+# Flag takes precedence
+./mydapp --smart-contract-address=0x2222222222222222222222222222222222222222 --buyer-or-seller=buyer
+# Uses 0x2222... (flag value)
+```
 
