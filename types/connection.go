@@ -20,6 +20,11 @@ const (
 	Connected                  ConnectionState = "Connected"
 	Connecting                 ConnectionState = "Connecting"
 	Reconnecting               ConnectionState = "Reconnecting"
+
+	// Hole punching states
+	HolePunchingScheduled  ConnectionState = "HolePunchingScheduled"
+	HolePunchingInProgress ConnectionState = "HolePunchingInProgress"
+	HolePunchingCompleted  ConnectionState = "HolePunchingCompleted"
 )
 
 // RendezvousState represents the state of a rendezvous

@@ -30,6 +30,7 @@ import (
 
 	"github.com/hashgraph/hedera-sdk-go/v2"
 	"github.com/libp2p/go-libp2p/core/host"
+	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/core/protocol"
 	"github.com/multiformats/go-multiaddr"
@@ -148,6 +149,10 @@ func HandleBuyerCase(ctx context.Context, p2pHost host.Host, protocol protocol.I
 			if err != nil {
 				fmt.Println("SELFERROR:could not deposit to shared account ", err)
 			}
+		case "punchMeRequest":
+			// Handle punchMeRequest from seller for hole punching
+			handlePunchMeRequest(topicMessage, p2pHost, sellerBuffers, protocol)
+
 		case "peerError": // error from seller
 			sellerError := new(types.NeuronPeerErrorMsg)
 			err := json.Unmarshal(topicMessage.Contents, &sellerError)
@@ -174,6 +179,8 @@ func HandleBuyerCase(ctx context.Context, p2pHost host.Host, protocol protocol.I
 					// look into the buffers, we have the request there and send it again
 					processSeller(Seller{PublicKey: sellerError.PublicKey}, p2pHost, sellerBuffers, constMyReachableAddresses, protocol)
 				case types.PunchMe:
+					// Enhanced handling: The seller is requesting hole punching
+					log.Printf("Received PunchMe request from seller %s, waiting for punchMeRequest message", sellerError.PublicKey)
 				case types.DoNothing:
 				}
 			case types.StreamError:
@@ -365,6 +372,176 @@ func HandleBuyerCase(ctx context.Context, p2pHost host.Host, protocol protocol.I
 	}()
 }
 
+// handlePunchMeRequest processes the punchMeRequest message from seller and initiates buyer's hole punching
+func handlePunchMeRequest(topicMessage hedera.TopicMessage, p2pHost host.Host, sellerBuffers *commonlib.NodeBuffers, protocol protocol.ID) {
+	// 1. Parse punchMeRequest
+	var punchMeMsg types.NeuronPunchMeRequestMsg
+	if err := json.Unmarshal(topicMessage.Contents, &punchMeMsg); err != nil {
+		log.Printf("Failed to unmarshal punchMeRequest: %v", err)
+		return
+	}
+
+	log.Printf("Received punchMeRequest from seller with timestamp %s", punchMeMsg.HederaTimestamp)
+
+	// 2. Convert seller's public key to peer ID
+	sellerPeerIDStr, err := keylib.ConvertHederaPublicKeyToPeerID(punchMeMsg.PublicKey)
+	if err != nil {
+		log.Printf("Error converting seller public key to peer ID: %v", err)
+		return
+	}
+	sellerPeerID, err := peer.Decode(sellerPeerIDStr)
+	if err != nil {
+		log.Printf("Error decoding seller peer ID: %v", err)
+		return
+	}
+
+	// 3. Decrypt seller's IP addresses
+	sellerIPBytes, err := keylib.DecryptFromOtherside(
+		punchMeMsg.EncryptedIpAddress,
+		os.Getenv("private_key"),
+		punchMeMsg.PublicKey,
+	)
+	if err != nil {
+		log.Printf("Failed to decrypt seller IP addresses: %v", err)
+		return
+	}
+
+	// 4. Parse seller's IP addresses
+	sellerIPString := string(sellerIPBytes)
+	sellerIPs := strings.Fields(sellerIPString)
+
+	// 5. Send acknowledgment to seller
+	ackEnvelope, err := preparePunchMeAcknowledgment(punchMeMsg)
+	if err != nil {
+		log.Printf("Failed to prepare punchMeAcknowledgment: %v", err)
+		return
+	}
+
+	if err := hedera_helper.SendTransactionEnvelope(ackEnvelope); err != nil {
+		log.Printf("Failed to send punchMeAcknowledgment: %v", err)
+		return
+	}
+
+	log.Printf("Sent punchMeAcknowledgment to seller %s", sellerPeerID)
+
+	// 6. Update buffer state
+	sellerBuffers.UpdateBufferLibP2PState(sellerPeerID, types.HolePunchingInProgress)
+
+	// 7. Schedule synchronized hole punching
+	scheduleBuyerHolePunching(punchMeMsg.HederaTimestamp, punchMeMsg.PunchDelay, sellerIPs, sellerPeerID, p2pHost, protocol, sellerBuffers)
+}
+
+// preparePunchMeAcknowledgment creates an acknowledgment message for the punchMeRequest
+func preparePunchMeAcknowledgment(punchMeMsg types.NeuronPunchMeRequestMsg) (types.TopicPostalEnvelope, error) {
+	// Get buyer's public key
+	buyerPublicKey, err := getBuyerPublicKey()
+	if err != nil {
+		return types.TopicPostalEnvelope{}, fmt.Errorf("failed to get buyer public key: %w", err)
+	}
+
+	// Create acknowledgment message
+	ackMsg := types.NeuronPunchMeAcknowledgmentMsg{
+		MessageType:     "punchMeAcknowledgment",
+		RequestTopic:    punchMeMsg.StdInTopic,
+		PublicKey:       buyerPublicKey,
+		HederaTimestamp: punchMeMsg.HederaTimestamp,
+		Version:         "0.4",
+	}
+
+	// Create seller's stdin topic
+	sellerStdIn := hedera.TopicID{
+		Shard: 0,
+		Realm: 0,
+		Topic: punchMeMsg.StdInTopic,
+	}
+
+	return types.TopicPostalEnvelope{
+		OtherStdInTopic: sellerStdIn,
+		Message:         ackMsg,
+	}, nil
+}
+
+// scheduleBuyerHolePunching schedules the buyer's side of synchronized hole punching
+func scheduleBuyerHolePunching(hederaTimestamp string, delaySeconds int, sellerIPs []string, sellerPeerID peer.ID, p2pHost host.Host, protocol protocol.ID, sellerBuffers *commonlib.NodeBuffers) {
+	// 1. Parse Hedera timestamp
+	consensusTime, err := time.Parse(time.RFC3339Nano, hederaTimestamp)
+	if err != nil {
+		log.Printf("Failed to parse Hedera timestamp: %v", err)
+		return
+	}
+
+	// 2. Calculate punch time (consensus time + delay)
+	punchTime := consensusTime.Add(time.Duration(delaySeconds) * time.Second)
+
+	log.Printf("Scheduling buyer hole punching for seller %s at %s (delay: %ds)", sellerPeerID, punchTime, delaySeconds)
+
+	// 3. Schedule the hole punching
+	go func() {
+		time.Sleep(time.Until(punchTime))
+
+		// 4. Perform hole punching
+		performBuyerHolePunching(sellerIPs, sellerPeerID, p2pHost, protocol, sellerBuffers)
+	}()
+}
+
+// performBuyerHolePunching performs the actual hole punching attempt from buyer side
+func performBuyerHolePunching(sellerIPs []string, sellerPeerID peer.ID, p2pHost host.Host, protocol protocol.ID, sellerBuffers *commonlib.NodeBuffers) {
+	log.Printf("Performing buyer hole punching with seller %s", sellerPeerID)
+
+	// Try each seller IP address
+	for _, sellerIP := range sellerIPs {
+		// Create addrInfo from seller IP
+		addrInfo, err := peer.AddrInfoFromString(sellerIP + "/p2p/" + sellerPeerID.String())
+		if err != nil {
+			log.Printf("Failed to parse seller address %s: %v", sellerIP, err)
+			continue
+		}
+
+		// Use libp2p's hole punching capabilities
+		ctx := context.Background()
+		holePunchCtx := network.WithSimultaneousConnect(ctx, true, "hole-punching") // true for buyer (client)
+		forceDirectConnCtx := network.WithForceDirectDial(holePunchCtx, "hole-punching")
+
+		// Attempt connection with hole punching
+		dialCtx, cancel := context.WithTimeout(forceDirectConnCtx, 30*time.Second)
+		defer cancel()
+
+		if err := p2pHost.Connect(dialCtx, *addrInfo); err != nil {
+			log.Printf("Buyer hole punching failed for seller %s with address %s: %v", sellerPeerID, sellerIP, err)
+			continue
+		}
+
+		log.Printf("Buyer hole punching successful ❤️❤️❤️ with seller %s using address %s", sellerPeerID, sellerIP)
+		sellerBuffers.UpdateBufferLibP2PState(sellerPeerID, types.HolePunchingCompleted)
+
+		/*
+			// Try to create stream if connection successful
+			stream, err := p2pHost.NewStream(dialCtx, sellerPeerID, protocol)
+			if err != nil {
+				log.Printf("Failed to create stream after buyer hole punching: %v", err)
+				continue
+			}
+
+			log.Printf("Stream created successfully after buyer hole punching: %v", stream)
+			sellerBuffers.UpdateBufferLibP2PState(sellerPeerID, types.Connected)
+		*/
+		// Store the successful address
+		sellerBuffers.SetLastOtherSideMultiAddress(sellerPeerID, sellerIP)
+
+		// Success - no need to try other addresses
+		return
+	}
+
+	// If we get here, all addresses failed
+	log.Printf("All buyer hole punching attempts failed for seller %s", sellerPeerID)
+	sellerBuffers.UpdateBufferLibP2PState(sellerPeerID, types.CanNotConnectUnknownReason)
+}
+
+// getBuyerPublicKey gets the buyer's public key
+func getBuyerPublicKey() (string, error) {
+	return commonlib.MyPublicKey.StringRaw(), nil
+}
+
 func prepareServiceRequestMsg(seller string, myReachableAddresses []multiaddr.Multiaddr) (types.TopicPostalEnvelope, error) {
 	res, err := hedera_helper.BuyerPrepareServiceRequest(
 		myReachableAddresses,
@@ -373,10 +550,12 @@ func prepareServiceRequestMsg(seller string, myReachableAddresses []multiaddr.Mu
 		"e2436b1e019e993215e832762f9242020d199940",
 		100, // 100 milli hbar
 	)
+
 	if err != nil {
 		return types.TopicPostalEnvelope{}, err
 	}
-	return *res, err
+
+	return *res, nil
 }
 
 func processSeller(seller Seller, p2pHost host.Host, sellerBuffers *commonlib.NodeBuffers, myReachableAddresses []multiaddr.Multiaddr, protocolID protocol.ID) {

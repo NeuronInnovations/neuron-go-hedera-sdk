@@ -97,6 +97,47 @@ func (m *NeuronScheduleSignRequestMsg) GetVersion() string {
 	return m.Version
 }
 
+// Hole Punching Message Types
+
+// NeuronPunchMeRequestMsg is sent by the seller to the buyer when direct connection fails
+// and hole punching is required. It contains the seller's encrypted IP address and timing
+// information for coordinated hole punching.
+type NeuronPunchMeRequestMsg struct {
+	MessageType        string `json:"messageType"`
+	EncryptedIpAddress []byte `json:"i"` // Seller's IP encrypted with buyer's public key
+	StdInTopic         uint64 `json:"o"` // Buyer's stdin topic
+	PublicKey          string `json:"k"` // Seller's public key
+	HederaTimestamp    string `json:"t"` // Timestamp from the HCS message for synchronization
+	PunchDelay         int    `json:"d"` // Delay in seconds after consensus (default: 10)
+	Version            string `json:"v"`
+}
+
+func (m *NeuronPunchMeRequestMsg) GetMessageType() string {
+	return m.MessageType
+}
+
+func (m *NeuronPunchMeRequestMsg) GetVersion() string {
+	return m.Version
+}
+
+// NeuronPunchMeAcknowledgmentMsg is sent by the buyer to acknowledge receipt of a
+// punchMeRequest and confirm participation in the hole punching protocol.
+type NeuronPunchMeAcknowledgmentMsg struct {
+	MessageType     string `json:"messageType"`
+	RequestTopic    uint64 `json:"r"` // Topic where punchMeRequest was received
+	PublicKey       string `json:"k"` // Buyer's public key
+	HederaTimestamp string `json:"t"` // Same timestamp from punchMeRequest for verification
+	Version         string `json:"v"`
+}
+
+func (m *NeuronPunchMeAcknowledgmentMsg) GetMessageType() string {
+	return m.MessageType
+}
+
+func (m *NeuronPunchMeAcknowledgmentMsg) GetVersion() string {
+	return m.Version
+}
+
 // ErrorType represents different types of errors
 type ErrorType string
 
@@ -209,6 +250,22 @@ func UnmarshalNeuronMessage(jsonData []byte) (NeuronMessage, error) {
 		err := json.Unmarshal(jsonData, &msg)
 		if err != nil {
 			return nil, fmt.Errorf("error un-marshalling NeuronPeerErrorMsg: %v", err)
+		}
+		return &msg, nil
+
+	case "punchMeRequest":
+		var msg NeuronPunchMeRequestMsg
+		err := json.Unmarshal(jsonData, &msg)
+		if err != nil {
+			return nil, fmt.Errorf("error un-marshalling NeuronPunchMeRequestMsg: %v", err)
+		}
+		return &msg, nil
+
+	case "punchMeAcknowledgment":
+		var msg NeuronPunchMeAcknowledgmentMsg
+		err := json.Unmarshal(jsonData, &msg)
+		if err != nil {
+			return nil, fmt.Errorf("error un-marshalling NeuronPunchMeAcknowledgmentMsg: %v", err)
 		}
 		return &msg, nil
 
