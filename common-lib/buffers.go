@@ -15,15 +15,16 @@ import (
 	"github.com/libp2p/go-libp2p/core/peer"
 )
 
-// Package-level variable for the BoltDB instance
-//var db *bbolt.DB
-
 // Package-level variable for the NodeBuffers instance
 var NodeBuffersInstance *NodeBuffers
 
-// Initialize the database in the package init function
-func StateManagerInit(buyerOrSellerFlag string, clearCacheFlag bool) {
+// Package-level variable for the StateManager instance
+var GlobalStateManager *StateManager
+
+// Initialize the state manager and NodeBuffers
+func StateManagerInit(buyerOrSellerFlag string, clearCacheFlag bool, stateManager *StateManager) {
 	NodeBuffersInstance = NewNodeBuffers()
+	GlobalStateManager = stateManager
 
 	// Dump database to JSON for debugging
 	//if err := NodeBuffersInstance.dumpToJSON(fmt.Sprintf("neuron-connections-startup-%s.json", buyerOrSellerFlag)); err != nil {
@@ -98,6 +99,8 @@ type NodeBufferInfo struct {
 	RequestOrResponse              types.TopicPostalEnvelope `json:"request_or_response"`
 	NextScheduleRequestTime        time.Time                 `json:"next_schedule_request_time"`
 	LastGoodsReceivedTime          time.Time                 `json:"last_goods_received_time"`
+	SharedAccID                    uint64                    `json:"shared_acc_id"`
+	SharedAccIDCreatedAt           time.Time                 `json:"shared_acc_id_created_at"`
 }
 
 func (nb *NodeBuffers) AddBuffer2(peerID peer.ID, envelope types.TopicPostalEnvelope, isOtherSideValidAccount bool, rendezvousState types.RendezvousState, libP2PState types.ConnectionState) {
@@ -154,6 +157,13 @@ func (nb *NodeBuffers) RemoveBuffer(peerID peer.ID) {
 	nb.mu.Lock()
 	defer nb.mu.Unlock()
 	delete(nb.Buffers, peerID)
+
+	// Remove peer from persistent storage (immediate - critical)
+	if GlobalStateManager != nil {
+		if err := GlobalStateManager.RemovePeer(peerID); err != nil {
+			log.Printf("Warning: Failed to remove peer %s from persistent storage: %v", peerID, err)
+		}
+	}
 }
 
 // UpdateBufferLibP2PState updates the LibP2PState of a buffer for a given buyerID
@@ -166,6 +176,12 @@ func (nb *NodeBuffers) UpdateBufferLibP2PState(peerID peer.ID, state types.Conne
 			buffer.NoOfConnectionAttempts = 0
 		}
 		buffer.LastConnectionAttempt = time.Now()
+
+		// Persist state change (immediate if connected/disconnected, batched otherwise)
+		if GlobalStateManager != nil {
+			immediate := (state == types.Connected || state == types.ConnectionLost)
+			GlobalStateManager.PersistPeer(peerID, buffer, immediate)
+		}
 	}
 }
 
@@ -186,6 +202,11 @@ func (nb *NodeBuffers) IncrementReconnectAttempts(peerID peer.ID) {
 		buffer.NoOfConnectionAttempts++
 		buffer.LastConnectionAttempt = time.Now()
 		buffer.NextScheduledConnectionAttempt = time.Now().Add(time.Second * time.Duration(1<<buffer.NoOfConnectionAttempts))
+
+		// Persist attempt count (batched - non-critical)
+		if GlobalStateManager != nil {
+			GlobalStateManager.PersistPeer(peerID, buffer, false)
+		}
 	}
 }
 
@@ -226,6 +247,11 @@ func (nb *NodeBuffers) SetLastOtherSideMultiAddress(peerID peer.ID, addr string)
 	defer nb.mu.Unlock()
 	if buffer, ok := nb.Buffers[peerID]; ok {
 		buffer.LastOtherSideMultiAddress = addr
+
+		// Persist IP address change (immediate write - critical)
+		if GlobalStateManager != nil {
+			GlobalStateManager.PersistPeer(peerID, buffer, true)
+		}
 	}
 }
 
@@ -248,6 +274,8 @@ func (nb *NodeBuffers) dumpToJSON(filename string) error {
 			"next_scheduled_connection_attempt": v.NextScheduledConnectionAttempt,
 			"next_schedule_request_time":        v.NextScheduleRequestTime,
 			"last_goods_received_time":          v.LastGoodsReceivedTime,
+			"shared_acc_id":                     v.SharedAccID,
+			"shared_acc_id_created_at":          v.SharedAccIDCreatedAt,
 		}
 		data[k.String()] = bufferInfo
 	}
@@ -273,6 +301,31 @@ func (nb *NodeBuffers) SetLastGoodsReceivedTime(peerID peer.ID) {
 	if buffer, ok := nb.Buffers[peerID]; ok {
 		buffer.LastGoodsReceivedTime = time.Now()
 	}
+}
+
+// SetSharedAccID sets the shared account ID for a peer
+func (nb *NodeBuffers) SetSharedAccID(peerID peer.ID, sharedAccID uint64) {
+	nb.mu.Lock()
+	defer nb.mu.Unlock()
+	if buffer, ok := nb.Buffers[peerID]; ok {
+		buffer.SharedAccID = sharedAccID
+		buffer.SharedAccIDCreatedAt = time.Now()
+
+		// Persist SharedAccID change (immediate - critical for cost savings)
+		if GlobalStateManager != nil {
+			GlobalStateManager.PersistPeer(peerID, buffer, true)
+		}
+	}
+}
+
+// GetSharedAccID gets the shared account ID for a peer
+func (nb *NodeBuffers) GetSharedAccID(peerID peer.ID) (uint64, bool) {
+	nb.mu.RLock()
+	defer nb.mu.RUnlock()
+	if buffer, ok := nb.Buffers[peerID]; ok {
+		return buffer.SharedAccID, buffer.SharedAccID > 0
+	}
+	return 0, false
 }
 
 // ShowDetailedPeerStatus extracts detailed status information for all peers

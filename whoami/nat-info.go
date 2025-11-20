@@ -70,7 +70,15 @@ var (
 func GetNatInfoAndUpdateGlobals(portFlag *string) (string, string, int, bool) {
 	natype, mapDesc, filterDesc, ip, stunRetrievedPort, err := getNatInfo(*portFlag)
 	if err != nil {
-		panic(err)
+		// Log the error but don't panic - return conservative defaults
+		log.Printf("Warning: NAT detection failed: %v. Using conservative defaults.", err)
+		natPort, _ := strconv.Atoi(*portFlag)
+		// Set conservative defaults (assume restricted NAT)
+		NatDeviceType = "unknown:unknown:unknown"
+		NatIPAddress = ""
+		NatPort = natPort
+		NatReachability = false
+		return NatDeviceType, NatIPAddress, NatPort, NatReachability
 	}
 
 	// Compute natDeviceType and natReachability values
@@ -376,9 +384,10 @@ func listen(conn *net.UDPConn) (messages chan *stun.Message) {
 			m.Raw = buf
 			err = m.Decode()
 			if err != nil {
-				log.Printf("Error decoding message: %v", err)
-				close(messages)
-				return
+				// Don't close channel on decode errors - skip invalid messages and continue
+				// This can happen when we receive non-STUN traffic (e.g., from other P2P peers)
+				log.Printf("Error decoding message: %v (skipping)", err)
+				continue
 			}
 
 			messages <- m

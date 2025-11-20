@@ -91,6 +91,17 @@ func HandleBuyerCase(ctx context.Context, p2pHost host.Host, protocol protocol.I
 		sellerBuffers = commonlib.NewNodeBuffers()
 	}
 
+	// IMPORTANT: Try BBolt-first reconnection BEFORE querying Hedera blockchain
+	// This prioritizes cached IPs and SharedAccIDs to avoid unnecessary blockchain queries
+	if commonlib.GlobalStateManager != nil && !commonlib.GlobalStateManager.IsInDegradedMode() {
+		log.Println("🚀 Starting BBolt-first reconnection (prioritizing cached IPs over Hedera)")
+		tryReconnectFromBBolt(ctx, p2pHost, sellerBuffers, protocol)
+		// Give BBolt reconnection attempts a moment to establish connections
+		time.Sleep(2 * time.Second)
+	} else {
+		log.Println("⚠️  BBolt unavailable or in degraded mode, will rely on Hedera for all connections")
+	}
+
 	go buyerCase(ctx, p2pHost, sellerBuffers)
 
 	// ------- LISTEN -----------
@@ -372,6 +383,88 @@ func HandleBuyerCase(ctx context.Context, p2pHost host.Host, protocol protocol.I
 	}()
 }
 
+// tryReconnectFromBBolt attempts to connect to sellers using persisted IPs from BBolt database
+// This function is called on startup to avoid unnecessary Hedera topic queries and prioritize cached connections
+func tryReconnectFromBBolt(ctx context.Context, p2pHost host.Host, sellerBuffers *commonlib.NodeBuffers, protocol protocol.ID) {
+	if sellerBuffers == nil || len(sellerBuffers.Buffers) == 0 {
+		log.Println("💾 No persisted sellers found in BBolt to reconnect to")
+		return
+	}
+
+	log.Printf("💾 Attempting BBolt-first reconnection to %d persisted sellers", len(sellerBuffers.Buffers))
+
+	// Create a copy of buffer references to avoid holding lock during connection attempts
+	buffersCopy := make(map[peer.ID]*commonlib.NodeBufferInfo)
+	for peerID, buffer := range sellerBuffers.Buffers {
+		buffersCopy[peerID] = buffer
+	}
+
+	for sellerPeerID, buffer := range buffersCopy {
+		// Skip if we don't have persisted IPs
+		if buffer.LastOtherSideMultiAddress == "" {
+			log.Printf("⏭️  No persisted IPs for seller %s, will rely on Hedera", sellerPeerID.ShortString())
+			continue
+		}
+
+		// Skip if we don't have a valid SharedAccID (indicates no previous successful connection)
+		if buffer.SharedAccID == 0 {
+			log.Printf("⏭️  No SharedAccID for seller %s, will rely on Hedera", sellerPeerID.ShortString())
+			continue
+		}
+
+		log.Printf("🔄 Attempting BBolt-first reconnection to seller %s using persisted IPs: %s (SharedAccID: %d)",
+			sellerPeerID.ShortString(), buffer.LastOtherSideMultiAddress, buffer.SharedAccID)
+
+		// Parse persisted multiaddresses
+		sellerIPs := strings.Fields(buffer.LastOtherSideMultiAddress)
+		if len(sellerIPs) == 0 {
+			log.Printf("⚠️  Invalid persisted IPs for seller %s", sellerPeerID)
+			continue
+		}
+
+		// Attempt direct connection using persisted IPs (in goroutine to avoid blocking)
+		go func(peerID peer.ID, ips []string, sharedAccID uint64) {
+			for _, ipStr := range ips {
+				addr, err := multiaddr.NewMultiaddr(ipStr)
+				if err != nil {
+					log.Printf("⚠️  Invalid multiaddr %s: %v", ipStr, err)
+					continue
+				}
+
+				log.Printf("🔌 Trying BBolt-cached connection to seller %s at %s", peerID.ShortString(), ipStr)
+
+				// Attempt connection with timeout
+				connectCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+				defer cancel()
+
+				err = p2pHost.Connect(connectCtx, peer.AddrInfo{
+					ID:    peerID,
+					Addrs: []multiaddr.Multiaddr{addr},
+				})
+
+				if err == nil {
+					log.Printf("✅ BBolt-first reconnection SUCCESS! Connected to seller %s (SharedAccID: %d)",
+						peerID.ShortString(), sharedAccID)
+					sellerBuffers.UpdateBufferLibP2PState(peerID, types.Connected)
+
+					// Try to open stream to verify connection
+					stream, streamErr := p2pHost.NewStream(context.Background(), peerID, protocol)
+					if streamErr == nil {
+						log.Printf("✅ Stream opened successfully to seller %s via BBolt-cached IP", peerID.ShortString())
+						stream.Close()
+						return // Success! No need to try other IPs
+					} else {
+						log.Printf("⚠️  Stream opening failed to seller %s: %v", peerID.ShortString(), streamErr)
+					}
+				} else {
+					log.Printf("⚠️  Connection attempt failed to %s: %v", ipStr, err)
+				}
+			}
+			log.Printf("⚠️  All BBolt reconnection attempts failed for seller %s, will rely on Hedera messages", peerID.ShortString())
+		}(sellerPeerID, sellerIPs, buffer.SharedAccID)
+	}
+}
+
 // handlePunchMeRequest processes the punchMeRequest message from seller and initiates buyer's hole punching
 func handlePunchMeRequest(topicMessage hedera.TopicMessage, p2pHost host.Host, sellerBuffers *commonlib.NodeBuffers, protocol protocol.ID) {
 	// 1. Parse punchMeRequest
@@ -543,12 +636,17 @@ func getBuyerPublicKey() (string, error) {
 }
 
 func prepareServiceRequestMsg(seller string, myReachableAddresses []multiaddr.Multiaddr) (types.TopicPostalEnvelope, error) {
+	return prepareServiceRequestMsgWithOptionalAccount(seller, myReachableAddresses, 0)
+}
+
+func prepareServiceRequestMsgWithOptionalAccount(seller string, myReachableAddresses []multiaddr.Multiaddr, existingSharedAccID uint64) (types.TopicPostalEnvelope, error) {
 	res, err := hedera_helper.BuyerPrepareServiceRequest(
 		myReachableAddresses,
 		os.Getenv("hedera_evm_id"),
 		keylib.ConverHederaPublicKeyToEthereunAddress(seller),
 		"e2436b1e019e993215e832762f9242020d199940",
 		100, // 100 milli hbar
+		existingSharedAccID,
 	)
 
 	if err != nil {
@@ -556,6 +654,23 @@ func prepareServiceRequestMsg(seller string, myReachableAddresses []multiaddr.Mu
 	}
 
 	return *res, nil
+}
+
+// extractSharedAccIDFromEnvelope extracts SharedAccID from a TopicPostalEnvelope
+func extractSharedAccIDFromEnvelope(envelope types.TopicPostalEnvelope) uint64 {
+	switch msg := envelope.Message.(type) {
+	case *types.NeuronServiceRequestMsg:
+		return msg.SharedAccID
+	case map[string]interface{}:
+		// Handle deserialized JSON where interface{} becomes map[string]interface{}
+		if a, ok := msg["a"].(float64); ok {
+			return uint64(a)
+		}
+		if a, ok := msg["SharedAccID"].(float64); ok {
+			return uint64(a)
+		}
+	}
+	return 0
 }
 
 func processSeller(seller Seller, p2pHost host.Host, sellerBuffers *commonlib.NodeBuffers, myReachableAddresses []multiaddr.Multiaddr, protocolID protocol.ID) {
@@ -598,15 +713,47 @@ func processSeller(seller Seller, p2pHost host.Host, sellerBuffers *commonlib.No
 
 	connsToPeer := p2pHost.Network().ConnsToPeer(targetPeerID)
 
+	// PRIORITY: Skip Hedera messaging if already connected via BBolt-cached IPs
+	// This avoids unnecessary blockchain queries and prioritizes local cache
+	if len(connsToPeer) > 0 {
+		// Check if connection is actually active and established
+		if p2pHost.Network().Connectedness(targetPeerID) == network.Connected {
+			log.Printf("✅ Already connected to seller %s via BBolt-cached IP, skipping Hedera query", sellerEvnAddress)
+			return
+		}
+	}
+
 	if len(connsToPeer) == 0 {
 		if !peerHasBuffer {
-			envelope, setupErr := prepareServiceRequestMsg(seller.PublicKey, myReachableAddresses)
+			// Check for persisted SharedAccID to reuse
+			var existingSharedAccID uint64 = 0
+			if commonlib.GlobalStateManager != nil {
+				loadedBuffer, err := commonlib.GlobalStateManager.LoadPeer(targetPeerID)
+				if err != nil {
+					log.Printf("⚠️ Failed to load persisted peer %s: %v", targetPeerID, err)
+				} else if loadedBuffer != nil {
+					if loadedBuffer.SharedAccID > 0 {
+						// Validate the existing SharedAccID before reusing
+						if isValid, validErr := hedera_helper.ValidateSharedAccount(loadedBuffer.SharedAccID, 100); isValid {
+							existingSharedAccID = loadedBuffer.SharedAccID
+							log.Printf("🔄 Reusing persisted SharedAccID %d for seller %s", existingSharedAccID, sellerEvnAddress)
+						} else {
+							log.Printf("⚠️ Persisted SharedAccID %d is invalid (%v), will create new", loadedBuffer.SharedAccID, validErr)
+						}
+					}
+				}
+			}
+
+			envelope, setupErr := prepareServiceRequestMsgWithOptionalAccount(seller.PublicKey, myReachableAddresses, existingSharedAccID)
 			if setupErr != nil {
 				sellerBuffers.AddBuffer2(targetPeerID, envelope, false, types.NotInitiated, types.ConnectionLost)
 				log.Printf("💀 envelope setup error; seller %s will be blacklisted, err: %v \n", sellerEvnAddress, setupErr)
 				hedera_helper.SendSelfErrorMessage(types.BadMessageError, "Could not create envelope for: "+sellerEvnAddress, types.DoNothing)
 				return
 			}
+
+			// Extract and store SharedAccID from envelope
+			newSharedAccID := extractSharedAccIDFromEnvelope(envelope)
 
 			sellerBuffers.IncrementReconnectAttempts(targetPeerID)
 			if execErr := hedera_helper.SendTransactionEnvelope(envelope); execErr != nil {
@@ -616,6 +763,12 @@ func processSeller(seller Seller, p2pHost host.Host, sellerBuffers *commonlib.No
 				return
 			}
 			sellerBuffers.AddBuffer2(targetPeerID, envelope, true, types.SendOK, types.Connecting)
+
+			// Store SharedAccID in buffer for future persistence
+			if newSharedAccID > 0 {
+				sellerBuffers.SetSharedAccID(targetPeerID, newSharedAccID)
+				log.Printf("💾 Stored SharedAccID %d for seller %s", newSharedAccID, sellerEvnAddress)
+			}
 		} else if isTooEarly, _ := commonlib.IsRequestTooEarly(sellerBuffers, targetPeerID); isTooEarly {
 			return
 		} else {
@@ -624,6 +777,43 @@ func processSeller(seller Seller, p2pHost host.Host, sellerBuffers *commonlib.No
 		}
 		sellerBuffers.IncrementReconnectAttempts(targetPeerID)
 		if peerBuffer != nil && peerBuffer.RequestOrResponse.Message != nil {
+			// Validate SharedAccID before re-sending (important for reboot scenario)
+			existingSharedAccID := peerBuffer.SharedAccID
+			if existingSharedAccID == 0 {
+				// Try to extract from message if not in dedicated field
+				existingSharedAccID = extractSharedAccIDFromEnvelope(peerBuffer.RequestOrResponse)
+			}
+
+			needNewEnvelope := false
+			if existingSharedAccID > 0 {
+				// Validate the existing SharedAccID
+				if isValid, validErr := hedera_helper.ValidateSharedAccount(existingSharedAccID, 100); !isValid {
+					log.Printf("⚠️ SharedAccID %d is invalid (%v), creating new envelope", existingSharedAccID, validErr)
+					needNewEnvelope = true
+				} else {
+					log.Printf("✅ Reusing valid SharedAccID %d for re-send to seller %s", existingSharedAccID, sellerEvnAddress)
+				}
+			}
+
+			if needNewEnvelope {
+				// Create new envelope with new SharedAccID
+				newEnvelope, setupErr := prepareServiceRequestMsgWithOptionalAccount(seller.PublicKey, myReachableAddresses, 0)
+				if setupErr != nil {
+					log.Printf("💀 Failed to create new envelope: %v", setupErr)
+					hedera_helper.SendSelfErrorMessage(types.BadMessageError, "Could not create new envelope for: "+sellerEvnAddress, types.DoNothing)
+					return
+				}
+
+				// Update buffer with new envelope and SharedAccID
+				newSharedAccID := extractSharedAccIDFromEnvelope(newEnvelope)
+				peerBuffer.RequestOrResponse = newEnvelope
+				peerBuffer.SharedAccID = newSharedAccID
+				if newSharedAccID > 0 {
+					sellerBuffers.SetSharedAccID(targetPeerID, newSharedAccID)
+					log.Printf("💾 Updated SharedAccID to %d for seller %s", newSharedAccID, sellerEvnAddress)
+				}
+			}
+
 			secondExecError := hedera_helper.SendTransactionEnvelope(peerBuffer.RequestOrResponse)
 			if secondExecError != nil {
 				log.Printf("💀-2  skip that seller %s because ExecuteHederaTransaction error: %v", sellerEvnAddress, secondExecError)

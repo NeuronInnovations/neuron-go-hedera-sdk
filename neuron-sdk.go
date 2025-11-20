@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"path/filepath"
 
 	neuronbuffers "github.com/NeuronInnovations/neuron-go-hedera-sdk/common-lib"
 	"github.com/NeuronInnovations/neuron-go-hedera-sdk/types"
@@ -133,14 +134,73 @@ func LaunchSDK(
 	Version = version
 	commonlib.MyProtocol = protocol
 
-	// enable persistence. TODO: use a flag to choose if you want to disable it. This is useful for stateless setups.
-	commonlib.StateManagerInit(*commonlib.BuyerOrSellerFlag, *commonlib.ClearCacheFlag)
+	// Initialize StateManager with bbolt persistence
+	dbPath := *commonlib.DbPathFlag
+	if dbPath == "" {
+		homeDir, err := os.UserHomeDir()
+		if err != nil {
+			log.Fatalf("Failed to get home directory: %v", err)
+		}
+		dbPath = filepath.Join(homeDir, ".neuron", "state.db")
+	}
+
+	stateManager, err := commonlib.NewStateManager(dbPath)
+	if err != nil {
+		// Non-fatal error - StateManager will operate in degraded mode
+		log.Printf("WARNING: Failed to initialize state manager: %v", err)
+		log.Println("Continuing in memory-only mode (no persistence)")
+	}
+
+	// Load persisted state or start fresh
+	if *commonlib.ClearCacheFlag {
+		log.Println("Clear cache flag set - clearing all persistent state")
+		if stateManager != nil && !stateManager.IsInDegradedMode() {
+			if err := stateManager.ClearAll(); err != nil {
+				log.Printf("Warning: Failed to clear persistent state: %v", err)
+			}
+		}
+		commonlib.StateManagerInit(*commonlib.BuyerOrSellerFlag, *commonlib.ClearCacheFlag, stateManager)
+	} else {
+		// Try to load persisted state
+		if stateManager != nil && !stateManager.IsInDegradedMode() {
+			loadedBuffers, err := stateManager.LoadAllPeers()
+			if err != nil {
+				log.Printf("Warning: Failed to load persisted state: %v", err)
+				log.Println("Starting with empty state")
+				commonlib.StateManagerInit(*commonlib.BuyerOrSellerFlag, *commonlib.ClearCacheFlag, stateManager)
+			} else {
+				// Use loaded buffers
+				commonlib.NodeBuffersInstance = loadedBuffers
+				commonlib.GlobalStateManager = stateManager
+				log.Printf("Successfully loaded %d peers from persistent state", len(loadedBuffers.Buffers))
+			}
+		} else {
+			// Degraded mode or no state manager - start with empty state
+			commonlib.StateManagerInit(*commonlib.BuyerOrSellerFlag, *commonlib.ClearCacheFlag, stateManager)
+		}
+	}
+
+	// Store reference for shutdown
+	defer func() {
+		if stateManager != nil {
+			log.Println("Persisting final state before shutdown...")
+			if err := stateManager.FlushAll(); err != nil {
+				log.Printf("Error flushing state: %v", err)
+			}
+			stateManager.PersistMetadata("last_shutdown", time.Now().Format(time.RFC3339Nano))
+			if err := stateManager.Close(); err != nil {
+				log.Printf("Error closing state manager: %v", err)
+			}
+		}
+	}()
 
 	// private keys are coming from the environment. Location is coming either from the force flag or the env variable. If any of them is missing
 	// then an external fallback configurator will be used. This can be an UI, a wallet, etc.
 	fixPrivKey, err := SetupKeysAndLocation(commonlib.MyEnvFile, flags.ForceLocationFlag, keyAndLocationConfigurator)
 	if err != nil {
-		log.Fatal(err)
+		log.Printf("FATAL: Failed to setup keys and location: %v", err)
+		log.Println("Cannot proceed without valid keys and location. Shutting down...")
+		os.Exit(1)
 	}
 	fixPrivKey_g = fixPrivKey
 	rawPublicKey, _ := fixPrivKey.GetPublic().Raw()
@@ -290,8 +350,23 @@ func LaunchSDK(
 					log.Println("🚌 nat device type changed", e.TransportProtocol.String(), e.NatDeviceType.String())
 				case event.EvtPeerConnectednessChanged:
 					log.Println("🚌 peer connectedness changed", e.Peer, e.Connectedness.String())
+
+					// Persist state change (immediate write for connection state changes)
+					if commonlib.GlobalStateManager != nil && commonlib.NodeBuffersInstance != nil {
+						if bufferInfo, exists := commonlib.NodeBuffersInstance.GetBuffer(e.Peer); exists {
+							commonlib.GlobalStateManager.PersistPeer(e.Peer, bufferInfo, true)
+						}
+					}
+
 				case event.EvtPeerIdentificationCompleted:
 					log.Println("🚌 peer identification completed", e.Peer, e.Protocols, e.ObservedAddr, e.ListenAddrs)
+
+					// Persist peer identification (batched - non-critical)
+					if commonlib.GlobalStateManager != nil && commonlib.NodeBuffersInstance != nil {
+						if bufferInfo, exists := commonlib.NodeBuffersInstance.GetBuffer(e.Peer); exists {
+							commonlib.GlobalStateManager.PersistPeer(e.Peer, bufferInfo, false)
+						}
+					}
 				case event.EvtLocalAddressesUpdated:
 					log.Println("🚌 local addresses updated", e.Removed, e.Current)
 				case event.EvtLocalProtocolsUpdated:
@@ -308,7 +383,9 @@ func LaunchSDK(
 
 		stdOutTopic, stdInTopic, stdErrTopic, err := hederaAnnounceAndHeartBeat(ctx, p2pHost)
 		if err != nil {
-			log.Panic(err)
+			log.Printf("FATAL: Failed to announce to Hedera and start heartbeat: %v", err)
+			log.Println("Cannot proceed without Hedera connectivity. Shutting down...")
+			os.Exit(1)
 		}
 
 		commonlib.MyStdIn = stdInTopic
@@ -343,10 +420,11 @@ func LaunchSDK(
 
 	<-keyboardCancelChannel
 
-	fmt.Println("Received keyboard signal, shutting  down the libp2p node ...")
+	fmt.Println("Received keyboard signal, shutting down the libp2p node ...")
 	// shut the node down
 	if err := p2pHost.Close(); err != nil {
-		panic(err)
+		log.Printf("Error closing p2p host: %v", err)
+		// Continue with shutdown despite error
 	}
 }
 
@@ -378,13 +456,14 @@ func createHost(options []config.Option) host.Host {
 	p2pHost, hostError := libp2p.New(options...)
 
 	if hostError != nil {
-		panic(hostError)
-	} else {
-		fmt.Printf(
-			"This host's identity \n\tMy host ID:%s\n\t p2pHost.Addrs():%s  \n listening on:%s  \n",
-			p2pHost.ID(), p2pHost.Addrs(), p2pHost.Network().ListenAddresses(),
-		)
+		log.Printf("FATAL: Failed to create libp2p host: %v", hostError)
+		log.Println("Cannot proceed without P2P connectivity. Shutting down...")
+		os.Exit(1)
 	}
+	fmt.Printf(
+		"This host's identity \n\tMy host ID:%s\n\t p2pHost.Addrs():%s  \n listening on:%s  \n",
+		p2pHost.ID(), p2pHost.Addrs(), p2pHost.Network().ListenAddresses(),
+	)
 	return p2pHost
 }
 
@@ -457,7 +536,7 @@ func hederaAnnounceAndHeartBeat(ctx context.Context, p2pHost host.Host) (hedera.
 	stdOutTopic, stdInTopic, stdErrTopic, topciCreationError := hedera_helper.EnsureTopicsAndNotifyContract(p2pHost)
 
 	if topciCreationError != nil {
-		log.Fatal("Failed to create hedera topics. Let's end it here. ", topciCreationError)
+		return hedera.TopicID{}, hedera.TopicID{}, hedera.TopicID{}, fmt.Errorf("failed to create Hedera topics: %w", topciCreationError)
 	}
 
 	go func() {
@@ -478,7 +557,8 @@ func hederaAnnounceAndHeartBeat(ctx context.Context, p2pHost host.Host) (hedera.
 				// Marshal the struct to JSON
 				heartbeatJSON, err := json.Marshal(heartbeatMessage)
 				if err != nil {
-					log.Fatalf("Error marshaling heartbeat message to JSON: %v", err)
+					log.Printf("Error marshaling heartbeat message to JSON: %v", err)
+					continue // Skip this heartbeat cycle
 				}
 				// Convert JSON bytes to a string
 				heartbeatString := string(heartbeatJSON)

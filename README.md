@@ -415,3 +415,211 @@ smart_contract_address=0x1111111111111111111111111111111111111111
 # Uses 0x2222... (flag value)
 ```
 
+## Testing and Verification
+
+The SDK includes comprehensive test scripts to verify BBolt database persistence, state management, and network operations. All test logs are automatically saved to `scripts/logs/` for detailed analysis.
+
+### Running BBolt Persistence Tests
+
+The BBolt persistence test verifies core database functionality including creation, structure, state persistence, IP tracking, and data integrity.
+
+**Prerequisites:**
+```bash
+# Ensure the neuron-sdk binary is built
+go build -o neuron-sdk ./cmd/neuron-sdk
+
+# Copy binary to scripts directory
+cp neuron-sdk scripts/neuron-sdk
+
+# Install bbolt CLI tool for database inspection (optional but recommended)
+go install go.etcd.io/bbolt/cmd/bbolt@latest
+```
+
+**Run the BBolt Persistence Test:**
+```bash
+# From the project root
+bash scripts/test_bbolt_persistence.sh
+```
+
+**What This Test Verifies:**
+- ✅ Database creation with correct structure (peers, topics, metadata buckets)
+- ✅ StateManager initialization and persistence
+- ✅ IP address discovery via STUN
+- ✅ NAT type detection and tracking
+- ✅ Graceful shutdown with state persistence
+- ✅ Database reopening after restart
+- ✅ Peer ID consistency across restarts
+
+**Generated Logs:**
+
+All test outputs are saved to `scripts/logs/`:
+
+```
+scripts/logs/
+├── BBOLT_PERSISTENCE_TEST_REPORT.md    # Comprehensive test report
+├── bbolt_test_YYYYMMDD_HHMMSS.log      # Main test execution log
+├── buyer_startup.log                    # Buyer instance startup logs
+├── buyer_restart.log                    # Buyer instance restart logs
+├── seller_startup.log                   # Seller instance startup logs
+└── verification_results.log             # Database verification results
+```
+
+**Viewing Test Results:**
+
+1. **Quick Summary:**
+   The test script outputs a summary at the end showing which tests passed/failed.
+
+2. **Detailed Report:**
+   ```bash
+   cat scripts/logs/BBOLT_PERSISTENCE_TEST_REPORT.md
+   ```
+   This report includes:
+   - Test execution summary
+   - Database structure analysis
+   - IP tracking verification
+   - Performance metrics
+   - Known limitations
+
+3. **Individual Logs:**
+   ```bash
+   # View buyer startup process
+   cat scripts/logs/buyer_startup.log
+
+   # View persistence verification
+   cat scripts/logs/buyer_restart.log
+   ```
+
+### Running Comprehensive Persistence Tests
+
+For more thorough testing including multiple restart cycles:
+
+```bash
+# From the project root
+bash scripts/run_persistence_test.sh
+```
+
+This test suite includes:
+- Phase 1: Initial startup and database creation
+- Phase 2: Graceful shutdown verification
+- Phase 3: Restart and fast reconnection
+- Phase 4: Stress test with multiple restarts
+- Phase 5: Final verification and analysis
+
+### Database Inspection
+
+Manually inspect BBolt databases using the bbolt CLI:
+
+```bash
+# View database info
+$HOME/go/bin/bbolt info /path/to/database.db
+
+# List all buckets
+$HOME/go/bin/bbolt buckets /path/to/database.db
+
+# View keys in a specific bucket
+$HOME/go/bin/bbolt keys /path/to/database.db peers
+$HOME/go/bin/bbolt keys /path/to/database.db topics
+$HOME/go/bin/bbolt keys /path/to/database.db metadata
+```
+
+### Database Verification Tool
+
+The SDK includes a verification tool to analyze database contents:
+
+```bash
+# Build verification tool
+cd scripts
+go build -o verify_connections verify_connections.go
+
+# Run verification
+./verify_connections /path/to/buyer.db /path/to/seller.db
+```
+
+The tool checks:
+- Database file integrity
+- Bucket structure validity
+- Peer connection state
+- Topic persistence
+- Metadata consistency
+
+### Test Configuration
+
+Tests use the environment configuration from `scripts/.env`. To test with different credentials:
+
+```bash
+# Create a test-specific .env file
+cp scripts/.env scripts/.env.test
+
+# Edit with your test credentials
+nano scripts/.env.test
+
+# The test scripts will automatically use scripts/.env
+```
+
+### Known Test Limitations
+
+⚠️ **Hedera Registration Requirement:**
+
+The test instances will fail at the Hedera smart contract registration check if using unregistered credentials:
+
+```
+Error: peer not found in the hedera contract for address
+```
+
+This is **expected behavior** - the SDK correctly validates that peers must be registered in the Neuron network before allowing operation. The BBolt persistence layer functions correctly regardless of this limitation.
+
+**To run full end-to-end tests:**
+1. Register test devices at [explorer.neuron.world](https://explorer.neuron.world)
+2. Update `scripts/.env` with registered credentials
+3. Re-run the test scripts
+
+### Continuous Integration
+
+For CI/CD pipelines, test scripts can be run non-interactively:
+
+```bash
+# Run tests without manual confirmation prompts
+bash scripts/test_bbolt_persistence.sh
+
+# Tests automatically save logs and databases
+# Check exit code for pass/fail status
+if [ $? -eq 0 ]; then
+  echo "Tests passed"
+else
+  echo "Tests failed"
+fi
+```
+
+### Troubleshooting Tests
+
+**Issue: Binary not found**
+```bash
+# Ensure binary is built and in the correct location
+go build -o neuron-sdk ./cmd/neuron-sdk
+cp neuron-sdk scripts/neuron-sdk
+chmod +x scripts/neuron-sdk
+```
+
+**Issue: Database creation fails**
+```bash
+# Check disk space
+df -h /tmp
+
+# Check permissions
+ls -la /tmp
+
+# View detailed error logs
+cat scripts/logs/buyer_startup.log | grep -i error
+```
+
+**Issue: Tests timeout**
+```bash
+# Increase timeout in test script or run manually
+# View running processes
+ps aux | grep neuron-sdk
+
+# Check if ports are already in use
+lsof -i :19001
+lsof -i :19002
+```
+

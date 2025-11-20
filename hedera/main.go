@@ -171,6 +171,7 @@ func BuyerPrepareServiceRequest(
 	toEthAddress string,
 	arbiterEthAddress string,
 	amount int64, // TODO: needs to match what is in the sla
+	existingSharedAccID uint64, // Pass 0 to create new account, or existing account ID to reuse
 ) (*types.TopicPostalEnvelope, error) {
 	client := GetHederaClientUsingEnv()
 	defer client.Close()
@@ -214,24 +215,56 @@ func BuyerPrepareServiceRequest(
 		return nil, err
 	}
 
-	// create a shared account and deposit the payment the sensor wants.
+	// Determine shared account: reuse existing or create new
+	var sharedAccID hedera.AccountID
 
-	sharedAccTx, err := createSharedAccount(fromHederaPupblicKeyEnc, toHederaPublicKeyEnc, arbiterHederaKeyEnc, amount)
-	if err != nil {
-		return nil, fmt.Errorf("error preparing a shared account: %v", err)
-	}
-	sharedAccTxResponse, err :=
-		sharedAccTx.SetMaxBackoff(time.Second * 5).SetMaxRetry(10).Execute(client)
+	if existingSharedAccID > 0 {
+		// Try to reuse existing shared account
+		sharedAccID = hedera.AccountID{Shard: 0, Realm: 0, Account: existingSharedAccID}
 
-	if err != nil {
-		return nil, fmt.Errorf("error creating a shared account: %v", err)
+		// Validate the account exists and check balance
+		accountInfo, err := GetAccountInfoFromNetwork(sharedAccID)
+		if err != nil {
+			log.Printf("Existing SharedAccID %d not found on network, creating new: %v", existingSharedAccID, err)
+			existingSharedAccID = 0 // Reset to create new
+		} else {
+			currentBalance := accountInfo.Balance.As(hedera.HbarUnits.Millibar)
+			if currentBalance < float64(amount) {
+				// Top up the account
+				topUpAmount := float64(amount) - currentBalance
+				log.Printf("SharedAccID %d has insufficient balance (%.2f millibar), topping up with %.2f millibar",
+					existingSharedAccID, currentBalance, topUpAmount)
+				if err := DepositToSharedAccount(sharedAccID, topUpAmount); err != nil {
+					log.Printf("Failed to top up SharedAccID %d, creating new: %v", existingSharedAccID, err)
+					existingSharedAccID = 0 // Reset to create new
+				} else {
+					log.Printf("Successfully reusing SharedAccID %d after top-up", existingSharedAccID)
+				}
+			} else {
+				log.Printf("Reusing existing SharedAccID %d with balance %.2f millibar", existingSharedAccID, currentBalance)
+			}
+		}
 	}
-	sharedAccTxReceipt, err := sharedAccTxResponse.GetReceipt(client)
-	if err != nil {
-		return nil, err
 
+	// Create new shared account if needed
+	if existingSharedAccID == 0 {
+		sharedAccTx, err := createSharedAccount(fromHederaPupblicKeyEnc, toHederaPublicKeyEnc, arbiterHederaKeyEnc, amount)
+		if err != nil {
+			return nil, fmt.Errorf("error preparing a shared account: %v", err)
+		}
+		sharedAccTxResponse, err := sharedAccTx.SetMaxBackoff(time.Second * 5).SetMaxRetry(10).Execute(client)
+
+		if err != nil {
+			return nil, fmt.Errorf("error creating a shared account: %v", err)
+		}
+		sharedAccTxReceipt, err := sharedAccTxResponse.GetReceipt(client)
+		if err != nil {
+			return nil, err
+		}
+		sharedAccID = *sharedAccTxReceipt.AccountID
+		log.Printf("Created new SharedAccID: %v", sharedAccID)
 	}
-	sharedAccID := *sharedAccTxReceipt.AccountID
+
 	fmt.Printf("shared account id: %v\n", sharedAccID)
 	serialized := fmt.Sprintf("%s", fromP2pPublicAddresses)
 	fmt.Printf("Sending serialized multiaddr: %s to seller %s \n", serialized, toEthAddress)
@@ -437,21 +470,37 @@ func downloadAndListen(topicID hedera.TopicID, callback func(message hedera.Topi
 	messageReceived := make(chan struct{}, 1)
 	// Main loop to keep subscribing
 mainLoop:
-	// Get the last time you received a message from the environment variable called "last_stdin_timestamp"
+	// Load last processed timestamp from database
 	var lastStdInTimestamp time.Time
-	/* TODO: re-introdce timestamps
-	lastStdInTimestampEnv := os.Getenv("last_stdin_timestamp")
-	if lastStdInTimestampEnv != "" {
-		lastStdInTimestamp, _ = time.Parse(time.RFC3339Nano, lastStdInTimestampEnv)
-	} else {
-		lastStdInTimestamp = time.Now().UTC()
-		commonlib.UpdateEnvVariable("last_stdin_timestamp", lastStdInTimestamp.Format(time.RFC3339Nano), commonlib.MyEnvFile)
-		log.Default().Println("last_stdin_timestamp not set, defaulting to now")
-	}
-	*/
-	lastStdInTimestamp = time.Now().UTC()
+	topicKey := fmt.Sprintf("%d.%d.%d", topicID.Shard, topicID.Realm, topicID.Topic)
 
-	handle, err := subscribe(client, topicID, lastStdInTimestamp, callback, messageReceived)
+	if commonlib.GlobalStateManager != nil && !commonlib.GlobalStateManager.IsInDegradedMode() {
+		loadedTime, err := commonlib.GlobalStateManager.LoadTopicPosition(topicKey)
+		if err == nil && !loadedTime.IsZero() {
+			lastStdInTimestamp = loadedTime
+			log.Printf("Resuming topic %s from %s", topicKey, lastStdInTimestamp.Format(time.RFC3339))
+		} else {
+			// Default: start from 24 hours ago
+			lastStdInTimestamp = time.Now().UTC().Add(-24 * time.Hour)
+			log.Printf("No saved position for topic %s, starting from 24 hours ago", topicKey)
+		}
+	} else {
+		// No state manager or degraded mode - start from now
+		lastStdInTimestamp = time.Now().UTC()
+		log.Printf("Starting topic %s from now (no persistence available)", topicKey)
+	}
+
+	// Wrap callback to persist timestamp after each message
+	wrappedCallback := func(message hedera.TopicMessage) {
+		callback(message) // Process message
+
+		// Persist timestamp (batched - not critical)
+		if commonlib.GlobalStateManager != nil {
+			commonlib.GlobalStateManager.PersistTopicPosition(topicKey, message.ConsensusTimestamp)
+		}
+	}
+
+	handle, err := subscribe(client, topicID, lastStdInTimestamp, wrappedCallback, messageReceived)
 	if err != nil {
 		log.Println("SELFERROR:Error subscribing to topic: ", err) // TODO: send error to error topic
 	}
@@ -597,4 +646,32 @@ func DepositToSharedAccount(sharedAccountID hedera.AccountID, amount float64) er
 		AddHbarTransfer(sharedAccountID, hedera.HbarFrom(amount, hedera.HbarUnits.Millibar)).                // Receive 3 HBAR
 		Execute(client)
 	return err
+}
+
+// ValidateSharedAccount checks if a shared account exists and has sufficient balance
+func ValidateSharedAccount(sharedAccID uint64, requiredBalanceMillibar int64) (bool, error) {
+	if sharedAccID == 0 {
+		return false, fmt.Errorf("invalid shared account ID: 0")
+	}
+
+	accountID := hedera.AccountID{Shard: 0, Realm: 0, Account: sharedAccID}
+	accountInfo, err := GetAccountInfoFromNetwork(accountID)
+
+	if err != nil {
+		return false, fmt.Errorf("account not found on network: %v", err)
+	}
+
+	if accountInfo.AccountID.IsZero() {
+		return false, fmt.Errorf("account is zero/invalid")
+	}
+
+	// Check balance (convert millibar to tinybar: 1 millibar = 100,000 tinybar)
+	currentBalanceMillibar := accountInfo.Balance.As(hedera.HbarUnits.Millibar)
+	if currentBalanceMillibar < float64(requiredBalanceMillibar) {
+		return false, fmt.Errorf("insufficient balance: %.2f millibar, need %d millibar",
+			currentBalanceMillibar, requiredBalanceMillibar)
+	}
+
+	log.Printf("SharedAccID %d validated: balance %.2f millibar", sharedAccID, currentBalanceMillibar)
+	return true, nil
 }

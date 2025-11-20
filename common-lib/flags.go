@@ -53,6 +53,10 @@ var UseLocalAddressFlag *bool
 // This takes precedence over the environment variable smart_contract_address.
 var SmartContractAddressFlag *string
 
+// DbPathFlag specifies the path to the bbolt database file for persistent state storage.
+// Default is "~/.neuron/state.db"
+var DbPathFlag *string
+
 func InitFlags() {
 	PeerOrRelayFlag = flag.String("mode", "peer", "Select peer, or relay")
 	ForceProtocolFlag = flag.String("force-protocol", "udp", "Force protocol: udp or tcp")
@@ -67,6 +71,7 @@ func InitFlags() {
 	ClearCacheFlag = flag.Bool("clear-cache", false, "set clear cache flag to delete cache be")
 	UseLocalAddressFlag = flag.Bool("use-local-address", false, "force the use of local addresses instead of discovered public ones, can only talk to local peers")
 	SmartContractAddressFlag = flag.String("smart-contract-address", "", "Smart contract address (overrides environment variable)")
+	DbPathFlag = flag.String("db-path", "", "Path to bbolt database file for persistent state (default: ~/.neuron/state.db)")
 	flag.CommandLine.ParseErrorsWhitelist.UnknownFlags = true
 	flag.Parse()
 }

@@ -1,0 +1,170 @@
+<mxfile host="app.diagrams.net" agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36" version="28.2.9">
+  <diagram name="Page-1" id="I2gSAia7F65i1p2ei8u_">
+    <mxGraphModel grid="1" page="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" pageScale="1" pageWidth="827" pageHeight="1169" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+        <mxCell id="yi3bz80fuZbYuyeUAR1W-51" value="connection" style="rounded=0;whiteSpace=wrap;html=1;" vertex="1" parent="1">
+          <mxGeometry x="200" y="1420" width="590" height="230" as="geometry" />
+        </mxCell>
+        <mxCell id="yi3bz80fuZbYuyeUAR1W-4" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;" edge="1" parent="1" source="yi3bz80fuZbYuyeUAR1W-1" target="yi3bz80fuZbYuyeUAR1W-3">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="yi3bz80fuZbYuyeUAR1W-6" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;" edge="1" parent="1" source="yi3bz80fuZbYuyeUAR1W-1" target="yi3bz80fuZbYuyeUAR1W-5">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="yi3bz80fuZbYuyeUAR1W-8" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;" edge="1" parent="1" source="yi3bz80fuZbYuyeUAR1W-1" target="yi3bz80fuZbYuyeUAR1W-7">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="yi3bz80fuZbYuyeUAR1W-10" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;" edge="1" parent="1" source="yi3bz80fuZbYuyeUAR1W-1" target="yi3bz80fuZbYuyeUAR1W-9">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="yi3bz80fuZbYuyeUAR1W-11" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;" edge="1" parent="1" source="yi3bz80fuZbYuyeUAR1W-1" target="yi3bz80fuZbYuyeUAR1W-9">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="yi3bz80fuZbYuyeUAR1W-12" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;" edge="1" parent="1" source="yi3bz80fuZbYuyeUAR1W-1" target="yi3bz80fuZbYuyeUAR1W-9">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="yi3bz80fuZbYuyeUAR1W-13" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;" edge="1" parent="1" source="yi3bz80fuZbYuyeUAR1W-1" target="yi3bz80fuZbYuyeUAR1W-9">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="yi3bz80fuZbYuyeUAR1W-15" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;" edge="1" parent="1" source="yi3bz80fuZbYuyeUAR1W-1" target="yi3bz80fuZbYuyeUAR1W-14">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="yi3bz80fuZbYuyeUAR1W-17" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;" edge="1" parent="1" source="yi3bz80fuZbYuyeUAR1W-1" target="yi3bz80fuZbYuyeUAR1W-16">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="yi3bz80fuZbYuyeUAR1W-1" value="speciality of libp2p" style="rounded=0;whiteSpace=wrap;html=1;" vertex="1" parent="1">
+          <mxGeometry x="350" y="550" width="120" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="yi3bz80fuZbYuyeUAR1W-3" value="mulitplex-encrypted stream:create multiple streams with another peer using the same port" style="ellipse;whiteSpace=wrap;html=1;rounded=0;" vertex="1" parent="1">
+          <mxGeometry x="570" y="540" width="80" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="yi3bz80fuZbYuyeUAR1W-5" value="many con procools like Quic" style="ellipse;whiteSpace=wrap;html=1;rounded=0;" vertex="1" parent="1">
+          <mxGeometry x="370" y="400" width="80" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="yi3bz80fuZbYuyeUAR1W-7" value="discovering(DHT)" style="ellipse;whiteSpace=wrap;html=1;rounded=0;" vertex="1" parent="1">
+          <mxGeometry x="170" y="540" width="80" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="yi3bz80fuZbYuyeUAR1W-9" value="peers can simple hole-punch" style="ellipse;whiteSpace=wrap;html=1;rounded=0;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="280" y="690" width="80" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="yi3bz80fuZbYuyeUAR1W-14" value="if they cannot penetrate firewall then they can use a relay (or proxy) to have in the middle to help hole punch" style="ellipse;whiteSpace=wrap;html=1;rounded=0;fillColor=#fff2cc;strokeColor=#d6b656;" vertex="1" parent="1">
+          <mxGeometry x="414" y="690" width="80" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="yi3bz80fuZbYuyeUAR1W-21" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;" edge="1" parent="1" source="yi3bz80fuZbYuyeUAR1W-16" target="yi3bz80fuZbYuyeUAR1W-20">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="yi3bz80fuZbYuyeUAR1W-23" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;" edge="1" parent="1" source="yi3bz80fuZbYuyeUAR1W-16" target="yi3bz80fuZbYuyeUAR1W-22">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="yi3bz80fuZbYuyeUAR1W-16" value="they can use the relay to proxy data between peers" style="ellipse;whiteSpace=wrap;html=1;rounded=0;fillColor=#f8cecc;strokeColor=#b85450;" vertex="1" parent="1">
+          <mxGeometry x="580" y="690" width="80" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="yi3bz80fuZbYuyeUAR1W-18" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;entryX=-0.007;entryY=0.572;entryDx=0;entryDy=0;entryPerimeter=0;" edge="1" parent="1" source="yi3bz80fuZbYuyeUAR1W-1" target="yi3bz80fuZbYuyeUAR1W-16">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="yi3bz80fuZbYuyeUAR1W-20" value="good becausse if firewall is strict" style="ellipse;whiteSpace=wrap;html=1;rounded=0;fillColor=#fff2cc;strokeColor=#d6b656;" vertex="1" parent="1">
+          <mxGeometry x="730" y="690" width="80" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="yi3bz80fuZbYuyeUAR1W-22" value="good because if a peer has not much upload bandwidth then it can give the data to someone with a better internet to distibute to the world" style="ellipse;whiteSpace=wrap;html=1;rounded=0;fillColor=#fff2cc;strokeColor=#d6b656;" vertex="1" parent="1">
+          <mxGeometry x="570" y="850" width="80" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="yi3bz80fuZbYuyeUAR1W-24" value="DHT is advertising you IP and EVM address to the entire&amp;nbsp; world" style="ellipse;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;" vertex="1" parent="1">
+          <mxGeometry x="130" y="590" width="80" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="yi3bz80fuZbYuyeUAR1W-26" value="if you use DHT you need to run a DHT server - is like running an DNS server" style="ellipse;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;" vertex="1" parent="1">
+          <mxGeometry x="120" y="490" width="80" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="yi3bz80fuZbYuyeUAR1W-27" value="hole punch is not reliable" style="ellipse;whiteSpace=wrap;html=1;aspect=fixed;" vertex="1" parent="1">
+          <mxGeometry x="130" y="1140" width="80" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="yi3bz80fuZbYuyeUAR1W-28" value="lip2p address:&amp;nbsp; evmofsensor1/circuit/evmaddressofproxy" style="ellipse;whiteSpace=wrap;html=1;aspect=fixed;" vertex="1" parent="1">
+          <mxGeometry x="170" y="1020" width="80" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="yi3bz80fuZbYuyeUAR1W-29" value="we don&#39;t have proxies / relays" style="ellipse;whiteSpace=wrap;html=1;aspect=fixed;" vertex="1" parent="1">
+          <mxGeometry x="240" y="1140" width="80" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="yi3bz80fuZbYuyeUAR1W-30" value="good news" style="text;html=1;whiteSpace=wrap;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;rounded=0;" vertex="1" parent="1">
+          <mxGeometry x="40" y="1040" width="60" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="yi3bz80fuZbYuyeUAR1W-31" value="we don&#39;t use these addresses because we don&#39;t use the relays.&amp;nbsp;" style="ellipse;whiteSpace=wrap;html=1;aspect=fixed;" vertex="1" parent="1">
+          <mxGeometry x="340" y="1140" width="80" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="yi3bz80fuZbYuyeUAR1W-34" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;" edge="1" parent="1" source="yi3bz80fuZbYuyeUAR1W-32" target="yi3bz80fuZbYuyeUAR1W-33">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="yi3bz80fuZbYuyeUAR1W-32" value="a sensor does not have a way to whitelist&amp;nbsp;" style="ellipse;whiteSpace=wrap;html=1;" vertex="1" parent="1">
+          <mxGeometry x="450" y="1140" width="120" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="yi3bz80fuZbYuyeUAR1W-33" value="white list 1-3 direct connections and 1 proxy connection and no one else" style="ellipse;whiteSpace=wrap;html=1;" vertex="1" parent="1">
+          <mxGeometry x="650" y="1140" width="120" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="yi3bz80fuZbYuyeUAR1W-35" value="if you have a low connection between peer 1 and peer 2 and a fast between peer 1 and peer 3 then the whole system of peer 1 degrades to the slow connection" style="ellipse;whiteSpace=wrap;html=1;" vertex="1" parent="1">
+          <mxGeometry x="100" y="1280" width="120" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="yi3bz80fuZbYuyeUAR1W-36" value="golang (even better in rust)" style="ellipse;whiteSpace=wrap;html=1;aspect=fixed;" vertex="1" parent="1">
+          <mxGeometry x="350" y="1020" width="80" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="yi3bz80fuZbYuyeUAR1W-37" value="we use only one stream&lt;br&gt;/adsb-2.0/" style="ellipse;whiteSpace=wrap;html=1;aspect=fixed;" vertex="1" parent="1">
+          <mxGeometry x="260" y="1280" width="80" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="yi3bz80fuZbYuyeUAR1W-38" value="open and closing a stream is very cheap" style="ellipse;whiteSpace=wrap;html=1;" vertex="1" parent="1">
+          <mxGeometry x="494" y="1020" width="76" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="yi3bz80fuZbYuyeUAR1W-39" value="but creating a conneciton is effort" style="ellipse;whiteSpace=wrap;html=1;" vertex="1" parent="1">
+          <mxGeometry x="560" y="1020" width="76" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="yi3bz80fuZbYuyeUAR1W-40" value="stream" style="rounded=0;whiteSpace=wrap;html=1;" vertex="1" parent="1">
+          <mxGeometry x="260" y="1440" width="510" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="yi3bz80fuZbYuyeUAR1W-41" value="json1" style="rounded=0;whiteSpace=wrap;html=1;" vertex="1" parent="1">
+          <mxGeometry x="290" y="1450" width="120" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="yi3bz80fuZbYuyeUAR1W-42" value="json1" style="rounded=0;whiteSpace=wrap;html=1;" vertex="1" parent="1">
+          <mxGeometry x="540" y="1450" width="120" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="yi3bz80fuZbYuyeUAR1W-43" value="" style="endArrow=classic;html=1;rounded=0;" edge="1" parent="1">
+          <mxGeometry width="50" height="50" relative="1" as="geometry">
+            <mxPoint x="200" y="1570" as="sourcePoint" />
+            <mxPoint x="250" y="1520" as="targetPoint" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="yi3bz80fuZbYuyeUAR1W-44" value="open stream" style="edgeLabel;html=1;align=center;verticalAlign=middle;resizable=0;points=[];" connectable="0" vertex="1" parent="yi3bz80fuZbYuyeUAR1W-43">
+          <mxGeometry x="-0.2897" y="2" relative="1" as="geometry">
+            <mxPoint as="offset" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="yi3bz80fuZbYuyeUAR1W-45" value="" style="endArrow=classic;html=1;rounded=0;" edge="1" parent="1">
+          <mxGeometry width="50" height="50" relative="1" as="geometry">
+            <mxPoint x="720" y="1570" as="sourcePoint" />
+            <mxPoint x="770" y="1520" as="targetPoint" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="yi3bz80fuZbYuyeUAR1W-46" value="close stream" style="edgeLabel;html=1;align=center;verticalAlign=middle;resizable=0;points=[];" connectable="0" vertex="1" parent="yi3bz80fuZbYuyeUAR1W-45">
+          <mxGeometry x="-0.2897" y="2" relative="1" as="geometry">
+            <mxPoint as="offset" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="yi3bz80fuZbYuyeUAR1W-47" value="stream" style="rounded=0;whiteSpace=wrap;html=1;" vertex="1" parent="1">
+          <mxGeometry x="280" y="1700" width="180" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="yi3bz80fuZbYuyeUAR1W-48" value="json1" style="rounded=0;whiteSpace=wrap;html=1;" vertex="1" parent="1">
+          <mxGeometry x="310" y="1720" width="120" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="yi3bz80fuZbYuyeUAR1W-50" value="stream" style="rounded=0;whiteSpace=wrap;html=1;" vertex="1" parent="1">
+          <mxGeometry x="570" y="1710" width="180" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="yi3bz80fuZbYuyeUAR1W-49" value="json1" style="rounded=0;whiteSpace=wrap;html=1;" vertex="1" parent="1">
+          <mxGeometry x="600" y="1720" width="120" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="yi3bz80fuZbYuyeUAR1W-52" value="we don&#39;t remember IP addresses" style="ellipse;whiteSpace=wrap;html=1;aspect=fixed;" vertex="1" parent="1">
+          <mxGeometry x="70" y="1630" width="80" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="yi3bz80fuZbYuyeUAR1W-55" value="files (json)" style="shape=parallelogram;perimeter=parallelogramPerimeter;whiteSpace=wrap;html=1;fixedSize=1;" vertex="1" parent="1">
+          <mxGeometry x="50" y="1870" width="120" height="60" as="geometry" />
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

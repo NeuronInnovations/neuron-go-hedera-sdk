@@ -34,7 +34,7 @@ func EnsureTopicsAndNotifyContract(p2pHost host.Host) (hedera.TopicID, hedera.To
 
 	peerInfo, err := GetPeerInfo(toEthAddress)
 	if err != nil {
-		log.Panic("We must be able to  correctly talk to the smart contract to continue;\n perhaps you are pointing to the wrong contract \n or your address doesn't exist, err:", err)
+		log.Panic("We must be able to correctly talk to the smart contract to continue;\n perhaps you are pointing to the wrong contract \n or your address doesn't exist, err:", err)
 	} else {
 		// check if peerInfo has data
 		if peerInfo.StdInTopic != 0 && peerInfo.StdOutTopic != 0 {

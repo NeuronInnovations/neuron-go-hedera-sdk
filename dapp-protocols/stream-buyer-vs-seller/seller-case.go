@@ -78,6 +78,7 @@ func HandleSellerCase(ctx context.Context, p2pHost host.Host, protocol protocol.
 				}
 
 				var requestMsgFromOtherSide types.NeuronServiceRequestMsg
+				var parseError error
 				switch message := bufferInfo.RequestOrResponse.Message.(type) {
 				case *types.NeuronServiceRequestMsg:
 					// Convert types.NeuronServiceRequestMsg to commonlib.NeuronServiceRequestMsg
@@ -86,35 +87,63 @@ func HandleSellerCase(ctx context.Context, p2pHost host.Host, protocol protocol.
 				case map[string]interface{}:
 					// Handle the case where the Message is a map[string]interface{}
 					fmt.Println("Message is a map[string]interface{}:", message)
-					requestMsgFromOtherSide := types.NeuronServiceRequestMsg{}
 					messageBytes, err := json.Marshal(message)
 					if err != nil {
-						log.Panic("Error marshaling message: ", err)
+						log.Printf("⚠️ Error marshaling message for peer %s: %v", peerID, err)
+						parseError = err
+					} else {
+						err = json.Unmarshal(messageBytes, &requestMsgFromOtherSide)
+						if err != nil {
+							log.Printf("⚠️ Error unmarshaling message to NeuronServiceRequestMsg for peer %s: %v", peerID, err)
+							parseError = err
+						} else {
+							fmt.Println("Successfully converted map to NeuronServiceRequestMsg:", requestMsgFromOtherSide)
+						}
 					}
-					err = json.Unmarshal(messageBytes, &requestMsgFromOtherSide)
-					if err != nil {
-						log.Panic("Error unmarshaling message to NeuronServiceRequestMsg: ", err)
-					}
-					fmt.Println("Successfully converted map to NeuronServiceRequestMsg:", requestMsgFromOtherSide)
 				default:
 					// Handle unexpected types
-					log.Printf("Unexpected Message type: %T; the raw message was %s", message, message)
+					log.Printf("⚠️ Unexpected Message type for peer %s: %T; the raw message was %s", peerID, message, message)
+					continue
 				}
+
+				// Skip if parsing failed
+				if parseError != nil {
+					continue
+				}
+
+				// Validate SharedAccID before using
+				if requestMsgFromOtherSide.SharedAccID == 0 {
+					log.Printf("⚠️ Invalid SharedAccID (0) for peer %s, skipping invoice", peerID)
+					continue
+				}
+
 				fmt.Println("Send invoice to: ", peerID)
 				sharedAccID, err := hedera.AccountIDFromString(fmt.Sprintf("0.0.%d", requestMsgFromOtherSide.SharedAccID))
 
 				if err != nil {
-					log.Panic(err)
+					log.Printf("⚠️ Invalid SharedAccID format for peer %s: %v", peerID, err)
+					continue
+				}
+
+				// Validate SharedAccID exists on network before sending invoice
+				isValid, validErr := hedera_helper.ValidateSharedAccount(requestMsgFromOtherSide.SharedAccID, 1)
+				if !isValid {
+					log.Printf("⚠️ SharedAccID %d for peer %s is invalid on network: %v", requestMsgFromOtherSide.SharedAccID, peerID, validErr)
+					log.Printf("🔄 Marking peer %s as invalid account - buyer needs to create new shared account", peerID)
+					buyerBuffers.UpdateBufferIsValidAccount(peerID, false)
+					continue
 				}
 
 				myDeviceAccountID, err := hedera.AccountIDFromEvmAddress(0, 0, os.Getenv("hedera_evm_id"))
 				if err != nil {
-					log.Panic(err)
+					log.Printf("⚠️ Error getting device account ID: %v", err)
+					continue
 				}
 
 				myParrentAccountID, err := hedera_helper.GetDeviceParent(os.Getenv("hedera_evm_id"))
 				if err != nil {
-					log.Panic(err)
+					log.Printf("⚠️ Error getting parent account ID: %v", err)
+					continue
 				}
 
 				buyerStdIn := hedera.TopicID{
@@ -125,9 +154,16 @@ func HandleSellerCase(ctx context.Context, p2pHost host.Host, protocol protocol.
 				err2 := hedera_helper.SellerSendScheduledTransferRequest(sharedAccID, myParrentAccountID, myDeviceAccountID, buyerStdIn)
 
 				if err2 != nil {
-					log.Panic(err2, "error sending scheduled transfer request")
+					log.Printf("⚠️ Error sending scheduled transfer request to peer %s: %v", peerID, err2)
+					// Check if it's an account-related error
+					if strings.Contains(err2.Error(), "INVALID_ACCOUNT_ID") || strings.Contains(err2.Error(), "ACCOUNT_DELETED") {
+						log.Printf("🔄 SharedAccID %d appears invalid, marking peer %s as invalid account", requestMsgFromOtherSide.SharedAccID, peerID)
+						buyerBuffers.UpdateBufferIsValidAccount(peerID, false)
+					}
+					continue
 				}
 
+				log.Printf("✅ Successfully sent invoice to peer %s using SharedAccID %d", peerID, requestMsgFromOtherSide.SharedAccID)
 			}
 			time.Sleep(60 * time.Minute)
 		}
@@ -238,7 +274,9 @@ func HandleSellerCase(ctx context.Context, p2pHost host.Host, protocol protocol.
 				addrInfo, decodeErr := peer.AddrInfoFromString(pidStr)
 
 				if decodeErr != nil {
-					log.Panic(decodeErr)
+					log.Printf("⚠️ Error decoding peer address info from %s: %v", pidStr, decodeErr)
+					hedera_helper.PeerSendErrorMessage(otherSideStdIn, types.IpDecryptionError, fmt.Sprintf("Invalid peer address: %v", decodeErr), types.SendFreshHederaRequest)
+					return
 				}
 				initiationError := commonlib.InitialConnect(ctx, p2pHost, *addrInfo, buyerBuffers, protocol)
 				if initiationError != nil {
