@@ -351,8 +351,34 @@ func LaunchSDK(
 				case event.EvtPeerConnectednessChanged:
 					log.Println("🚌 peer connectedness changed", e.Peer, e.Connectedness.String())
 
-					// Persist state change (immediate write for connection state changes)
-					if commonlib.GlobalStateManager != nil && commonlib.NodeBuffersInstance != nil {
+					// FIX 3: Create buffer and persist immediately on new connection
+					if e.Connectedness == network.Connected && commonlib.GlobalStateManager != nil && commonlib.NodeBuffersInstance != nil {
+						bufferInfo, exists := commonlib.NodeBuffersInstance.GetBuffer(e.Peer)
+						if !exists {
+							// Buffer doesn't exist - create it now to ensure persistence
+							log.Printf("🔧 FIX 3: Creating buffer for newly connected peer %s", e.Peer)
+							commonlib.NodeBuffersInstance.AddBuffer3(e.Peer, types.ReceivedOK, types.Connected)
+							bufferInfo, exists = commonlib.NodeBuffersInstance.GetBuffer(e.Peer)
+							if exists {
+								log.Printf("✅ FIX 3: Buffer created for peer %s", e.Peer)
+							}
+						}
+
+						// Get and store remote address
+						if exists {
+							if conns := p2pHost.Network().ConnsToPeer(e.Peer); len(conns) > 0 {
+								remoteAddr := conns[0].RemoteMultiaddr().String()
+								commonlib.NodeBuffersInstance.SetLastOtherSideMultiAddress(e.Peer, remoteAddr)
+								log.Printf("💾 FIX 3: Stored IP %s for peer %s", remoteAddr, e.Peer)
+								// Re-fetch buffer after updating IP
+								bufferInfo, _ = commonlib.NodeBuffersInstance.GetBuffer(e.Peer)
+							}
+							// Persist immediately
+							commonlib.GlobalStateManager.PersistPeer(e.Peer, bufferInfo, true)
+							log.Printf("💾 FIX 3: Persisted connection for peer %s", e.Peer)
+						}
+					} else if commonlib.GlobalStateManager != nil && commonlib.NodeBuffersInstance != nil {
+						// Existing behavior for non-Connected states (e.g., Disconnected)
 						if bufferInfo, exists := commonlib.NodeBuffersInstance.GetBuffer(e.Peer); exists {
 							commonlib.GlobalStateManager.PersistPeer(e.Peer, bufferInfo, true)
 						}

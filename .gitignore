@@ -15,3 +15,5 @@ neuron-sdk
 /.personal
 /.cursor**
 /.serena**
+/docs/**
+/@docs/**

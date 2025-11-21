@@ -618,8 +618,31 @@ func performBuyerHolePunching(sellerIPs []string, sellerPeerID peer.ID, p2pHost 
 			log.Printf("Stream created successfully after buyer hole punching: %v", stream)
 			sellerBuffers.UpdateBufferLibP2PState(sellerPeerID, types.Connected)
 		*/
+		// FIX 1: Create buffer if needed and persist hole-punched connection immediately
+		log.Printf("🔍 Hole punching success for seller %s - ensuring persistence", sellerPeerID)
+
+		// First check if buffer exists, create if not (using AddBuffer3 - no envelope needed)
+		if _, exists := sellerBuffers.GetBuffer(sellerPeerID); !exists {
+			log.Printf("🔧 FIX 1: Creating minimal buffer for hole-punched seller %s", sellerPeerID)
+			sellerBuffers.AddBuffer3(sellerPeerID, types.ReceivedOK, types.Connected)
+			log.Printf("✅ FIX 1: Buffer created for seller %s", sellerPeerID)
+		}
+
 		// Store the successful address
 		sellerBuffers.SetLastOtherSideMultiAddress(sellerPeerID, sellerIP)
+		log.Printf("💾 Stored hole-punched IP %s for seller %s", sellerIP, sellerPeerID)
+
+		// Persist to BBolt
+		if commonlib.GlobalStateManager != nil {
+			if bufferInfo, exists := sellerBuffers.GetBuffer(sellerPeerID); exists {
+				commonlib.GlobalStateManager.PersistPeer(sellerPeerID, bufferInfo, true)
+				log.Printf("💾 FIX 1: Persisted seller connection via hole punching to %s", sellerIP)
+			} else {
+				log.Printf("⚠️ FIX 1: Buffer still doesn't exist after creation attempt - cannot persist")
+			}
+		} else {
+			log.Printf("⚠️ FIX 1: GlobalStateManager is nil - cannot persist")
+		}
 
 		// Success - no need to try other addresses
 		return
@@ -715,11 +738,74 @@ func processSeller(seller Seller, p2pHost host.Host, sellerBuffers *commonlib.No
 
 	// PRIORITY: Skip Hedera messaging if already connected via BBolt-cached IPs
 	// This avoids unnecessary blockchain queries and prioritizes local cache
+	// FIX 2: However, still create SharedAccID if not exists for cost-effective reconnection
 	if len(connsToPeer) > 0 {
 		// Check if connection is actually active and established
 		if p2pHost.Network().Connectedness(targetPeerID) == network.Connected {
-			log.Printf("✅ Already connected to seller %s via BBolt-cached IP, skipping Hedera query", sellerEvnAddress)
-			return
+			// Check if SharedAccID exists
+			var hasSharedAccID bool
+			if bufferInfo, exists := sellerBuffers.GetBuffer(targetPeerID); exists {
+				hasSharedAccID = bufferInfo.SharedAccID > 0
+			}
+
+			if hasSharedAccID {
+				log.Printf("✅ Already connected to seller %s with SharedAccID, skipping Hedera query", sellerEvnAddress)
+				return
+			} else {
+				// Connected via hole punching but no SharedAccID yet - create it asynchronously
+				log.Printf("⚠️ Connected to seller %s but no SharedAccID - creating asynchronously for future cost savings", sellerEvnAddress)
+
+				// FIX 2 CRITICAL: First ensure buffer exists and store IP address
+				// Without this, SetSharedAccID fails silently because buffer doesn't exist
+				if _, bufferExists := sellerBuffers.GetBuffer(targetPeerID); !bufferExists {
+					log.Printf("🔧 Creating buffer for hole-punched seller %s", sellerEvnAddress)
+					// Create a minimal envelope just to initialize the buffer
+					minimalEnvelope, envErr := prepareServiceRequestMsgWithOptionalAccount(seller.PublicKey, myReachableAddresses, 0)
+					if envErr == nil {
+						sellerBuffers.AddBuffer2(targetPeerID, minimalEnvelope, false, types.ReceivedOK, types.Connected)
+						log.Printf("✅ Buffer created for seller %s", sellerEvnAddress)
+					} else {
+						log.Printf("⚠️ Could not create buffer for seller %s: %v", sellerEvnAddress, envErr)
+					}
+				}
+
+				// Store IP address from current connection
+				if conns := p2pHost.Network().ConnsToPeer(targetPeerID); len(conns) > 0 {
+					remoteAddr := conns[0].RemoteMultiaddr().String()
+					sellerBuffers.SetLastOtherSideMultiAddress(targetPeerID, remoteAddr)
+					log.Printf("💾 Stored IP address %s for seller %s", remoteAddr, sellerEvnAddress)
+
+					// Persist immediately after storing IP
+					if commonlib.GlobalStateManager != nil {
+						if bufferInfo, exists := sellerBuffers.GetBuffer(targetPeerID); exists {
+							commonlib.GlobalStateManager.PersistPeer(targetPeerID, bufferInfo, true)
+							log.Printf("💾 Persisted hole-punched connection with IP for seller %s", sellerEvnAddress)
+						}
+					}
+				}
+
+				// Now create SharedAccID asynchronously
+				go func() {
+					// Create SharedAccID in background
+					envelope, setupErr := prepareServiceRequestMsgWithOptionalAccount(seller.PublicKey, myReachableAddresses, 0)
+					if setupErr != nil {
+						log.Printf("💀 Failed to create SharedAccID envelope for %s: %v", sellerEvnAddress, setupErr)
+						return
+					}
+
+					newSharedAccID := extractSharedAccIDFromEnvelope(envelope)
+					if newSharedAccID > 0 {
+						sellerBuffers.SetSharedAccID(targetPeerID, newSharedAccID)
+						log.Printf("💾 Asynchronously created and stored SharedAccID %d for seller %s", newSharedAccID, sellerEvnAddress)
+					}
+
+					// Send to Hedera to create the shared account
+					if execErr := hedera_helper.SendTransactionEnvelope(envelope); execErr != nil {
+						log.Printf("⚠️ Failed to send SharedAccID transaction for %s: %v", sellerEvnAddress, execErr)
+					}
+				}()
+				// Continue execution - don't return, allow normal flow
+			}
 		}
 	}
 
