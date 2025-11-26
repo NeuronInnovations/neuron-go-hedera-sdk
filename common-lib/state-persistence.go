@@ -2,12 +2,18 @@ package commonlib
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"log"
 	"os"
+	"os/signal"
 	"path/filepath"
+	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/libp2p/go-libp2p/core/peer"
@@ -16,17 +22,23 @@ import (
 
 const (
 	// Database bucket names
-	bucketPeers    = "peers"
-	bucketTopics   = "topics"
-	bucketMetadata = "metadata"
+	bucketPeers         = "peers"
+	bucketTopics        = "topics"
+	bucketMetadata      = "metadata"
+	bucketPeerInfoCache = "peer_info_cache" // Cache for blockchain PeerInfo data
+
+	// Special key for storing the full peer list in the cache bucket
+	peerListCacheKey = "_peer_list_"
 
 	// Default configuration
-	defaultBatchInterval = 5 * time.Minute
-	defaultBatchSize     = 50
-	retryInterval        = 5 * time.Minute
+	defaultBatchInterval    = 5 * time.Minute
+	defaultBatchSize        = 50
+	retryInterval           = 5 * time.Minute
+	defaultSnapshotInterval = 10 * time.Minute
+	defaultMaxSnapshots     = 3
 )
 
-// StateManager handles persistent state storage using bbolt
+// StateManager handles persistent state storage using bbolt with corruption prevention
 type StateManager struct {
 	db                *bolt.DB
 	dbPath            string
@@ -36,10 +48,18 @@ type StateManager struct {
 	wg                sync.WaitGroup
 	degradedMode      bool // True if persistence is failing
 	degradedModeMutex sync.RWMutex
-	closed            atomic.Bool      // Prevents double-close and write-after-close
-	closeOnce         sync.Once        // Ensures Close() is called only once
-	closeErr          error            // Stores error from Close()
-	writesDropped     atomic.Uint64    // Counter for dropped writes (metrics)
+	closed            atomic.Bool   // Prevents double-close and write-after-close
+	closeOnce         sync.Once     // Ensures Close() is called only once
+	closeErr          error         // Stores error from Close()
+	writesDropped     atomic.Uint64 // Counter for dropped writes (metrics)
+
+	// Snapshot management for corruption recovery
+	snapshotDir           string
+	maxSnapshots          int
+	snapshotInterval      time.Duration
+	lastSnapshotTime      time.Time
+	snapshotMutex         sync.Mutex
+	corruptedRecordsCount atomic.Uint64 // Counter for corrupted records detected
 }
 
 // NewStateManager creates a new StateManager with the specified database path
@@ -60,23 +80,37 @@ func NewStateManager(dbPath string) (*StateManager, error) {
 		return nil, fmt.Errorf("failed to create database directory: %w", err)
 	}
 
-	// Create StateManager with channels
-	sm := &StateManager{
-		dbPath:         dbPath,
-		writeQueue:     make(chan interface{}, 1000),
-		immediateQueue: make(chan interface{}, 100),
-		stopChan:       make(chan struct{}),
+	// Create snapshot directory
+	snapshotDir := filepath.Join(dbDir, "snapshots")
+	if err := os.MkdirAll(snapshotDir, 0755); err != nil {
+		log.Printf("⚠️ Warning: Failed to create snapshot directory: %v", err)
+		// Non-fatal - continue without snapshots
 	}
 
+	// Create StateManager with channels
+	sm := &StateManager{
+		dbPath:           dbPath,
+		writeQueue:       make(chan interface{}, 1000),
+		immediateQueue:   make(chan interface{}, 100),
+		stopChan:         make(chan struct{}),
+		snapshotDir:      snapshotDir,
+		maxSnapshots:     defaultMaxSnapshots,
+		snapshotInterval: defaultSnapshotInterval,
+	}
+
+	// Setup signal handlers for graceful shutdown on unexpected termination
+	sm.setupSignalHandlers()
+
 	// Always start background workers (even in degraded mode)
-	sm.wg.Add(2)
+	sm.wg.Add(3) // batchWriter, immediateWriter, snapshotWorker
 	go sm.batchWriter()
 	go sm.immediateWriter()
+	go sm.snapshotWorker()
 
 	// Open database with corruption recovery
-	db, err := openWithRecovery(dbPath)
+	db, err := sm.openWithRecovery(dbPath)
 	if err != nil {
-		log.Printf("WARNING: Failed to open database, entering degraded mode: %v", err)
+		log.Printf("⚠️ WARNING: Failed to open database, entering degraded mode: %v", err)
 		sm.degradedMode = true
 		// Start retry goroutine to attempt recovery
 		sm.wg.Add(1)
@@ -88,7 +122,7 @@ func NewStateManager(dbPath string) (*StateManager, error) {
 	// Initialize buckets
 	if err := initializeBuckets(db); err != nil {
 		db.Close()
-		log.Printf("WARNING: Failed to initialize buckets, entering degraded mode: %v", err)
+		log.Printf("⚠️ WARNING: Failed to initialize buckets, entering degraded mode: %v", err)
 		sm.degradedMode = true
 		sm.wg.Add(1)
 		go sm.retryDatabaseOpen()
@@ -99,48 +133,222 @@ func NewStateManager(dbPath string) (*StateManager, error) {
 	sm.db = db
 	sm.degradedMode = false
 
-	log.Printf("StateManager initialized successfully at %s", dbPath)
+	log.Printf("✅ StateManager initialized successfully at %s", dbPath)
+	log.Printf("📁 Snapshot directory: %s", snapshotDir)
 	return sm, nil
 }
 
+// setupSignalHandlers configures handlers for graceful shutdown signals
+func (sm *StateManager) setupSignalHandlers() {
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan,
+		syscall.SIGINT,  // Ctrl+C
+		syscall.SIGTERM, // Termination
+		syscall.SIGHUP,  // Hangup
+	)
+
+	go func() {
+		sig := <-sigChan
+		log.Printf("🛑 StateManager received signal %v, initiating emergency flush...", sig)
+
+		// Mark as closed to prevent new writes
+		sm.closed.Store(true)
+
+		// Emergency flush - sync immediately
+		sm.degradedModeMutex.RLock()
+		db := sm.db
+		degraded := sm.degradedMode
+		sm.degradedModeMutex.RUnlock()
+
+		if !degraded && db != nil {
+			// Flush pending writes
+			if err := sm.FlushAll(); err != nil {
+				log.Printf("⚠️ Emergency flush error: %v", err)
+			}
+
+			// Force sync to disk
+			if err := db.Sync(); err != nil {
+				log.Printf("⚠️ Emergency sync error: %v", err)
+			}
+
+			log.Printf("✅ Emergency flush completed")
+		}
+
+		// Re-raise signal for default handling (allows proper process exit)
+		signal.Reset(sig)
+		if sigNum, ok := sig.(syscall.Signal); ok {
+			syscall.Kill(syscall.Getpid(), sigNum)
+		}
+	}()
+}
+
 // openWithRecovery attempts to open the database with corruption detection and recovery
-func openWithRecovery(dbPath string) (*bolt.DB, error) {
+func (sm *StateManager) openWithRecovery(dbPath string) (*bolt.DB, error) {
+	// Try to open database with optimized settings for SD card
 	db, err := bolt.Open(dbPath, 0600, &bolt.Options{
-		Timeout: 10 * time.Second, // Production-ready timeout for lock acquisition
+		Timeout:      10 * time.Second, // Production-ready timeout for lock acquisition
+		NoGrowSync:   true,             // Don't sync on file growth - reduces SD card wear
+		FreelistType: bolt.FreelistMapType, // Better for frequent updates
 	})
 
 	if err != nil {
-		// Check if it's a corruption error
-		if err == bolt.ErrInvalid || err == bolt.ErrVersionMismatch || err == bolt.ErrChecksum {
-			log.Printf("Database corruption detected: %v", err)
-			// Backup corrupted file
-			backupPath := fmt.Sprintf("%s.corrupted.%d", dbPath, time.Now().Unix())
-			if renameErr := os.Rename(dbPath, backupPath); renameErr != nil {
-				log.Printf("Failed to backup corrupted database: %v", renameErr)
-			} else {
-				log.Printf("Corrupted database backed up to: %s", backupPath)
-			}
+		log.Printf("🔴 Database open failed: %v", err)
+		return sm.attemptRecoveryFromSnapshots(dbPath, err)
+	}
 
-			// Try to create fresh database
-			db, err = bolt.Open(dbPath, 0600, &bolt.Options{
-				Timeout: 1 * time.Second,
-			})
-			if err != nil {
-				return nil, fmt.Errorf("failed to create fresh database after corruption: %w", err)
-			}
-			log.Println("Created fresh database after corruption recovery")
-			return db, nil
-		}
-		return nil, err
+	// Validate database integrity
+	if err := validateDatabaseIntegrity(db); err != nil {
+		log.Printf("🔴 Database integrity check failed: %v", err)
+		db.Close()
+		return sm.attemptRecoveryFromSnapshots(dbPath, err)
 	}
 
 	return db, nil
 }
 
+// validateDatabaseIntegrity performs basic integrity checks on the database
+func validateDatabaseIntegrity(db *bolt.DB) error {
+	return db.View(func(tx *bolt.Tx) error {
+		// Check if we can iterate all buckets (will fail if corrupted)
+		return tx.ForEach(func(name []byte, b *bolt.Bucket) error {
+			// Try to iterate bucket keys (will fail if corrupted)
+			return b.ForEach(func(k, v []byte) error {
+				return nil // Just checking iteration works
+			})
+		})
+	})
+}
+
+// attemptRecoveryFromSnapshots tries to recover from available snapshots
+func (sm *StateManager) attemptRecoveryFromSnapshots(dbPath string, originalErr error) (*bolt.DB, error) {
+	// Get sorted list of snapshots (newest first)
+	snapshots, err := sm.getSnapshotsSorted()
+	if err != nil || len(snapshots) == 0 {
+		log.Printf("⚠️ No snapshots available for recovery")
+		return sm.createFreshDatabaseWithBackup(dbPath, originalErr)
+	}
+
+	// Try each snapshot from newest to oldest
+	for i, snapshot := range snapshots {
+		snapshotPath := filepath.Join(sm.snapshotDir, snapshot)
+		log.Printf("🔄 Attempting recovery from snapshot %d/%d: %s", i+1, len(snapshots), snapshot)
+
+		recoveryPath := dbPath + ".recovery"
+
+		// Copy snapshot to recovery path
+		if err := copyFileWithSync(snapshotPath, recoveryPath); err != nil {
+			log.Printf("⚠️ Failed to copy snapshot: %v", err)
+			continue
+		}
+
+		// Try to open recovered database
+		db, err := bolt.Open(recoveryPath, 0600, &bolt.Options{
+			Timeout: 10 * time.Second,
+		})
+		if err != nil {
+			log.Printf("⚠️ Snapshot %s is also corrupted: %v", snapshot, err)
+			os.Remove(recoveryPath)
+			continue
+		}
+
+		// Validate integrity
+		if err := validateDatabaseIntegrity(db); err != nil {
+			log.Printf("⚠️ Snapshot %s failed integrity check: %v", snapshot, err)
+			db.Close()
+			os.Remove(recoveryPath)
+			continue
+		}
+
+		// Success! Close and rename
+		db.Close()
+
+		// Backup corrupted database
+		if _, statErr := os.Stat(dbPath); statErr == nil {
+			backupPath := fmt.Sprintf("%s.corrupted.%d", dbPath, time.Now().Unix())
+			if renameErr := os.Rename(dbPath, backupPath); renameErr != nil {
+				log.Printf("⚠️ Failed to backup corrupted database: %v", renameErr)
+			} else {
+				log.Printf("📦 Corrupted database backed up to: %s", backupPath)
+			}
+		}
+
+		// Move recovered database into place
+		if err := os.Rename(recoveryPath, dbPath); err != nil {
+			log.Printf("🔴 Failed to finalize recovery: %v", err)
+			os.Remove(recoveryPath)
+			continue
+		}
+
+		// Sync directory to ensure rename is durable
+		if err := syncDirectory(filepath.Dir(dbPath)); err != nil {
+			log.Printf("⚠️ Warning: failed to sync directory: %v", err)
+		}
+
+		log.Printf("✅ Successfully recovered from snapshot: %s", snapshot)
+		return bolt.Open(dbPath, 0600, &bolt.Options{
+			Timeout:      10 * time.Second,
+			NoGrowSync:   true,
+			FreelistType: bolt.FreelistMapType,
+		})
+	}
+
+	// All snapshots failed
+	log.Printf("🔴 All snapshots failed, creating fresh database")
+	return sm.createFreshDatabaseWithBackup(dbPath, originalErr)
+}
+
+// createFreshDatabaseWithBackup backs up corrupted database and creates a fresh one
+func (sm *StateManager) createFreshDatabaseWithBackup(dbPath string, originalErr error) (*bolt.DB, error) {
+	// Backup corrupted file if exists
+	if _, err := os.Stat(dbPath); err == nil {
+		backupPath := fmt.Sprintf("%s.corrupted.%d", dbPath, time.Now().Unix())
+		if renameErr := os.Rename(dbPath, backupPath); renameErr != nil {
+			log.Printf("⚠️ Failed to backup corrupted database: %v", renameErr)
+		} else {
+			log.Printf("📦 Corrupted database backed up to: %s", backupPath)
+		}
+	}
+
+	// Create fresh database
+	db, err := bolt.Open(dbPath, 0600, &bolt.Options{
+		Timeout:      1 * time.Second,
+		NoGrowSync:   true,
+		FreelistType: bolt.FreelistMapType,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to create fresh database after corruption: %w (original error: %v)", err, originalErr)
+	}
+
+	log.Println("🆕 Created fresh database after corruption recovery")
+	return db, nil
+}
+
+// getSnapshotsSorted returns snapshot filenames sorted by timestamp (newest first)
+func (sm *StateManager) getSnapshotsSorted() ([]string, error) {
+	entries, err := os.ReadDir(sm.snapshotDir)
+	if err != nil {
+		return nil, err
+	}
+
+	var snapshots []string
+	for _, entry := range entries {
+		if !entry.IsDir() && strings.HasPrefix(entry.Name(), "state-") && strings.HasSuffix(entry.Name(), ".db") {
+			snapshots = append(snapshots, entry.Name())
+		}
+	}
+
+	// Sort newest first (filenames contain timestamps)
+	sort.Slice(snapshots, func(i, j int) bool {
+		return snapshots[i] > snapshots[j]
+	})
+
+	return snapshots, nil
+}
+
 // initializeBuckets creates the necessary buckets if they don't exist
 func initializeBuckets(db *bolt.DB) error {
 	return db.Update(func(tx *bolt.Tx) error {
-		buckets := []string{bucketPeers, bucketTopics, bucketMetadata}
+		buckets := []string{bucketPeers, bucketTopics, bucketMetadata, bucketPeerInfoCache}
 		for _, bucket := range buckets {
 			if _, err := tx.CreateBucketIfNotExists([]byte(bucket)); err != nil {
 				return fmt.Errorf("failed to create bucket %s: %w", bucket, err)
@@ -148,6 +356,98 @@ func initializeBuckets(db *bolt.DB) error {
 		}
 		return nil
 	})
+}
+
+// snapshotWorker periodically creates database snapshots for recovery
+func (sm *StateManager) snapshotWorker() {
+	defer sm.wg.Done()
+	ticker := time.NewTicker(sm.snapshotInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			if err := sm.CreateSnapshot(); err != nil {
+				log.Printf("⚠️ Snapshot creation failed: %v", err)
+			}
+		case <-sm.stopChan:
+			// Create final snapshot before shutdown
+			log.Println("📸 Creating final snapshot before shutdown...")
+			if err := sm.CreateSnapshot(); err != nil {
+				log.Printf("⚠️ Final snapshot creation failed: %v", err)
+			}
+			return
+		}
+	}
+}
+
+// CreateSnapshot creates a point-in-time backup of the database
+func (sm *StateManager) CreateSnapshot() error {
+	sm.snapshotMutex.Lock()
+	defer sm.snapshotMutex.Unlock()
+
+	sm.degradedModeMutex.RLock()
+	degraded := sm.degradedMode
+	db := sm.db
+	sm.degradedModeMutex.RUnlock()
+
+	if degraded || db == nil {
+		return fmt.Errorf("cannot create snapshot: database unavailable")
+	}
+
+	// Generate snapshot filename with timestamp
+	timestamp := time.Now().Format("20060102-150405")
+	snapshotPath := filepath.Join(sm.snapshotDir, fmt.Sprintf("state-%s.db", timestamp))
+	tempPath := snapshotPath + ".tmp"
+
+	// Use bbolt's consistent snapshot feature
+	err := db.View(func(tx *bolt.Tx) error {
+		return tx.CopyFile(tempPath, 0600)
+	})
+	if err != nil {
+		os.Remove(tempPath)
+		return fmt.Errorf("failed to create snapshot: %w", err)
+	}
+
+	// Atomic rename for crash safety
+	if err := os.Rename(tempPath, snapshotPath); err != nil {
+		os.Remove(tempPath)
+		return fmt.Errorf("failed to finalize snapshot: %w", err)
+	}
+
+	// Sync directory to ensure rename is durable
+	if err := syncDirectory(sm.snapshotDir); err != nil {
+		log.Printf("⚠️ Warning: failed to sync snapshot directory: %v", err)
+	}
+
+	sm.lastSnapshotTime = time.Now()
+	log.Printf("✅ Created snapshot: %s", filepath.Base(snapshotPath))
+
+	// Rotate old snapshots
+	sm.rotateSnapshots()
+
+	return nil
+}
+
+// rotateSnapshots removes old snapshots keeping only maxSnapshots
+func (sm *StateManager) rotateSnapshots() {
+	snapshots, err := sm.getSnapshotsSorted()
+	if err != nil {
+		log.Printf("⚠️ Warning: failed to read snapshot directory: %v", err)
+		return
+	}
+
+	// Remove oldest snapshots exceeding maxSnapshots
+	for len(snapshots) > sm.maxSnapshots {
+		oldestIndex := len(snapshots) - 1
+		oldPath := filepath.Join(sm.snapshotDir, snapshots[oldestIndex])
+		if err := os.Remove(oldPath); err != nil {
+			log.Printf("⚠️ Warning: failed to remove old snapshot %s: %v", snapshots[oldestIndex], err)
+		} else {
+			log.Printf("🗑️ Removed old snapshot: %s", snapshots[oldestIndex])
+		}
+		snapshots = snapshots[:oldestIndex]
+	}
 }
 
 // retryDatabaseOpen attempts to recover from degraded mode periodically
@@ -161,7 +461,7 @@ func (sm *StateManager) retryDatabaseOpen() {
 		case <-ticker.C:
 			sm.degradedModeMutex.Lock()
 			if sm.degradedMode && sm.db == nil {
-				db, err := openWithRecovery(sm.dbPath)
+				db, err := sm.openWithRecovery(sm.dbPath)
 				if err == nil {
 					if initErr := initializeBuckets(db); initErr != nil {
 						log.Printf("Failed to initialize buckets during recovery: %v", initErr)
@@ -169,7 +469,7 @@ func (sm *StateManager) retryDatabaseOpen() {
 					} else {
 						sm.db = db
 						sm.degradedMode = false
-						log.Println("Successfully recovered from degraded mode")
+						log.Println("✅ Successfully recovered from degraded mode")
 						sm.degradedModeMutex.Unlock()
 						return
 					}
@@ -197,7 +497,7 @@ func (sm *StateManager) PersistPeer(peerID peer.ID, info *NodeBufferInfo, immedi
 		// Track dropped writes and warn periodically
 		dropped := sm.writesDropped.Add(1)
 		if dropped%100 == 0 {
-			log.Printf("WARNING: %d writes dropped in degraded mode - persistence unavailable", dropped)
+			log.Printf("⚠️ WARNING: %d writes dropped in degraded mode - persistence unavailable", dropped)
 		}
 		return
 	}
@@ -213,13 +513,13 @@ func (sm *StateManager) PersistPeer(peerID peer.ID, info *NodeBufferInfo, immedi
 		select {
 		case sm.immediateQueue <- write:
 		default:
-			log.Printf("Immediate write queue full, dropping write for peer %s", peerID)
+			log.Printf("⚠️ Immediate write queue full, dropping write for peer %s", peerID)
 		}
 	} else {
 		select {
 		case sm.writeQueue <- write:
 		default:
-			log.Printf("Batched write queue full, dropping write for peer %s", peerID)
+			log.Printf("⚠️ Batched write queue full, dropping write for peer %s", peerID)
 		}
 	}
 }
@@ -248,13 +548,22 @@ func (sm *StateManager) LoadPeer(peerID peer.ID) (*NodeBufferInfo, error) {
 
 		var err error
 		info, err = DeserializeNodeBufferInfo(data)
-		return err
+		if err != nil {
+			// Check if it's a checksum error (corruption)
+			if errors.Is(err, ErrChecksumMismatch) {
+				sm.corruptedRecordsCount.Add(1)
+				return fmt.Errorf("peer data corrupted: %w", err)
+			}
+			return err
+		}
+		return nil
 	})
 
 	return info, err
 }
 
 // LoadAllPeers loads all peers from the database into a NodeBuffers instance
+// Corrupted individual records are logged and skipped to allow partial recovery
 func (sm *StateManager) LoadAllPeers() (*NodeBuffers, error) {
 	sm.degradedModeMutex.RLock()
 	degraded := sm.degradedMode
@@ -265,6 +574,8 @@ func (sm *StateManager) LoadAllPeers() (*NodeBuffers, error) {
 	}
 
 	nodeBuffers := NewNodeBuffers()
+	var corruptedCount int
+	var loadedCount int
 
 	err := sm.db.View(func(tx *bolt.Tx) error {
 		bucket := tx.Bucket([]byte(bucketPeers))
@@ -275,17 +586,25 @@ func (sm *StateManager) LoadAllPeers() (*NodeBuffers, error) {
 		return bucket.ForEach(func(k, v []byte) error {
 			peerID, err := peer.Decode(string(k))
 			if err != nil {
-				log.Printf("Failed to decode peer ID %s: %v", string(k), err)
+				log.Printf("⚠️ Skipping invalid peer ID %s: %v", string(k), err)
+				corruptedCount++
 				return nil // Skip invalid peer ID
 			}
 
 			info, err := DeserializeNodeBufferInfo(v)
 			if err != nil {
-				log.Printf("Failed to deserialize peer %s: %v", peerID, err)
-				return nil // Skip invalid data
+				// Check if it's a checksum error (corruption detected)
+				if errors.Is(err, ErrChecksumMismatch) {
+					log.Printf("🔴 CORRUPTION DETECTED for peer %s: checksum mismatch, skipping", peerID)
+				} else {
+					log.Printf("⚠️ Failed to deserialize peer %s: %v, skipping", peerID, err)
+				}
+				corruptedCount++
+				return nil // Skip corrupted data - don't fail entire load
 			}
 
 			nodeBuffers.Buffers[peerID] = info
+			loadedCount++
 			return nil
 		})
 	})
@@ -294,7 +613,13 @@ func (sm *StateManager) LoadAllPeers() (*NodeBuffers, error) {
 		return nil, err
 	}
 
-	log.Printf("Loaded %d peers from persistent state", len(nodeBuffers.Buffers))
+	// Update corruption counter
+	if corruptedCount > 0 {
+		sm.corruptedRecordsCount.Add(uint64(corruptedCount))
+		log.Printf("⚠️ WARNING: %d corrupted peer records were skipped during load", corruptedCount)
+	}
+
+	log.Printf("✅ Loaded %d valid peers from persistent state", loadedCount)
 	return nodeBuffers, nil
 }
 
@@ -340,7 +665,7 @@ func (sm *StateManager) PersistTopicPosition(topicKey string, timestamp time.Tim
 	select {
 	case sm.writeQueue <- write:
 	default:
-		log.Printf("Write queue full, dropping topic position write for %s", topicKey)
+		log.Printf("⚠️ Write queue full, dropping topic position write for %s", topicKey)
 	}
 }
 
@@ -395,8 +720,145 @@ func (sm *StateManager) PersistMetadata(key, value string) {
 	select {
 	case sm.writeQueue <- write:
 	default:
-		log.Printf("Write queue full, dropping metadata write for %s", key)
+		log.Printf("⚠️ Write queue full, dropping metadata write for %s", key)
 	}
+}
+
+// ============================================================================
+// PeerInfo Cache Methods - For blockchain fallback strategy
+// ============================================================================
+
+// PersistPeerInfo caches PeerInfo data from blockchain for fallback use
+// This write is batched as it's not critical for immediate persistence
+func (sm *StateManager) PersistPeerInfo(evmAddress string, info *CachedPeerInfo) {
+	// Check if closed first to prevent write to closed channel
+	if sm.closed.Load() {
+		return
+	}
+
+	sm.degradedModeMutex.RLock()
+	degraded := sm.degradedMode
+	sm.degradedModeMutex.RUnlock()
+
+	if degraded {
+		return
+	}
+
+	write := PeerInfoCacheWrite{
+		EvmAddress: evmAddress,
+		Info:       info,
+	}
+
+	select {
+	case sm.writeQueue <- write:
+	default:
+		log.Printf("⚠️ Write queue full, dropping PeerInfo cache write for %s", evmAddress)
+	}
+}
+
+// LoadPeerInfo loads cached PeerInfo for a given EVM address
+// Returns error if not found or corrupted
+func (sm *StateManager) LoadPeerInfo(evmAddress string) (*CachedPeerInfo, error) {
+	sm.degradedModeMutex.RLock()
+	degraded := sm.degradedMode
+	sm.degradedModeMutex.RUnlock()
+
+	if degraded {
+		return nil, fmt.Errorf("database in degraded mode")
+	}
+
+	var info *CachedPeerInfo
+	err := sm.db.View(func(tx *bolt.Tx) error {
+		bucket := tx.Bucket([]byte(bucketPeerInfoCache))
+		if bucket == nil {
+			return fmt.Errorf("peer info cache bucket not found")
+		}
+
+		data := bucket.Get([]byte(evmAddress))
+		if data == nil {
+			return fmt.Errorf("peer info not found in cache for %s", evmAddress)
+		}
+
+		var err error
+		info, err = DeserializeCachedPeerInfo(data)
+		if err != nil {
+			// Check if it's a checksum error (corruption)
+			if errors.Is(err, ErrChecksumMismatch) {
+				sm.corruptedRecordsCount.Add(1)
+				return fmt.Errorf("cached peer info corrupted for %s: %w", evmAddress, err)
+			}
+			return err
+		}
+		return nil
+	})
+
+	return info, err
+}
+
+// PersistPeerList caches the list of all registered peer addresses
+// This write is batched as it's not critical for immediate persistence
+func (sm *StateManager) PersistPeerList(list *CachedPeerList) {
+	// Check if closed first to prevent write to closed channel
+	if sm.closed.Load() {
+		return
+	}
+
+	sm.degradedModeMutex.RLock()
+	degraded := sm.degradedMode
+	sm.degradedModeMutex.RUnlock()
+
+	if degraded {
+		return
+	}
+
+	write := PeerListCacheWrite{
+		List: list,
+	}
+
+	select {
+	case sm.writeQueue <- write:
+	default:
+		log.Printf("⚠️ Write queue full, dropping peer list cache write")
+	}
+}
+
+// LoadPeerList loads the cached list of all registered peer addresses
+// Returns error if not found or corrupted
+func (sm *StateManager) LoadPeerList() (*CachedPeerList, error) {
+	sm.degradedModeMutex.RLock()
+	degraded := sm.degradedMode
+	sm.degradedModeMutex.RUnlock()
+
+	if degraded {
+		return nil, fmt.Errorf("database in degraded mode")
+	}
+
+	var list *CachedPeerList
+	err := sm.db.View(func(tx *bolt.Tx) error {
+		bucket := tx.Bucket([]byte(bucketPeerInfoCache))
+		if bucket == nil {
+			return fmt.Errorf("peer info cache bucket not found")
+		}
+
+		data := bucket.Get([]byte(peerListCacheKey))
+		if data == nil {
+			return fmt.Errorf("peer list not found in cache")
+		}
+
+		var err error
+		list, err = DeserializeCachedPeerList(data)
+		if err != nil {
+			// Check if it's a checksum error (corruption)
+			if errors.Is(err, ErrChecksumMismatch) {
+				sm.corruptedRecordsCount.Add(1)
+				return fmt.Errorf("cached peer list corrupted: %w", err)
+			}
+			return err
+		}
+		return nil
+	})
+
+	return list, err
 }
 
 // ClearAll removes all data from the database
@@ -411,7 +873,7 @@ func (sm *StateManager) ClearAll() error {
 
 	return sm.db.Update(func(tx *bolt.Tx) error {
 		// Delete and recreate all buckets
-		buckets := []string{bucketPeers, bucketTopics, bucketMetadata}
+		buckets := []string{bucketPeers, bucketTopics, bucketMetadata, bucketPeerInfoCache}
 		for _, bucket := range buckets {
 			if err := tx.DeleteBucket([]byte(bucket)); err != nil && err != bolt.ErrBucketNotFound {
 				return err
@@ -420,7 +882,7 @@ func (sm *StateManager) ClearAll() error {
 				return err
 			}
 		}
-		log.Println("Cleared all persistent state")
+		log.Println("🗑️ Cleared all persistent state")
 		return nil
 	})
 }
@@ -439,7 +901,7 @@ func (sm *StateManager) batchWriter() {
 		}
 
 		if err := sm.executeBatch(batch); err != nil {
-			log.Printf("Failed to execute batched writes: %v", err)
+			log.Printf("⚠️ Failed to execute batched writes: %v", err)
 		}
 		batch = batch[:0]
 	}
@@ -468,7 +930,7 @@ func (sm *StateManager) immediateWriter() {
 		select {
 		case write := <-sm.immediateQueue:
 			if err := sm.executeWrite(write); err != nil {
-				log.Printf("Failed to execute immediate write: %v", err)
+				log.Printf("⚠️ Failed to execute immediate write: %v", err)
 			}
 		case <-sm.stopChan:
 			return
@@ -559,6 +1021,32 @@ func (sm *StateManager) executeWriteInTx(tx *bolt.Tx, write interface{}) error {
 
 		return bucket.Put([]byte(w.Key), []byte(w.Value))
 
+	case PeerInfoCacheWrite:
+		bucket := tx.Bucket([]byte(bucketPeerInfoCache))
+		if bucket == nil {
+			return fmt.Errorf("peer info cache bucket not found")
+		}
+
+		data, err := SerializeCachedPeerInfo(w.Info)
+		if err != nil {
+			return fmt.Errorf("failed to serialize cached peer info: %w", err)
+		}
+
+		return bucket.Put([]byte(w.EvmAddress), data)
+
+	case PeerListCacheWrite:
+		bucket := tx.Bucket([]byte(bucketPeerInfoCache))
+		if bucket == nil {
+			return fmt.Errorf("peer info cache bucket not found")
+		}
+
+		data, err := SerializeCachedPeerList(w.List)
+		if err != nil {
+			return fmt.Errorf("failed to serialize cached peer list: %w", err)
+		}
+
+		return bucket.Put([]byte(peerListCacheKey), data)
+
 	default:
 		return fmt.Errorf("unknown write type: %T", write)
 	}
@@ -603,7 +1091,7 @@ execute:
 		if err := sm.executeBatch(batch); err != nil {
 			return fmt.Errorf("failed to flush pending writes: %w", err)
 		}
-		log.Printf("Flushed %d pending writes", len(batch))
+		log.Printf("💾 Flushed %d pending writes", len(batch))
 	}
 
 	// Ensure all writes are synced to disk
@@ -620,11 +1108,20 @@ func (sm *StateManager) GetStats() map[string]interface{} {
 	defer sm.degradedModeMutex.RUnlock()
 
 	stats := map[string]interface{}{
-		"degraded_mode":       sm.degradedMode,
-		"write_queue_length":  len(sm.writeQueue),
-		"immediate_queue_len": len(sm.immediateQueue),
-		"writes_dropped":      sm.writesDropped.Load(),
-		"closed":              sm.closed.Load(),
+		"degraded_mode":            sm.degradedMode,
+		"write_queue_length":       len(sm.writeQueue),
+		"immediate_queue_len":      len(sm.immediateQueue),
+		"writes_dropped":           sm.writesDropped.Load(),
+		"closed":                   sm.closed.Load(),
+		"corrupted_records_count":  sm.corruptedRecordsCount.Load(),
+		"last_snapshot_time":       sm.lastSnapshotTime.Format(time.RFC3339),
+		"snapshot_dir":             sm.snapshotDir,
+		"max_snapshots":            sm.maxSnapshots,
+	}
+
+	// Count current snapshots
+	if snapshots, err := sm.getSnapshotsSorted(); err == nil {
+		stats["snapshot_count"] = len(snapshots)
 	}
 
 	if sm.db != nil {
@@ -639,7 +1136,7 @@ func (sm *StateManager) GetStats() map[string]interface{} {
 // Safe to call multiple times - subsequent calls return the same error
 func (sm *StateManager) Close() error {
 	sm.closeOnce.Do(func() {
-		log.Println("Closing StateManager...")
+		log.Println("🛑 Closing StateManager...")
 
 		// Mark as closed to prevent new writes
 		sm.closed.Store(true)
@@ -652,7 +1149,7 @@ func (sm *StateManager) Close() error {
 
 		// Flush any remaining writes
 		if err := sm.FlushAll(); err != nil {
-			log.Printf("Error flushing writes during close: %v", err)
+			log.Printf("⚠️ Error flushing writes during close: %v", err)
 			if sm.closeErr == nil {
 				sm.closeErr = err
 			}
@@ -665,7 +1162,7 @@ func (sm *StateManager) Close() error {
 
 		if db != nil {
 			if err := db.Close(); err != nil {
-				log.Printf("Error closing database: %v", err)
+				log.Printf("⚠️ Error closing database: %v", err)
 				if sm.closeErr == nil {
 					sm.closeErr = fmt.Errorf("failed to close database: %w", err)
 				}
@@ -673,9 +1170,9 @@ func (sm *StateManager) Close() error {
 		}
 
 		if sm.closeErr == nil {
-			log.Println("StateManager closed successfully")
+			log.Println("✅ StateManager closed successfully")
 		} else {
-			log.Printf("StateManager closed with errors: %v", sm.closeErr)
+			log.Printf("⚠️ StateManager closed with errors: %v", sm.closeErr)
 		}
 	})
 
@@ -705,12 +1202,12 @@ func (sm *StateManager) SaveNodeBuffersSnapshot(nb *NodeBuffers) error {
 		for peerID, info := range nb.Buffers {
 			data, err := SerializeNodeBufferInfo(info)
 			if err != nil {
-				log.Printf("Failed to serialize peer %s: %v", peerID, err)
+				log.Printf("⚠️ Failed to serialize peer %s: %v", peerID, err)
 				continue
 			}
 
 			if err := bucket.Put([]byte(peerID.String()), data); err != nil {
-				log.Printf("Failed to save peer %s: %v", peerID, err)
+				log.Printf("⚠️ Failed to save peer %s: %v", peerID, err)
 			}
 		}
 
@@ -728,6 +1225,16 @@ func (sm *StateManager) IsInDegradedMode() bool {
 	sm.degradedModeMutex.RLock()
 	defer sm.degradedModeMutex.RUnlock()
 	return sm.degradedMode
+}
+
+// GetSnapshotDirectory returns the path to the snapshot directory
+func (sm *StateManager) GetSnapshotDirectory() string {
+	return sm.snapshotDir
+}
+
+// GetCorruptedRecordsCount returns the number of corrupted records detected
+func (sm *StateManager) GetCorruptedRecordsCount() uint64 {
+	return sm.corruptedRecordsCount.Load()
 }
 
 // ExportToJSON exports the entire database to a JSON file (for debugging/backup)
@@ -791,3 +1298,39 @@ func (sm *StateManager) ExportToJSON(outputPath string) error {
 
 	return os.WriteFile(outputPath, data, 0644)
 }
+
+// Helper functions
+
+// syncDirectory syncs a directory to ensure metadata is written to disk
+func syncDirectory(dirPath string) error {
+	dir, err := os.Open(dirPath)
+	if err != nil {
+		return err
+	}
+	defer dir.Close()
+	return dir.Sync()
+}
+
+// copyFileWithSync copies a file from src to dst with fsync for durability
+// This is critical for SD card corruption prevention
+func copyFileWithSync(src, dst string) error {
+	sourceFile, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer sourceFile.Close()
+
+	destFile, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer destFile.Close()
+
+	if _, err := io.Copy(destFile, sourceFile); err != nil {
+		return err
+	}
+
+	// Sync to ensure data is written to disk - critical for SD cards
+	return destFile.Sync()
+}
+

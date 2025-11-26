@@ -149,22 +149,72 @@ type PeerInfo struct {
 	StdErrTopic uint64
 }
 
-// TODO: retry on failure. This one likes to return 502 bad gateway and eth rate limit exceeded.
-// however, currently we stop the world on failure but should keep retrying.
+// GetPeerInfo retrieves peer information using blockchain-first, cache-fallback strategy.
+// It first attempts to query the Hedera blockchain. If successful, the result is cached.
+// If the blockchain query fails (network issues, rate limits, insufficient funds),
+// it falls back to locally cached data from bbolt.
 func GetPeerInfo(hederaAccEvmAddress string) (PeerInfo, error) {
 	log.Println("getting contract info for ", hederaAccEvmAddress)
-	var peerInfo PeerInfo
-	var err error
-	maxRetries := 25
-	baseDelay := time.Second
 
 	// Get the smart contract address for error reporting
-	var scAddress string
-	if commonlib.SmartContractAddressFlag != nil && *commonlib.SmartContractAddressFlag != "" {
-		scAddress = *commonlib.SmartContractAddressFlag
-	} else {
-		scAddress = os.Getenv("smart_contract_address")
+	scAddress := getSmartContractAddress()
+
+	// 1. Try blockchain first with reduced retries (3 instead of 25 for faster fallback)
+	peerInfo, err := getPeerInfoFromBlockchain(hederaAccEvmAddress, 3)
+	if err == nil {
+		// Success - cache for future fallback
+		if commonlib.GlobalStateManager != nil {
+			cachedInfo := &commonlib.CachedPeerInfo{
+				Available:   peerInfo.Available,
+				PeerID:      peerInfo.PeerID,
+				StdOutTopic: peerInfo.StdOutTopic,
+				StdInTopic:  peerInfo.StdInTopic,
+				StdErrTopic: peerInfo.StdErrTopic,
+				CachedAt:    time.Now(),
+			}
+			commonlib.GlobalStateManager.PersistPeerInfo(hederaAccEvmAddress, cachedInfo)
+		}
+		return peerInfo, nil
 	}
+
+	log.Printf("⚠️ Blockchain query failed for %s: %v, attempting cache fallback", hederaAccEvmAddress, err)
+
+	// 2. Fallback to cached data
+	if commonlib.GlobalStateManager != nil {
+		cached, cacheErr := commonlib.GlobalStateManager.LoadPeerInfo(hederaAccEvmAddress)
+		if cacheErr == nil {
+			// Check if cache is stale
+			if commonlib.IsCacheStale(cached.CachedAt, commonlib.DefaultPeerInfoCacheTTL) {
+				log.Printf("⚠️ Cache for %s is stale (cached %v ago), but using anyway due to blockchain unavailability",
+					hederaAccEvmAddress, time.Since(cached.CachedAt).Round(time.Minute))
+			} else {
+				log.Printf("📦 Using cached PeerInfo for %s (cached %v ago)",
+					hederaAccEvmAddress, time.Since(cached.CachedAt).Round(time.Minute))
+			}
+			return PeerInfo{
+				Available:   cached.Available,
+				PeerID:      cached.PeerID,
+				StdOutTopic: cached.StdOutTopic,
+				StdInTopic:  cached.StdInTopic,
+				StdErrTopic: cached.StdErrTopic,
+			}, nil
+		}
+		log.Printf("⚠️ Cache lookup also failed: %v", cacheErr)
+	}
+
+	// 3. Both failed - return original blockchain error
+	return PeerInfo{}, fmt.Errorf("blockchain unavailable and no valid cache for %s [contract: %s]: %w",
+		hederaAccEvmAddress, scAddress, err)
+}
+
+// getPeerInfoFromBlockchain queries the Hedera blockchain directly for peer info.
+// This is the internal function that performs the actual blockchain query with retries.
+func getPeerInfoFromBlockchain(hederaAccEvmAddress string, maxRetries int) (PeerInfo, error) {
+	var peerInfo PeerInfo
+	var err error
+	baseDelay := time.Second
+
+	scAddress := getSmartContractAddress()
 
 	for i := 0; i < maxRetries; i++ {
 		contractCaller := GetHRpcClient()
@@ -175,7 +225,8 @@ func GetPeerInfo(hederaAccEvmAddress string) (PeerInfo, error) {
 		if err == nil {
 			// Check if returned peerInfo is empty/default struct
 			if peerInfo == (PeerInfo{}) {
-				return peerInfo, fmt.Errorf("peer not found in the hedera contract for address; peer must be a registered neuron node: %s (contract: %s)", hederaAccEvmAddress, scAddress)
+				return peerInfo, fmt.Errorf("peer not found in the hedera contract for address; peer must be a registered neuron node: %s (contract: %s)",
+					hederaAccEvmAddress, scAddress)
 			}
 			return peerInfo, nil
 		}
@@ -185,33 +236,80 @@ func GetPeerInfo(hederaAccEvmAddress string) (PeerInfo, error) {
 
 	return peerInfo, fmt.Errorf("max retries exceeded getting peer info [contract: %s]: %v", scAddress, err)
 }
-func GetAllPeers() ([]string, error) {
-	contractCaller := GetHRpcClient()
 
-	// Get the smart contract address for error reporting
-	var scAddress string
+// getSmartContractAddress returns the smart contract address from flag or environment
+func getSmartContractAddress() string {
 	if commonlib.SmartContractAddressFlag != nil && *commonlib.SmartContractAddressFlag != "" {
-		scAddress = *commonlib.SmartContractAddressFlag
-	} else {
-		scAddress = os.Getenv("smart_contract_address")
+		return *commonlib.SmartContractAddressFlag
+	}
+	return os.Getenv("smart_contract_address")
+}
+// GetAllPeers retrieves all registered peer addresses using blockchain-first, cache-fallback strategy.
+// It first attempts to query the Hedera blockchain. If successful, the result is cached.
+// If the blockchain query fails, it falls back to locally cached data from bbolt.
+func GetAllPeers() ([]string, error) {
+	// 1. Try blockchain first
+	peers, err := getAllPeersFromBlockchain()
+	if err == nil {
+		// Success - cache for future fallback
+		if commonlib.GlobalStateManager != nil {
+			cachedList := &commonlib.CachedPeerList{
+				Addresses: peers,
+				CachedAt:  time.Now(),
+			}
+			commonlib.GlobalStateManager.PersistPeerList(cachedList)
+		}
+		return peers, nil
 	}
 
-	peerArraySize, error := GetPeerArraySize()
-	if error != nil {
-		return nil, error
+	log.Printf("⚠️ Blockchain query for peer list failed: %v, attempting cache fallback", err)
+
+	// 2. Fallback to cached data
+	if commonlib.GlobalStateManager != nil {
+		cached, cacheErr := commonlib.GlobalStateManager.LoadPeerList()
+		if cacheErr == nil && len(cached.Addresses) > 0 {
+			// Check if cache is stale
+			if commonlib.IsCacheStale(cached.CachedAt, commonlib.DefaultPeerInfoCacheTTL) {
+				log.Printf("⚠️ Cached peer list is stale (cached %v ago), but using anyway due to blockchain unavailability",
+					time.Since(cached.CachedAt).Round(time.Minute))
+			} else {
+				log.Printf("📦 Using cached peer list (%d peers, cached %v ago)",
+					len(cached.Addresses), time.Since(cached.CachedAt).Round(time.Minute))
+			}
+			return cached.Addresses, nil
+		}
+		if cacheErr != nil {
+			log.Printf("⚠️ Cache lookup also failed: %v", cacheErr)
+		}
+	}
+
+	// 3. Both failed - return original blockchain error
+	return nil, fmt.Errorf("blockchain unavailable and no valid peer list cache: %w", err)
+}
+
+// getAllPeersFromBlockchain queries the Hedera blockchain directly for the full peer list.
+// This is the internal function that performs the actual blockchain query.
+func getAllPeersFromBlockchain() ([]string, error) {
+	contractCaller := GetHRpcClient()
+	scAddress := getSmartContractAddress()
+
+	peerArraySize, err := GetPeerArraySize()
+	if err != nil {
+		return nil, err
 	}
 
 	peerList := make([]string, 0)
 	for i := big.NewInt(0); i.Cmp(peerArraySize) < 0; i.Add(i, big.NewInt(1)) {
 		address, err1 := contractCaller.PeerList(&bind.CallOpts{}, i)
 
-		perrInfo, err2 := GetPeerInfo(address.String())
+		// Use the direct blockchain query to avoid recursive caching
+		perrInfo, err2 := getPeerInfoFromBlockchain(address.String(), 3)
 		if err1 != nil || err2 != nil {
 			return nil, fmt.Errorf("failed to get peer list at index %d [contract: %s]: %v", i, scAddress, err1)
 		}
 		// check if the address bytes start with 0x0000000, that is a lot of zeros
 		// then it's not an address that has been derived by a private key
-		// but an address internally genearated by hedera. Reject it.
+		// but an address internally generated by hedera. Reject it.
 		if bytes.HasPrefix(address.Bytes(), make([]byte, 12)) {
 			continue
 		}

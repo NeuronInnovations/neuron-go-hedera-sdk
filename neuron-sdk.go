@@ -180,17 +180,39 @@ func LaunchSDK(
 		}
 	}
 
-	// Store reference for shutdown
+	// Store reference for shutdown with enhanced durability
 	defer func() {
 		if stateManager != nil {
-			log.Println("Persisting final state before shutdown...")
+			log.Println("🛑 Initiating graceful shutdown...")
+
+			// Create final snapshot before shutdown for recovery safety
+			log.Println("📸 Creating final snapshot...")
+			if err := stateManager.CreateSnapshot(); err != nil {
+				log.Printf("⚠️ Final snapshot failed: %v", err)
+			}
+
+			// Flush all pending writes to disk
+			log.Println("💾 Flushing pending writes...")
 			if err := stateManager.FlushAll(); err != nil {
-				log.Printf("Error flushing state: %v", err)
+				log.Printf("⚠️ Error flushing state: %v", err)
 			}
+
+			// Record shutdown metadata
 			stateManager.PersistMetadata("last_shutdown", time.Now().Format(time.RFC3339Nano))
-			if err := stateManager.Close(); err != nil {
-				log.Printf("Error closing state manager: %v", err)
+			stateManager.PersistMetadata("shutdown_reason", "graceful")
+
+			// Log corruption stats if any were detected
+			if corruptedCount := stateManager.GetCorruptedRecordsCount(); corruptedCount > 0 {
+				log.Printf("⚠️ Session detected %d corrupted records", corruptedCount)
 			}
+
+			// Close the state manager
+			log.Println("🔄 Closing database...")
+			if err := stateManager.Close(); err != nil {
+				log.Printf("⚠️ Error closing state manager: %v", err)
+			}
+
+			log.Println("✅ Shutdown complete")
 		}
 	}()
 
