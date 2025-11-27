@@ -386,18 +386,15 @@ func HandleBuyerCase(ctx context.Context, p2pHost host.Host, protocol protocol.I
 // tryReconnectFromBBolt attempts to connect to sellers using persisted IPs from BBolt database
 // This function is called on startup to avoid unnecessary Hedera topic queries and prioritize cached connections
 func tryReconnectFromBBolt(ctx context.Context, p2pHost host.Host, sellerBuffers *commonlib.NodeBuffers, protocol protocol.ID) {
-	if sellerBuffers == nil || len(sellerBuffers.Buffers) == 0 {
+	// Use GetBufferMap which is thread-safe and returns a copy
+	buffersCopy := sellerBuffers.GetBufferMap()
+
+	if len(buffersCopy) == 0 {
 		log.Println("💾 No persisted sellers found in BBolt to reconnect to")
 		return
 	}
 
-	log.Printf("💾 Attempting BBolt-first reconnection to %d persisted sellers", len(sellerBuffers.Buffers))
-
-	// Create a copy of buffer references to avoid holding lock during connection attempts
-	buffersCopy := make(map[peer.ID]*commonlib.NodeBufferInfo)
-	for peerID, buffer := range sellerBuffers.Buffers {
-		buffersCopy[peerID] = buffer
-	}
+	log.Printf("💾 Attempting BBolt-first reconnection to %d persisted sellers", len(buffersCopy))
 
 	for sellerPeerID, buffer := range buffersCopy {
 		// Skip if we don't have persisted IPs
@@ -819,12 +816,21 @@ func processSeller(seller Seller, p2pHost host.Host, sellerBuffers *commonlib.No
 					log.Printf("⚠️ Failed to load persisted peer %s: %v", targetPeerID, err)
 				} else if loadedBuffer != nil {
 					if loadedBuffer.SharedAccID > 0 {
-						// Validate the existing SharedAccID before reusing
-						if isValid, validErr := hedera_helper.ValidateSharedAccount(loadedBuffer.SharedAccID, 100); isValid {
+						// For cached reconnections, trust the SharedAccID if it's fresh (< 24h)
+						// This avoids unnecessary blockchain queries during Hedera-free reconnection
+						if !commonlib.IsCacheStale(loadedBuffer.SharedAccIDCreatedAt, 24*time.Hour) {
 							existingSharedAccID = loadedBuffer.SharedAccID
-							log.Printf("🔄 Reusing persisted SharedAccID %d for seller %s", existingSharedAccID, sellerEvnAddress)
+							log.Printf("🔄 Reusing fresh cached SharedAccID %d for seller %s (no blockchain validation needed)",
+								existingSharedAccID, sellerEvnAddress)
 						} else {
-							log.Printf("⚠️ Persisted SharedAccID %d is invalid (%v), will create new", loadedBuffer.SharedAccID, validErr)
+							// Cache is stale (> 24h), validate against blockchain
+							log.Printf("⏰ Cached SharedAccID %d is stale, validating against blockchain", loadedBuffer.SharedAccID)
+							if isValid, validErr := hedera_helper.ValidateSharedAccount(loadedBuffer.SharedAccID, 100); isValid {
+								existingSharedAccID = loadedBuffer.SharedAccID
+								log.Printf("🔄 Validated stale SharedAccID %d for seller %s", existingSharedAccID, sellerEvnAddress)
+							} else {
+								log.Printf("⚠️ Stale SharedAccID %d is invalid (%v), will create new", loadedBuffer.SharedAccID, validErr)
+							}
 						}
 					}
 				}
@@ -872,12 +878,19 @@ func processSeller(seller Seller, p2pHost host.Host, sellerBuffers *commonlib.No
 
 			needNewEnvelope := false
 			if existingSharedAccID > 0 {
-				// Validate the existing SharedAccID
-				if isValid, validErr := hedera_helper.ValidateSharedAccount(existingSharedAccID, 100); !isValid {
-					log.Printf("⚠️ SharedAccID %d is invalid (%v), creating new envelope", existingSharedAccID, validErr)
-					needNewEnvelope = true
+				// For cached reconnections, trust the SharedAccID if it's fresh (< 24h)
+				// This avoids unnecessary blockchain queries during Hedera-free reconnection
+				if !commonlib.IsCacheStale(peerBuffer.SharedAccIDCreatedAt, 24*time.Hour) {
+					log.Printf("✅ Reusing fresh cached SharedAccID %d for re-send to seller %s (no blockchain validation)",
+						existingSharedAccID, sellerEvnAddress)
 				} else {
-					log.Printf("✅ Reusing valid SharedAccID %d for re-send to seller %s", existingSharedAccID, sellerEvnAddress)
+					// Cache is stale, validate against blockchain
+					if isValid, validErr := hedera_helper.ValidateSharedAccount(existingSharedAccID, 100); !isValid {
+						log.Printf("⚠️ Stale SharedAccID %d is invalid (%v), creating new envelope", existingSharedAccID, validErr)
+						needNewEnvelope = true
+					} else {
+						log.Printf("✅ Validated stale SharedAccID %d for re-send to seller %s", existingSharedAccID, sellerEvnAddress)
+					}
 				}
 			}
 

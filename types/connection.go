@@ -21,6 +21,9 @@ const (
 	Connecting                 ConnectionState = "Connecting"
 	Reconnecting               ConnectionState = "Reconnecting"
 
+	// Cache-based reconnection states (Hedera-free)
+	ReconnectingFromCache ConnectionState = "ReconnectingFromCache"
+
 	// Hole punching states
 	HolePunchingScheduled  ConnectionState = "HolePunchingScheduled"
 	HolePunchingInProgress ConnectionState = "HolePunchingInProgress"

@@ -57,6 +57,10 @@ type SerializedNodeBufferInfo struct {
 	LastGoodsReceivedTime          time.Time                 `json:"last_goods_received_time"`
 	SharedAccID                    uint64                    `json:"shared_acc_id"`
 	SharedAccIDCreatedAt           time.Time                 `json:"shared_acc_id_created_at"`
+
+	// Cache-based reconnection tracking (Hedera-free reconnection)
+	CacheReconnectAttempts int       `json:"cache_reconnect_attempts"`
+	LastCacheReconnectTime time.Time `json:"last_cache_reconnect_time"`
 }
 
 // SerializeNodeBufferInfo converts NodeBufferInfo to checksummed bytes
@@ -76,6 +80,8 @@ func SerializeNodeBufferInfo(info *NodeBufferInfo) ([]byte, error) {
 		LastGoodsReceivedTime:          info.LastGoodsReceivedTime,
 		SharedAccID:                    info.SharedAccID,
 		SharedAccIDCreatedAt:           info.SharedAccIDCreatedAt,
+		CacheReconnectAttempts:         info.CacheReconnectAttempts,
+		LastCacheReconnectTime:         info.LastCacheReconnectTime,
 	}
 
 	jsonData, err := json.Marshal(serialized)
@@ -159,6 +165,8 @@ func buildNodeBufferInfoFromSerialized(serialized *SerializedNodeBufferInfo) *No
 		LastGoodsReceivedTime:          serialized.LastGoodsReceivedTime,
 		SharedAccID:                    serialized.SharedAccID,
 		SharedAccIDCreatedAt:           serialized.SharedAccIDCreatedAt,
+		CacheReconnectAttempts:         serialized.CacheReconnectAttempts,
+		LastCacheReconnectTime:         serialized.LastCacheReconnectTime,
 	}
 
 	// Migration: Try to extract SharedAccID from RequestOrResponse.Message if not directly stored

@@ -31,6 +31,17 @@ func HandleSellerCase(ctx context.Context, p2pHost host.Host, protocol protocol.
 		buyerBuffers = commonlib.NewNodeBuffers()
 	}
 
+	// IMPORTANT: Try BBolt-first reconnection BEFORE listening to Hedera topics
+	// This prioritizes cached IPs and SharedAccIDs to avoid unnecessary blockchain queries
+	if commonlib.GlobalStateManager != nil && !commonlib.GlobalStateManager.IsInDegradedMode() {
+		log.Println("🚀 [Seller] Starting BBolt-first reconnection (prioritizing cached buyer IPs over Hedera)")
+		sellerTryReconnectFromBBolt(ctx, p2pHost, buyerBuffers, protocol)
+		// Give BBolt reconnection attempts a moment to establish connections
+		time.Sleep(2 * time.Second)
+	} else {
+		log.Println("⚠️ [Seller] BBolt unavailable or in degraded mode, will rely on Hedera for all connections")
+	}
+
 	/*
 		// Periodically check for active streams and update buffer writers
 		go func() {
@@ -520,4 +531,63 @@ func getBuyerPublicKeyFromPeerID(peerID peer.ID) (string, error) {
 // getSellerPublicKey gets the seller's public key from environment
 func getSellerPublicKey() (string, error) {
 	return commonlib.MyPublicKey.StringRaw(), nil
+}
+
+// sellerTryReconnectFromBBolt attempts to connect to buyers using persisted IPs from BBolt database
+// This function is called on startup to avoid unnecessary Hedera topic queries and prioritize cached connections
+// It mirrors the buyer's tryReconnectFromBBolt but for the seller context
+func sellerTryReconnectFromBBolt(ctx context.Context, p2pHost host.Host, buyerBuffers *commonlib.NodeBuffers, protocol protocol.ID) {
+	// Use GetBufferMap which is thread-safe and returns a copy
+	buffersCopy := buyerBuffers.GetBufferMap()
+
+	if len(buffersCopy) == 0 {
+		log.Println("💾 [Seller] No persisted buyers found in BBolt to reconnect to")
+		return
+	}
+
+	log.Printf("💾 [Seller] Attempting BBolt-first reconnection to %d persisted buyers", len(buffersCopy))
+
+	for buyerPeerID, buffer := range buffersCopy {
+		// Skip if we don't have persisted IPs
+		if buffer.LastOtherSideMultiAddress == "" {
+			log.Printf("⏭️ [Seller] No persisted IPs for buyer %s, will rely on Hedera", buyerPeerID.ShortString())
+			continue
+		}
+
+		// Skip if we don't have a valid SharedAccID (indicates no previous successful connection)
+		if buffer.SharedAccID == 0 {
+			log.Printf("⏭️ [Seller] No SharedAccID for buyer %s, will rely on Hedera", buyerPeerID.ShortString())
+			continue
+		}
+
+		log.Printf("🔄 [Seller] Attempting BBolt-first reconnection to buyer %s using persisted IPs: %s (SharedAccID: %d)",
+			buyerPeerID.ShortString(), buffer.LastOtherSideMultiAddress, buffer.SharedAccID)
+
+		// Attempt direct connection using persisted IPs (in goroutine to avoid blocking)
+		go func(peerID peer.ID, cachedAddr string, sharedAccID uint64) {
+			// Use the unified AttemptReconnectFromCache function
+			err := commonlib.AttemptReconnectFromCache(ctx, p2pHost, peerID, buyerBuffers, protocol)
+
+			if err == nil {
+				log.Printf("✅ [Seller] BBolt-first reconnection SUCCESS! Connected to buyer %s (SharedAccID: %d)",
+					peerID.ShortString(), sharedAccID)
+
+				// Update buffer state
+				buyerBuffers.UpdateBufferLibP2PState(peerID, types.Connected)
+
+				// Try to open stream to the buyer
+				stream, streamErr := p2pHost.NewStream(context.Background(), peerID, protocol)
+				if streamErr == nil {
+					log.Printf("✅ [Seller] Stream opened successfully to buyer %s via BBolt-cached IP", peerID.ShortString())
+					// Keep the stream open - seller uses it for data transmission
+					_ = stream // Seller's data transmission logic will use this
+				} else {
+					log.Printf("⚠️ [Seller] Stream opening failed to buyer %s: %v", peerID.ShortString(), streamErr)
+				}
+			} else {
+				log.Printf("⚠️ [Seller] BBolt reconnection failed for buyer %s: %v, will rely on Hedera messages",
+					peerID.ShortString(), err)
+			}
+		}(buyerPeerID, buffer.LastOtherSideMultiAddress, buffer.SharedAccID)
+	}
 }

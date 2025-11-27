@@ -3,11 +3,11 @@ package commonlib
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
+	"sort"
 	"sync"
 	"time"
-
-	"log"
 
 	"github.com/NeuronInnovations/neuron-go-hedera-sdk/types"
 	"github.com/hashgraph/hedera-sdk-go/v2"
@@ -20,6 +20,105 @@ var NodeBuffersInstance *NodeBuffers
 
 // Package-level variable for the StateManager instance
 var GlobalStateManager *StateManager
+
+// ============================================================================
+// Invoice Queueing System - For Hedera-free reconnection
+// ============================================================================
+
+// QueuedInvoice represents an invoice that couldn't be sent to Hedera
+// and is queued for later delivery when the network becomes available
+type QueuedInvoice struct {
+	PeerID      peer.ID   `json:"peer_id"`
+	SharedAccID uint64    `json:"shared_acc_id"`
+	Amount      float64   `json:"amount"`
+	BuyerStdIn  uint64    `json:"buyer_std_in"`
+	QueuedAt    time.Time `json:"queued_at"`
+	RetryCount  int       `json:"retry_count"`
+}
+
+// Invoice queue for storing pending invoices when Hedera is unavailable
+var (
+	PendingInvoices     []QueuedInvoice
+	InvoiceQueueMutex   sync.Mutex
+	invoiceFlushRunning bool
+)
+
+// QueueInvoice adds an invoice to the pending queue for later delivery
+func QueueInvoice(peerID peer.ID, sharedAccID uint64, amount float64, buyerStdIn uint64) {
+	InvoiceQueueMutex.Lock()
+	defer InvoiceQueueMutex.Unlock()
+
+	invoice := QueuedInvoice{
+		PeerID:      peerID,
+		SharedAccID: sharedAccID,
+		Amount:      amount,
+		BuyerStdIn:  buyerStdIn,
+		QueuedAt:    time.Now(),
+		RetryCount:  0,
+	}
+
+	PendingInvoices = append(PendingInvoices, invoice)
+	log.Printf("📋 Queued invoice for peer %s (SharedAccID: %d, Amount: %.2f) - queue size: %d",
+		peerID.ShortString(), sharedAccID, amount, len(PendingInvoices))
+}
+
+// GetPendingInvoiceCount returns the number of pending invoices
+func GetPendingInvoiceCount() int {
+	InvoiceQueueMutex.Lock()
+	defer InvoiceQueueMutex.Unlock()
+	return len(PendingInvoices)
+}
+
+// RemoveInvoice removes a successfully sent invoice from the queue
+func RemoveInvoice(index int) {
+	InvoiceQueueMutex.Lock()
+	defer InvoiceQueueMutex.Unlock()
+
+	if index >= 0 && index < len(PendingInvoices) {
+		PendingInvoices = append(PendingInvoices[:index], PendingInvoices[index+1:]...)
+	}
+}
+
+// GetPendingInvoices returns a copy of the pending invoices for processing
+func GetPendingInvoices() []QueuedInvoice {
+	InvoiceQueueMutex.Lock()
+	defer InvoiceQueueMutex.Unlock()
+
+	// Return a copy to avoid race conditions
+	invoicesCopy := make([]QueuedInvoice, len(PendingInvoices))
+	copy(invoicesCopy, PendingInvoices)
+	return invoicesCopy
+}
+
+// ClearProcessedInvoices removes invoices that have been successfully processed
+func ClearProcessedInvoices(processedIndices []int) {
+	InvoiceQueueMutex.Lock()
+	defer InvoiceQueueMutex.Unlock()
+
+	if len(processedIndices) == 0 {
+		return
+	}
+
+	// Sort indices in descending order to remove from end first
+	// This ensures indices remain valid as we remove elements
+	sort.Sort(sort.Reverse(sort.IntSlice(processedIndices)))
+
+	for _, idx := range processedIndices {
+		if idx >= 0 && idx < len(PendingInvoices) {
+			PendingInvoices = append(PendingInvoices[:idx], PendingInvoices[idx+1:]...)
+		}
+	}
+}
+
+// IncrementInvoiceRetry increments the retry count for a queued invoice
+func IncrementInvoiceRetry(index int) {
+	InvoiceQueueMutex.Lock()
+	defer InvoiceQueueMutex.Unlock()
+
+	if index >= 0 && index < len(PendingInvoices) {
+		PendingInvoices[index].RetryCount++
+	}
+}
 
 // Initialize the state manager and NodeBuffers
 func StateManagerInit(buyerOrSellerFlag string, clearCacheFlag bool, stateManager *StateManager) {
@@ -101,6 +200,10 @@ type NodeBufferInfo struct {
 	LastGoodsReceivedTime          time.Time                 `json:"last_goods_received_time"`
 	SharedAccID                    uint64                    `json:"shared_acc_id"`
 	SharedAccIDCreatedAt           time.Time                 `json:"shared_acc_id_created_at"`
+
+	// Cache-based reconnection tracking (Hedera-free reconnection)
+	CacheReconnectAttempts int       `json:"cache_reconnect_attempts"`
+	LastCacheReconnectTime time.Time `json:"last_cache_reconnect_time"`
 }
 
 func (nb *NodeBuffers) AddBuffer2(peerID peer.ID, envelope types.TopicPostalEnvelope, isOtherSideValidAccount bool, rendezvousState types.RendezvousState, libP2PState types.ConnectionState) {
@@ -328,6 +431,46 @@ func (nb *NodeBuffers) GetSharedAccID(peerID peer.ID) (uint64, bool) {
 	return 0, false
 }
 
+// IncrementCacheReconnectAttempts increments the cache-based reconnection attempt count
+func (nb *NodeBuffers) IncrementCacheReconnectAttempts(peerID peer.ID) {
+	nb.mu.Lock()
+	defer nb.mu.Unlock()
+	if buffer, ok := nb.Buffers[peerID]; ok {
+		buffer.CacheReconnectAttempts++
+		buffer.LastCacheReconnectTime = time.Now()
+
+		// Persist cache reconnect state (batched - non-critical)
+		if GlobalStateManager != nil {
+			GlobalStateManager.PersistPeer(peerID, buffer, false)
+		}
+	}
+}
+
+// ResetCacheReconnectAttempts resets the cache-based reconnection attempt count on success
+func (nb *NodeBuffers) ResetCacheReconnectAttempts(peerID peer.ID) {
+	nb.mu.Lock()
+	defer nb.mu.Unlock()
+	if buffer, ok := nb.Buffers[peerID]; ok {
+		buffer.CacheReconnectAttempts = 0
+		buffer.LastCacheReconnectTime = time.Now()
+
+		// Persist reset (batched - non-critical)
+		if GlobalStateManager != nil {
+			GlobalStateManager.PersistPeer(peerID, buffer, false)
+		}
+	}
+}
+
+// GetCacheReconnectInfo returns cache reconnection attempt info for a peer
+func (nb *NodeBuffers) GetCacheReconnectInfo(peerID peer.ID) (int, time.Time, bool) {
+	nb.mu.RLock()
+	defer nb.mu.RUnlock()
+	if buffer, ok := nb.Buffers[peerID]; ok {
+		return buffer.CacheReconnectAttempts, buffer.LastCacheReconnectTime, true
+	}
+	return 0, time.Time{}, false
+}
+
 // ShowDetailedPeerStatus extracts detailed status information for all peers
 func (nb *NodeBuffers) ShowDetailedPeerStatus(p2pHost host.Host) []types.PeerStatusInfo {
 	nb.mu.RLock()
@@ -367,6 +510,8 @@ func (nb *NodeBuffers) ShowDetailedPeerStatus(p2pHost host.Host) []types.PeerSta
 			connectionStatus = "Connecting"
 		case types.Reconnecting:
 			connectionStatus = "Reconnecting"
+		case types.ReconnectingFromCache:
+			connectionStatus = "ReconnectingFromCache"
 		case types.ConnectionLost, types.ConnectionLostFlushError, types.ConnectionLostWriteError:
 			connectionStatus = "Disconnected"
 		case types.CanNotConnectUnknownReason, types.CanNotConnectStreamError:

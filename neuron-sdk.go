@@ -451,13 +451,49 @@ func LaunchSDK(
 
 	fmt.Printf("The node is up and tho peerID is %v\n", p2pHost.ID())
 
-	// Monitor connection events
+	// Monitor connection events with automatic cached reconnection
 	p2pHost.Network().Notify(&network.NotifyBundle{
 		ConnectedF: func(n network.Network, c network.Conn) {
 			log.Printf("Connected to %s", c.RemotePeer())
 		},
 		DisconnectedF: func(n network.Network, c network.Conn) {
-			log.Printf("Disconnected from %s", c.RemotePeer())
+			peerID := c.RemotePeer()
+			log.Printf("Disconnected from %s, attempting cached reconnection", peerID)
+
+			// Check if we have a buffer for this peer (indicates an active relationship)
+			if commonlib.NodeBuffersInstance == nil {
+				log.Printf("NodeBuffersInstance is nil, skipping cached reconnection for %s", peerID)
+				return
+			}
+
+			_, exists := commonlib.NodeBuffersInstance.GetBuffer(peerID)
+			if !exists {
+				log.Printf("No buffer found for peer %s, skipping cached reconnection", peerID.ShortString())
+				return
+			}
+
+			// Attempt cached reconnection in a goroutine to avoid blocking
+			go func() {
+				// Small delay to avoid immediate reconnection during intentional disconnects
+				time.Sleep(500 * time.Millisecond)
+
+				// Verify still disconnected before attempting reconnection
+				if n.Connectedness(peerID) == network.Connected {
+					log.Printf("Peer %s already reconnected, skipping cached reconnection", peerID.ShortString())
+					return
+				}
+
+				err := commonlib.AttemptReconnectFromCache(ctx, p2pHost, peerID,
+					commonlib.NodeBuffersInstance, protocol)
+				if err != nil {
+					log.Printf("Cached reconnection failed for %s: %v (will fall back to Hedera on next cycle)",
+						peerID.ShortString(), err)
+					// Mark peer for Hedera-based reconnection on next cycle
+					commonlib.NodeBuffersInstance.UpdateBufferLibP2PState(peerID, types.ConnectionLost)
+				} else {
+					log.Printf("Cached reconnection SUCCESS for %s - no Hedera needed!", peerID.ShortString())
+				}
+			}()
 		},
 	})
 

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"strings"
 
 	"os"
 	"time"
@@ -311,6 +312,12 @@ func SellerSendScheduledTransferRequest(
 	// Get the current balance of the shared account
 	accountInfo, err := GetAccountInfoFromNetwork(sharedAccID)
 	if err != nil {
+		// Network error - queue invoice for later and continue streaming
+		if isNetworkError(err) {
+			log.Printf("⚠️ Network error getting balance, queueing invoice for SharedAccID %d", sharedAccID.Account)
+			queueInvoiceForLater(sharedAccID.Account, 0, buyerStdIn.Topic)
+			return nil // Don't fail - continue streaming
+		}
 		return fmt.Errorf("failed to get account balance: %v", err)
 	}
 
@@ -329,23 +336,44 @@ func SellerSendScheduledTransferRequest(
 		FreezeWith(client)
 
 	if err != nil {
+		// Network error - queue invoice for later
+		if isNetworkError(err) {
+			log.Printf("⚠️ Network error creating transfer, queueing invoice for SharedAccID %d", sharedAccID.Account)
+			queueInvoiceForLater(sharedAccID.Account, totalAmount, buyerStdIn.Topic)
+			return nil // Don't fail - continue streaming
+		}
 		return err
 	}
 
 	// Prepare the transfer transaction to be scheduled
 	scheduledTransferTx, err := transferTx.Schedule()
 	if err != nil {
+		if isNetworkError(err) {
+			log.Printf("⚠️ Network error scheduling transfer, queueing invoice for SharedAccID %d", sharedAccID.Account)
+			queueInvoiceForLater(sharedAccID.Account, totalAmount, buyerStdIn.Topic)
+			return nil
+		}
 		return err
 	}
 
 	scheduledTxResponse, err := scheduledTransferTx.Execute(client)
 
 	if err != nil {
+		if isNetworkError(err) {
+			log.Printf("⚠️ Network error executing scheduled transfer, queueing invoice for SharedAccID %d", sharedAccID.Account)
+			queueInvoiceForLater(sharedAccID.Account, totalAmount, buyerStdIn.Topic)
+			return nil
+		}
 		return err
 	}
 
 	receipt, err := scheduledTxResponse.GetReceipt(client)
 	if err != nil {
+		if isNetworkError(err) {
+			log.Printf("⚠️ Network error getting receipt, queueing invoice for SharedAccID %d", sharedAccID.Account)
+			queueInvoiceForLater(sharedAccID.Account, totalAmount, buyerStdIn.Topic)
+			return nil
+		}
 		return err
 	}
 
@@ -368,10 +396,207 @@ func SellerSendScheduledTransferRequest(
 		Execute(client)
 
 	if err != nil {
+		if isNetworkError(err) {
+			log.Printf("⚠️ Network error sending to topic, queueing invoice for SharedAccID %d", sharedAccID.Account)
+			queueInvoiceForLater(sharedAccID.Account, totalAmount, buyerStdIn.Topic)
+			return nil
+		}
 		return err
 	}
 
 	fmt.Println(txResponse)
+
+	return nil
+}
+
+// isNetworkError checks if the error is a network-related error vs an account/validation error
+func isNetworkError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errStr := err.Error()
+	// Network-related error patterns
+	networkPatterns := []string{
+		"connection refused",
+		"connection reset",
+		"network is unreachable",
+		"timeout",
+		"dial tcp",
+		"no route to host",
+		"i/o timeout",
+		"context deadline exceeded",
+		"EOF",
+		"UNAVAILABLE",
+		"RESOURCE_EXHAUSTED",
+	}
+	for _, pattern := range networkPatterns {
+		if strings.Contains(strings.ToLower(errStr), strings.ToLower(pattern)) {
+			return true
+		}
+	}
+	return false
+}
+
+// queueInvoiceForLater adds an invoice to the pending queue
+func queueInvoiceForLater(sharedAccID uint64, amount float64, buyerStdIn uint64) {
+	// We don't have the peerID here, so we'll use a placeholder
+	// The invoice will be identified by SharedAccID
+	commonlib.InvoiceQueueMutex.Lock()
+	defer commonlib.InvoiceQueueMutex.Unlock()
+
+	invoice := commonlib.QueuedInvoice{
+		SharedAccID: sharedAccID,
+		Amount:      amount,
+		BuyerStdIn:  buyerStdIn,
+		QueuedAt:    time.Now(),
+		RetryCount:  0,
+	}
+
+	commonlib.PendingInvoices = append(commonlib.PendingInvoices, invoice)
+	log.Printf("📋 Queued invoice (SharedAccID: %d, Amount: %.2f) - queue size: %d",
+		sharedAccID, amount, len(commonlib.PendingInvoices))
+}
+
+// StartInvoiceFlushWorker starts a background worker that periodically flushes queued invoices
+// This should be called once during seller initialization
+func StartInvoiceFlushWorker(stopChan <-chan struct{}) {
+	log.Println("📋 Starting invoice flush worker (interval: 60s)")
+
+	go func() {
+		ticker := time.NewTicker(60 * time.Second)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ticker.C:
+				FlushPendingInvoices()
+			case <-stopChan:
+				log.Println("📋 Invoice flush worker stopping, flushing remaining invoices...")
+				FlushPendingInvoices()
+				return
+			}
+		}
+	}()
+}
+
+// FlushPendingInvoices attempts to send all queued invoices to Hedera
+func FlushPendingInvoices() {
+	invoices := commonlib.GetPendingInvoices()
+	if len(invoices) == 0 {
+		return
+	}
+
+	log.Printf("📋 Flushing %d pending invoices", len(invoices))
+
+	var processedIndices []int
+
+	for i, invoice := range invoices {
+		// Skip invoices that have been retried too many times
+		if invoice.RetryCount >= 5 {
+			log.Printf("⚠️ Invoice for SharedAccID %d exceeded max retries, removing from queue", invoice.SharedAccID)
+			processedIndices = append(processedIndices, i)
+			continue
+		}
+
+		// Attempt to send the invoice
+		err := retryInvoice(invoice)
+		if err == nil {
+			log.Printf("✅ Successfully flushed queued invoice for SharedAccID %d", invoice.SharedAccID)
+			processedIndices = append(processedIndices, i)
+		} else {
+			log.Printf("⚠️ Failed to flush invoice for SharedAccID %d: %v", invoice.SharedAccID, err)
+			commonlib.IncrementInvoiceRetry(i)
+		}
+	}
+
+	// Remove successfully processed invoices
+	if len(processedIndices) > 0 {
+		commonlib.ClearProcessedInvoices(processedIndices)
+		log.Printf("📋 Cleared %d processed invoices, %d remaining",
+			len(processedIndices), commonlib.GetPendingInvoiceCount())
+	}
+}
+
+// retryInvoice attempts to send a queued invoice
+func retryInvoice(invoice commonlib.QueuedInvoice) error {
+	client := GetHederaClientUsingEnv()
+	defer client.Close()
+
+	// Create the account IDs
+	sharedAccID := hedera.AccountID{Shard: 0, Realm: 0, Account: invoice.SharedAccID}
+	buyerStdIn := hedera.TopicID{Shard: 0, Realm: 0, Topic: invoice.BuyerStdIn}
+
+	// Get seller's accounts
+	myDeviceAccountID, err := hedera.AccountIDFromEvmAddress(0, 0, os.Getenv("hedera_evm_id"))
+	if err != nil {
+		return fmt.Errorf("failed to get device account: %w", err)
+	}
+
+	myParentAccountID, err := GetDeviceParent(os.Getenv("hedera_evm_id"))
+	if err != nil {
+		return fmt.Errorf("failed to get parent account: %w", err)
+	}
+
+	// Get current balance
+	accountInfo, err := GetAccountInfoFromNetwork(sharedAccID)
+	if err != nil {
+		return fmt.Errorf("failed to get account balance: %w", err)
+	}
+
+	totalAmount := accountInfo.Balance.As(hedera.HbarUnits.Millibar)
+	if totalAmount < 1 {
+		log.Printf("⚠️ SharedAccID %d has insufficient balance (%.2f), skipping invoice", invoice.SharedAccID, totalAmount)
+		return nil // Don't retry - mark as processed
+	}
+
+	sixtyPercent := float64(totalAmount) * 0.6
+	fortyPercent := float64(totalAmount) * 0.4
+
+	transferTx, err := hedera.NewTransferTransaction().
+		AddHbarTransfer(sharedAccID, hedera.HbarFrom(-float64(totalAmount), hedera.HbarUnits.Millibar)).
+		AddHbarTransfer(myParentAccountID, hedera.HbarFrom(sixtyPercent, hedera.HbarUnits.Millibar)).
+		AddHbarTransfer(myDeviceAccountID, hedera.HbarFrom(fortyPercent, hedera.HbarUnits.Millibar)).
+		SetTransactionMemo(uuid.New().String()).
+		FreezeWith(client)
+
+	if err != nil {
+		return fmt.Errorf("failed to create transfer: %w", err)
+	}
+
+	scheduledTransferTx, err := transferTx.Schedule()
+	if err != nil {
+		return fmt.Errorf("failed to schedule transfer: %w", err)
+	}
+
+	scheduledTxResponse, err := scheduledTransferTx.Execute(client)
+	if err != nil {
+		return fmt.Errorf("failed to execute scheduled transfer: %w", err)
+	}
+
+	receipt, err := scheduledTxResponse.GetReceipt(client)
+	if err != nil {
+		return fmt.Errorf("failed to get receipt: %w", err)
+	}
+
+	scheduleId := receipt.ScheduleID
+
+	// Send notification to buyer
+	m := &types.NeuronScheduleSignRequestMsg{
+		MessageType: "scheduleSignRequest",
+		ScheduleID:  scheduleId.Schedule,
+		SharedAccID: sharedAccID.Account,
+		Version:     "0.4",
+	}
+	jsonBytes, _ := json.Marshal(m)
+
+	_, err = hedera.NewTopicMessageSubmitTransaction().
+		SetMessage(jsonBytes).
+		SetTopicID(buyerStdIn).
+		Execute(client)
+
+	if err != nil {
+		return fmt.Errorf("failed to send to topic: %w", err)
+	}
 
 	return nil
 }

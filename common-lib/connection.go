@@ -19,6 +19,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/core/protocol"
+	"github.com/multiformats/go-multiaddr"
 )
 
 // GetStreamHandler finds and returns the stream for a given peer and protocol ID
@@ -216,4 +217,167 @@ func HolePunchConnectIfNotConnected(ctx context.Context, p2pHost host.Host, pi p
 	}
 	log.Println("hole punch connected to ", pi.ID)
 	return nil
+}
+
+// AttemptReconnectFromCache attempts to reconnect to a peer using cached IP addresses from BBolt.
+// This function enables Hedera-free reconnection by using persisted connection data.
+// It tries the last known IP address with 3 retries and exponential backoff (1s, 2s, 4s).
+// Returns nil on success, error on failure after all retries exhausted.
+func AttemptReconnectFromCache(ctx context.Context, p2pHost host.Host, peerID peer.ID,
+	buffers *NodeBuffers, protocolID protocol.ID) error {
+
+	if buffers == nil {
+		return fmt.Errorf("buffers is nil, cannot attempt cached reconnection")
+	}
+
+	// Get cached buffer info for the peer
+	bufferInfo, exists := buffers.GetBuffer(peerID)
+	if !exists {
+		return fmt.Errorf("no cached buffer found for peer %s", peerID.ShortString())
+	}
+
+	// Check if we have a cached address
+	cachedAddr := bufferInfo.LastOtherSideMultiAddress
+	if cachedAddr == "" {
+		return fmt.Errorf("no cached address for peer %s", peerID.ShortString())
+	}
+
+	log.Printf("🔄 Attempting cached reconnection to peer %s using address: %s", peerID.ShortString(), cachedAddr)
+
+	// Update state to indicate we're attempting cached reconnection
+	buffers.UpdateBufferLibP2PState(peerID, types.ReconnectingFromCache)
+	buffers.IncrementCacheReconnectAttempts(peerID)
+
+	// Parse the cached multiaddress
+	maddr, err := parseMultiaddr(cachedAddr)
+	if err != nil {
+		log.Printf("Failed to parse cached multiaddress %s: %v", cachedAddr, err)
+		return fmt.Errorf("invalid cached address: %w", err)
+	}
+
+	// Create AddrInfo for connection attempt
+	addrInfo := peer.AddrInfo{
+		ID:    peerID,
+		Addrs: maddr,
+	}
+
+	// Retry loop with exponential backoff (1s, 2s, 4s)
+	maxRetries := 3
+	baseBackoff := time.Second
+
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		log.Printf("🔌 Cache reconnection attempt %d/%d for peer %s", attempt, maxRetries, peerID.ShortString())
+
+		// Create timeout context for this attempt
+		connectCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+
+		// Attempt connection
+		err := p2pHost.Connect(connectCtx, addrInfo)
+		cancel()
+
+		if err == nil {
+			// Connection successful!
+			log.Printf("✅ Cache reconnection SUCCESS on attempt %d for peer %s", attempt, peerID.ShortString())
+
+			// Verify connection is actually established
+			if p2pHost.Network().Connectedness(peerID) == network.Connected {
+				buffers.UpdateBufferLibP2PState(peerID, types.Connected)
+				buffers.ResetCacheReconnectAttempts(peerID)
+
+				// Try to open a stream to verify full connectivity
+				streamCtx, streamCancel := context.WithTimeout(ctx, 5*time.Second)
+				stream, streamErr := p2pHost.NewStream(streamCtx, peerID, protocolID)
+				streamCancel()
+
+				if streamErr == nil {
+					log.Printf("✅ Stream opened successfully after cache reconnection to %s", peerID.ShortString())
+					stream.Close() // Close the test stream, caller will open their own
+					return nil
+				}
+				log.Printf("⚠️ Connected but stream failed for %s: %v", peerID.ShortString(), streamErr)
+				// Still consider this a success - connection is established
+				return nil
+			}
+		}
+
+		log.Printf("⚠️ Cache reconnection attempt %d/%d failed for peer %s: %v", attempt, maxRetries, peerID.ShortString(), err)
+
+		// If not the last attempt, wait with exponential backoff
+		if attempt < maxRetries {
+			backoffDuration := baseBackoff * time.Duration(1<<(attempt-1)) // 1s, 2s, 4s
+			log.Printf("⏳ Waiting %v before next cache reconnection attempt", backoffDuration)
+			time.Sleep(backoffDuration)
+		}
+	}
+
+	// All retries exhausted
+	log.Printf("❌ Cache reconnection FAILED for peer %s after %d attempts", peerID.ShortString(), maxRetries)
+	buffers.UpdateBufferLibP2PState(peerID, types.ConnectionLost)
+	return fmt.Errorf("cache reconnection failed after %d attempts", maxRetries)
+}
+
+// parseMultiaddr parses a cached multiaddress string which may contain multiple addresses
+// separated by spaces or be a single address
+func parseMultiaddr(addrStr string) ([]multiaddr.Multiaddr, error) {
+	var addrs []multiaddr.Multiaddr
+
+	// Handle space-separated addresses (e.g., from Fields split)
+	parts := splitAddresses(addrStr)
+
+	for _, part := range parts {
+		if part == "" {
+			continue
+		}
+		addr, err := multiaddr.NewMultiaddr(part)
+		if err != nil {
+			log.Printf("Skipping invalid multiaddr %s: %v", part, err)
+			continue
+		}
+		addrs = append(addrs, addr)
+	}
+
+	if len(addrs) == 0 {
+		return nil, fmt.Errorf("no valid multiaddresses found in: %s", addrStr)
+	}
+
+	return addrs, nil
+}
+
+// splitAddresses splits a string that may contain multiple multiaddresses
+func splitAddresses(s string) []string {
+	// Handle different formats:
+	// 1. Single address: "/ip4/1.2.3.4/udp/1234/quic-v1"
+	// 2. Space-separated: "/ip4/1.2.3.4/udp/1234 /ip4/5.6.7.8/udp/5678"
+	// 3. Already split
+
+	var result []string
+	current := ""
+
+	for i := 0; i < len(s); i++ {
+		if s[i] == '/' && current != "" && (i == 0 || s[i-1] == ' ') {
+			// New address starting
+			if current != "" {
+				result = append(result, current)
+			}
+			current = "/"
+		} else if s[i] == ' ' {
+			if current != "" {
+				result = append(result, current)
+				current = ""
+			}
+		} else {
+			current += string(s[i])
+		}
+	}
+
+	if current != "" {
+		result = append(result, current)
+	}
+
+	// If no splits were made, return the original
+	if len(result) == 0 {
+		return []string{s}
+	}
+
+	return result
 }
