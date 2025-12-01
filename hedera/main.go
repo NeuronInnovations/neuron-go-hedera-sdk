@@ -276,7 +276,7 @@ func BuyerPrepareServiceRequest(
 
 	peerInfo, err := GetPeerInfo(fromEthAddress)
 	if err != nil {
-		log.Panic(err)
+		return nil, fmt.Errorf("failed to get buyer's peer info: %w", err)
 	}
 
 	m := &types.NeuronServiceRequestMsg{

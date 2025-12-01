@@ -739,14 +739,13 @@ func processSeller(seller Seller, p2pHost host.Host, sellerBuffers *commonlib.No
 	if len(connsToPeer) > 0 {
 		// Check if connection is actually active and established
 		if p2pHost.Network().Connectedness(targetPeerID) == network.Connected {
-			// Check if SharedAccID exists
-			var hasSharedAccID bool
-			if bufferInfo, exists := sellerBuffers.GetBuffer(targetPeerID); exists {
-				hasSharedAccID = bufferInfo.SharedAccID > 0
-			}
+			// Check if SharedAccID exists in buffer (loaded from BBolt on startup)
+			bufferInfo, bufferExists := sellerBuffers.GetBuffer(targetPeerID)
+			hasSharedAccID := bufferExists && bufferInfo.SharedAccID > 0
 
 			if hasSharedAccID {
-				log.Printf("✅ Already connected to seller %s with SharedAccID, skipping Hedera query", sellerEvnAddress)
+				log.Printf("✅ Already connected to seller %s with persisted SharedAccID %d (from BBolt), skipping Hedera query",
+					sellerEvnAddress, bufferInfo.SharedAccID)
 				return
 			} else {
 				// Connected via hole punching but no SharedAccID yet - create it asynchronously

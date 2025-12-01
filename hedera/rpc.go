@@ -18,15 +18,15 @@ import (
 )
 
 func EnsureTopicsAndNotifyContract(p2pHost host.Host) (hedera.TopicID, hedera.TopicID, hedera.TopicID, error) {
+	var emptyTopic hedera.TopicID
 
 	hostPubKey, err := p2pHost.ID().ExtractPublicKey()
 	if err != nil {
-		log.Panic("The peer must have a public key but we couldn't get it: ", err)
+		return emptyTopic, emptyTopic, emptyTopic, fmt.Errorf("failed to extract public key from peer: %w", err)
 	}
 	hostPubKeyByte, err := hostPubKey.Raw()
-
 	if err != nil {
-		log.Panic("The peer must have a public key but we couldn't get it: ", err)
+		return emptyTopic, emptyTopic, emptyTopic, fmt.Errorf("failed to get raw public key bytes: %w", err)
 	}
 	hostPubKeyStr := common.Bytes2Hex(hostPubKeyByte)
 
@@ -34,8 +34,10 @@ func EnsureTopicsAndNotifyContract(p2pHost host.Host) (hedera.TopicID, hedera.To
 
 	peerInfo, err := GetPeerInfo(toEthAddress)
 	if err != nil {
-		log.Panic("We must be able to correctly talk to the smart contract to continue;\n perhaps you are pointing to the wrong contract \n or your address doesn't exist, err:", err)
-	} else {
+		return emptyTopic, emptyTopic, emptyTopic, fmt.Errorf("failed to get peer info from blockchain or cache: %w", err)
+	}
+
+	{
 		// check if peerInfo has data
 		if peerInfo.StdInTopic != 0 && peerInfo.StdOutTopic != 0 {
 			// return the topics
@@ -216,7 +218,7 @@ func getPeerInfoFromBlockchain(hederaAccEvmAddress string, maxRetries int) (Peer
 
 	scAddress := getSmartContractAddress()
 
-	for i := 0; i < maxRetries; i++ {
+	for attempt := 1; attempt <= maxRetries; attempt++ {
 		contractCaller := GetHRpcClient()
 		peerInfo, err = contractCaller.HederaAddressToPeer(
 			&bind.CallOpts{},
@@ -230,8 +232,11 @@ func getPeerInfoFromBlockchain(hederaAccEvmAddress string, maxRetries int) (Peer
 			}
 			return peerInfo, nil
 		}
-		fmt.Printf("Error getting rpc peer info, retrying: %d th time [contract: %s] - %v\n", i, scAddress, err)
-		time.Sleep(baseDelay * (1 << i)) // Exponential backoff
+		log.Printf("⚠️ Blockchain query attempt %d/%d failed [contract: %s]: %v", attempt, maxRetries, scAddress, err)
+		if attempt < maxRetries {
+			backoff := baseDelay * (1 << (attempt - 1)) // Exponential backoff: 1s, 2s, 4s
+			time.Sleep(backoff)
+		}
 	}
 
 	return peerInfo, fmt.Errorf("max retries exceeded getting peer info [contract: %s]: %v", scAddress, err)
