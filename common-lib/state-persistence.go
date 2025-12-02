@@ -1334,3 +1334,214 @@ func copyFileWithSync(src, dst string) error {
 	return destFile.Sync()
 }
 
+// ============================================================================
+// PUBLIC DEBUG API - Exported for SDK consumers to interrogate database state
+// ============================================================================
+
+// DumpDatabaseState returns the complete database state as a structured object.
+// This is the primary interrogation function for SDK consumers.
+// Returns nil and error if database is not initialized or in degraded mode.
+//
+// Example usage:
+//
+//	snapshot, err := commonlib.DumpDatabaseState()
+//	if err == nil {
+//	    jsonBytes, _ := json.MarshalIndent(snapshot, "", "  ")
+//	    fmt.Println(string(jsonBytes))
+//	}
+func DumpDatabaseState() (*DatabaseSnapshot, error) {
+	if GlobalStateManager == nil {
+		return nil, fmt.Errorf("state manager not initialized")
+	}
+
+	sm := GlobalStateManager
+	sm.degradedModeMutex.RLock()
+	if sm.degradedMode {
+		sm.degradedModeMutex.RUnlock()
+		return nil, fmt.Errorf("database in degraded mode")
+	}
+	sm.degradedModeMutex.RUnlock()
+
+	snapshot := &DatabaseSnapshot{
+		Peers:           make(map[string]*SerializedNodeBufferInfo),
+		Topics:          make(map[string]time.Time),
+		CachedPeerInfos: make(map[string]*CachedPeerInfo),
+		Stats:           sm.GetStats(),
+		ExportedAt:      time.Now(),
+	}
+
+	err := sm.db.View(func(tx *bolt.Tx) error {
+		// Load all peers
+		peersBucket := tx.Bucket([]byte(bucketPeers))
+		if peersBucket != nil {
+			peersBucket.ForEach(func(k, v []byte) error {
+				info, err := DeserializeNodeBufferInfo(v)
+				if err == nil {
+					snapshot.Peers[string(k)] = ToSerializedNodeBufferInfo(info)
+				}
+				return nil
+			})
+		}
+
+		// Load all topics
+		topicsBucket := tx.Bucket([]byte(bucketTopics))
+		if topicsBucket != nil {
+			topicsBucket.ForEach(func(k, v []byte) error {
+				if t, err := time.Parse(time.RFC3339Nano, string(v)); err == nil {
+					snapshot.Topics[string(k)] = t
+				}
+				return nil
+			})
+		}
+
+		// Load all cached peer infos
+		peerInfoCacheBucket := tx.Bucket([]byte(bucketPeerInfoCache))
+		if peerInfoCacheBucket != nil {
+			peerInfoCacheBucket.ForEach(func(k, v []byte) error {
+				key := string(k)
+				// Skip the peer list cache key
+				if key == peerListCacheKey {
+					return nil
+				}
+				info, err := DeserializeCachedPeerInfo(v)
+				if err == nil {
+					snapshot.CachedPeerInfos[key] = info
+				}
+				return nil
+			})
+		}
+
+		return nil
+	})
+
+	if err != nil {
+		return nil, err
+	}
+
+	// Try to load cached peer list (optional, non-fatal if missing)
+	if list, err := sm.LoadPeerList(); err == nil {
+		snapshot.CachedPeerList = list
+	}
+
+	return snapshot, nil
+}
+
+// GetDatabaseStats returns database statistics for monitoring.
+// Returns empty map with "error" key if state manager is not initialized.
+//
+// Example usage:
+//
+//	stats := commonlib.GetDatabaseStats()
+//	fmt.Printf("Writes dropped: %v\n", stats["writes_dropped"])
+func GetDatabaseStats() map[string]interface{} {
+	if GlobalStateManager == nil {
+		return map[string]interface{}{"error": "state manager not initialized"}
+	}
+	return GlobalStateManager.GetStats()
+}
+
+// GetAllPeerStates returns all persisted peer states keyed by peer ID string.
+// This is useful for iterating over all known peers and their cached data.
+//
+// Example usage:
+//
+//	peers, err := commonlib.GetAllPeerStates()
+//	for peerID, state := range peers {
+//	    fmt.Printf("Peer %s: SharedAccID=%d\n", peerID, state.SharedAccID)
+//	}
+func GetAllPeerStates() (map[string]*SerializedNodeBufferInfo, error) {
+	if GlobalStateManager == nil {
+		return nil, fmt.Errorf("state manager not initialized")
+	}
+
+	nodeBuffers, err := GlobalStateManager.LoadAllPeers()
+	if err != nil {
+		return nil, err
+	}
+
+	result := make(map[string]*SerializedNodeBufferInfo)
+	nodeBuffers.mu.RLock()
+	defer nodeBuffers.mu.RUnlock()
+
+	for peerID, info := range nodeBuffers.Buffers {
+		result[peerID.String()] = ToSerializedNodeBufferInfo(info)
+	}
+
+	return result, nil
+}
+
+// GetPeerStateByID returns the state for a specific peer given its string ID.
+// Returns nil and error if the peer is not found or state manager is not initialized.
+//
+// Example usage:
+//
+//	state, err := commonlib.GetPeerStateByID("16Uiu2HAmRweAijoix...")
+//	if err == nil {
+//	    fmt.Printf("SharedAccID: %d, IP: %s\n", state.SharedAccID, state.LastOtherSideMultiAddress)
+//	}
+func GetPeerStateByID(peerIDStr string) (*SerializedNodeBufferInfo, error) {
+	if GlobalStateManager == nil {
+		return nil, fmt.Errorf("state manager not initialized")
+	}
+
+	peerID, err := peer.Decode(peerIDStr)
+	if err != nil {
+		return nil, fmt.Errorf("invalid peer ID: %w", err)
+	}
+
+	info, err := GlobalStateManager.LoadPeer(peerID)
+	if err != nil {
+		return nil, err
+	}
+
+	return ToSerializedNodeBufferInfo(info), nil
+}
+
+// IsDatabaseHealthy returns true if the database is operational (not in degraded mode).
+// This is useful for health checks and monitoring.
+//
+// Example usage:
+//
+//	if !commonlib.IsDatabaseHealthy() {
+//	    log.Warn("Database in degraded mode!")
+//	}
+func IsDatabaseHealthy() bool {
+	if GlobalStateManager == nil {
+		return false
+	}
+	return !GlobalStateManager.IsInDegradedMode()
+}
+
+// GetInvoiceQueueStatus returns the status of the pending invoice queue.
+// This is useful for monitoring Hedera connectivity and queued payments.
+//
+// Example usage:
+//
+//	status := commonlib.GetInvoiceQueueStatus()
+//	fmt.Printf("Pending invoices: %d\n", status.Count)
+func GetInvoiceQueueStatus() InvoiceQueueStatus {
+	InvoiceQueueMutex.Lock()
+	defer InvoiceQueueMutex.Unlock()
+
+	status := InvoiceQueueStatus{
+		Count: len(PendingInvoices),
+	}
+
+	if len(PendingInvoices) > 0 {
+		// Find oldest and newest times
+		status.OldestTime = PendingInvoices[0].QueuedAt
+		status.NewestTime = PendingInvoices[0].QueuedAt
+
+		for _, inv := range PendingInvoices {
+			if inv.QueuedAt.Before(status.OldestTime) {
+				status.OldestTime = inv.QueuedAt
+			}
+			if inv.QueuedAt.After(status.NewestTime) {
+				status.NewestTime = inv.QueuedAt
+			}
+		}
+	}
+
+	return status
+}
+

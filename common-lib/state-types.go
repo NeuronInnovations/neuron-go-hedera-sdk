@@ -381,3 +381,52 @@ func deserializeCachedPeerListLegacy(data []byte) (*CachedPeerList, error) {
 func IsCacheStale(cachedAt time.Time, maxAge time.Duration) bool {
 	return time.Since(cachedAt) > maxAge
 }
+
+// ============================================================================
+// Database Interrogation Types - For SDK consumers to inspect database state
+// ============================================================================
+
+// DatabaseSnapshot represents a complete snapshot of the BBolt database state.
+// This is the primary type returned by DumpDatabaseState() for SDK consumers
+// to interrogate the running database.
+type DatabaseSnapshot struct {
+	Peers           map[string]*SerializedNodeBufferInfo `json:"peers"`
+	Topics          map[string]time.Time                 `json:"topics"`
+	CachedPeerList  *CachedPeerList                      `json:"cached_peer_list,omitempty"`
+	CachedPeerInfos map[string]*CachedPeerInfo           `json:"cached_peer_infos,omitempty"`
+	Stats           map[string]interface{}               `json:"stats"`
+	ExportedAt      time.Time                            `json:"exported_at"`
+}
+
+// InvoiceQueueStatus provides status information about the pending invoice queue.
+// This is useful for monitoring Hedera connectivity issues and queued payments.
+type InvoiceQueueStatus struct {
+	Count      int       `json:"count"`
+	OldestTime time.Time `json:"oldest_time,omitempty"`
+	NewestTime time.Time `json:"newest_time,omitempty"`
+}
+
+// ToSerializedNodeBufferInfo converts NodeBufferInfo to its exported serializable form.
+// This allows callers to get a clean JSON-serializable struct without needing to
+// understand the internal NodeBufferInfo structure.
+func ToSerializedNodeBufferInfo(info *NodeBufferInfo) *SerializedNodeBufferInfo {
+	if info == nil {
+		return nil
+	}
+	return &SerializedNodeBufferInfo{
+		LastOtherSideMultiAddress:      info.LastOtherSideMultiAddress,
+		LibP2PState:                    info.LibP2PState,
+		RendezvousState:                info.RendezvousState,
+		IsOtherSideValidAccount:        info.IsOtherSideValidAccount,
+		NoOfConnectionAttempts:         info.NoOfConnectionAttempts,
+		LastConnectionAttempt:          info.LastConnectionAttempt,
+		NextScheduledConnectionAttempt: info.NextScheduledConnectionAttempt,
+		RequestOrResponse:              info.RequestOrResponse,
+		NextScheduleRequestTime:        info.NextScheduleRequestTime,
+		LastGoodsReceivedTime:          info.LastGoodsReceivedTime,
+		SharedAccID:                    info.SharedAccID,
+		SharedAccIDCreatedAt:           info.SharedAccIDCreatedAt,
+		CacheReconnectAttempts:         info.CacheReconnectAttempts,
+		LastCacheReconnectTime:         info.LastCacheReconnectTime,
+	}
+}

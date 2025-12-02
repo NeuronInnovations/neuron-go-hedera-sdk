@@ -409,12 +409,15 @@ func SellerSendScheduledTransferRequest(
 	return nil
 }
 
-// isNetworkError checks if the error is a network-related error vs an account/validation error
+// isNetworkError checks if the error is a network-related error vs an account/validation error.
+// This includes detecting Cloudflare/RPC HTML error pages that indicate backend unavailability.
 func isNetworkError(err error) bool {
 	if err == nil {
 		return false
 	}
 	errStr := err.Error()
+	errStrLower := strings.ToLower(errStr)
+
 	// Network-related error patterns
 	networkPatterns := []string{
 		"connection refused",
@@ -425,16 +428,85 @@ func isNetworkError(err error) bool {
 		"no route to host",
 		"i/o timeout",
 		"context deadline exceeded",
-		"EOF",
-		"UNAVAILABLE",
-		"RESOURCE_EXHAUSTED",
+		"eof",
+		"unavailable",
+		"resource_exhausted",
 	}
+
+	// Cloudflare/RPC HTML error page patterns
+	// These are returned when hashio or similar RPC providers are down
+	htmlErrorPatterns := []string{
+		"<!doctype html>",       // HTML error page marker
+		"bad gateway",           // 502 error
+		"service temporarily",   // 503 error
+		"gateway timeout",       // 504 error
+		"cloudflare",            // Cloudflare proxy errors
+		"502:",                  // HTTP status code in error
+		"503:",                  // HTTP status code in error
+		"504:",                  // HTTP status code in error
+		"origin is unreachable", // Cloudflare 523
+		"connection timed out",  // Cloudflare 522
+		"web server is down",    // Cloudflare 521
+	}
+
 	for _, pattern := range networkPatterns {
-		if strings.Contains(strings.ToLower(errStr), strings.ToLower(pattern)) {
+		if strings.Contains(errStrLower, pattern) {
 			return true
 		}
 	}
+
+	for _, pattern := range htmlErrorPatterns {
+		if strings.Contains(errStrLower, pattern) {
+			return true
+		}
+	}
+
 	return false
+}
+
+// SanitizeRPCError converts verbose RPC errors (especially HTML error pages) into clean,
+// human-readable messages. This prevents log pollution from Cloudflare HTML responses.
+func SanitizeRPCError(err error) string {
+	if err == nil {
+		return ""
+	}
+
+	errStr := err.Error()
+	errStrLower := strings.ToLower(errStr)
+
+	// Detect and classify HTML error pages from Cloudflare/RPC providers
+	switch {
+	case strings.Contains(errStrLower, "502") && strings.Contains(errStrLower, "bad gateway"):
+		return "RPC unavailable (502 Bad Gateway - backend server down)"
+	case strings.Contains(errStrLower, "503") && strings.Contains(errStrLower, "service"):
+		return "RPC unavailable (503 Service Unavailable - backend overloaded)"
+	case strings.Contains(errStrLower, "504") && strings.Contains(errStrLower, "gateway"):
+		return "RPC unavailable (504 Gateway Timeout - backend not responding)"
+	case strings.Contains(errStrLower, "521") || strings.Contains(errStrLower, "web server is down"):
+		return "RPC unavailable (521 Web Server Down - origin offline)"
+	case strings.Contains(errStrLower, "522") || strings.Contains(errStrLower, "connection timed out"):
+		return "RPC unavailable (522 Connection Timed Out - origin unreachable)"
+	case strings.Contains(errStrLower, "523") || strings.Contains(errStrLower, "origin is unreachable"):
+		return "RPC unavailable (523 Origin Unreachable - DNS or routing issue)"
+	case strings.Contains(errStrLower, "<!doctype html>") || strings.Contains(errStrLower, "<html"):
+		// Generic HTML error page - extract what we can
+		if strings.Contains(errStrLower, "cloudflare") {
+			return "RPC unavailable (Cloudflare error page received)"
+		}
+		return "RPC unavailable (HTML error page received instead of JSON)"
+	case strings.Contains(errStrLower, "connection refused"):
+		return "RPC unavailable (connection refused - server not listening)"
+	case strings.Contains(errStrLower, "timeout") || strings.Contains(errStrLower, "context deadline exceeded"):
+		return "RPC unavailable (request timeout)"
+	case strings.Contains(errStrLower, "eof"):
+		return "RPC unavailable (connection closed unexpectedly)"
+	}
+
+	// For non-HTML errors, return as-is but truncate if too long
+	if len(errStr) > 200 {
+		return errStr[:200] + "... (truncated)"
+	}
+	return errStr
 }
 
 // queueInvoiceForLater adds an invoice to the pending queue

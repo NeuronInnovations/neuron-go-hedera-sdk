@@ -179,7 +179,7 @@ func GetPeerInfo(hederaAccEvmAddress string) (PeerInfo, error) {
 		return peerInfo, nil
 	}
 
-	log.Printf("⚠️ Blockchain query failed for %s: %v, attempting cache fallback", hederaAccEvmAddress, err)
+	log.Printf("⚠️ Blockchain query failed for %s: %s, attempting cache fallback", hederaAccEvmAddress, SanitizeRPCError(err))
 
 	// 2. Fallback to cached data
 	if commonlib.GlobalStateManager != nil {
@@ -232,14 +232,17 @@ func getPeerInfoFromBlockchain(hederaAccEvmAddress string, maxRetries int) (Peer
 			}
 			return peerInfo, nil
 		}
-		log.Printf("⚠️ Blockchain query attempt %d/%d failed [contract: %s]: %v", attempt, maxRetries, scAddress, err)
+		// Use sanitized error to avoid HTML page pollution in logs
+		sanitizedErr := SanitizeRPCError(err)
+		log.Printf("⚠️ Blockchain query attempt %d/%d failed [contract: %s]: %s", attempt, maxRetries, scAddress, sanitizedErr)
 		if attempt < maxRetries {
 			backoff := baseDelay * (1 << (attempt - 1)) // Exponential backoff: 1s, 2s, 4s
 			time.Sleep(backoff)
 		}
 	}
 
-	return peerInfo, fmt.Errorf("max retries exceeded getting peer info [contract: %s]: %v", scAddress, err)
+	// Return sanitized error message to prevent HTML pollution in error chains
+	return peerInfo, fmt.Errorf("max retries exceeded getting peer info [contract: %s]: %s", scAddress, SanitizeRPCError(err))
 }
 
 // getSmartContractAddress returns the smart contract address from flag or environment
@@ -267,7 +270,7 @@ func GetAllPeers() ([]string, error) {
 		return peers, nil
 	}
 
-	log.Printf("⚠️ Blockchain query for peer list failed: %v, attempting cache fallback", err)
+	log.Printf("⚠️ Blockchain query for peer list failed: %s, attempting cache fallback", SanitizeRPCError(err))
 
 	// 2. Fallback to cached data
 	if commonlib.GlobalStateManager != nil {
@@ -288,8 +291,8 @@ func GetAllPeers() ([]string, error) {
 		}
 	}
 
-	// 3. Both failed - return original blockchain error
-	return nil, fmt.Errorf("blockchain unavailable and no valid peer list cache: %w", err)
+	// 3. Both failed - return sanitized blockchain error
+	return nil, fmt.Errorf("blockchain unavailable and no valid peer list cache: %s", SanitizeRPCError(err))
 }
 
 // getAllPeersFromBlockchain queries the Hedera blockchain directly for the full peer list.

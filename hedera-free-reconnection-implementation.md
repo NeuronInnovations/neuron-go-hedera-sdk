@@ -409,16 +409,17 @@ for _, idx := range processedIndices {
 
 ## Files Modified
 
-| File                                                   | Changes                                                               |
-| ------------------------------------------------------ | --------------------------------------------------------------------- |
-| `common-lib/connection.go`                             | Added `AttemptReconnectFromCache`, `parseMultiaddr`, `splitAddresses` |
-| `common-lib/buffers.go`                                | Added invoice queue, cache reconnect tracking fields and methods      |
-| `common-lib/state-types.go`                            | Updated serialization for new fields                                  |
-| `types/connection.go`                                  | Added `ReconnectingFromCache` state                                   |
-| `neuron-sdk.go`                                        | Upgraded `DisconnectedF` handler                                      |
-| `dapp-protocols/stream-buyer-vs-seller/buyer-case.go`  | Added `tryReconnectFromBBolt`, optimized SharedAccID validation       |
-| `dapp-protocols/stream-buyer-vs-seller/seller-case.go` | Added `sellerTryReconnectFromBBolt`                                   |
-| `hedera/main.go`                                       | Added invoice queueing, network error detection, flush worker         |
+| File                                                   | Changes                                                                           |
+| ------------------------------------------------------ | --------------------------------------------------------------------------------- |
+| `common-lib/connection.go`                             | Added `AttemptReconnectFromCache`, `parseMultiaddr`, `splitAddresses`             |
+| `common-lib/buffers.go`                                | Added invoice queue, cache reconnect tracking fields and methods                  |
+| `common-lib/state-types.go`                            | Updated serialization for new fields                                              |
+| `types/connection.go`                                  | Added `ReconnectingFromCache` state                                               |
+| `neuron-sdk.go`                                        | Upgraded `DisconnectedF` handler                                                  |
+| `dapp-protocols/stream-buyer-vs-seller/buyer-case.go`  | Added `tryReconnectFromBBolt`, optimized SharedAccID validation                   |
+| `dapp-protocols/stream-buyer-vs-seller/seller-case.go` | Added `sellerTryReconnectFromBBolt`                                               |
+| `hedera/main.go`                                       | Added invoice queueing, network error detection, flush worker, `SanitizeRPCError` |
+| `hedera/rpc.go`                                        | Updated error logging to use sanitized errors, detect HTML error pages            |
 
 ---
 
@@ -438,6 +439,318 @@ The implementation maintains backward compatibility:
 1. **Serialization:** Legacy data without new fields deserializes correctly (zero values used)
 2. **Fallback:** If cached reconnection fails, existing Hedera-based reconnection continues to work
 3. **Degraded Mode:** If BBolt is unavailable, system operates as before
+
+---
+
+### 9. RPC Error Sanitization
+
+**File:** `hedera/main.go`
+
+When RPC providers like hashio experience backend issues, Cloudflare returns HTML error pages instead of JSON responses. These HTML pages pollute logs and make debugging difficult.
+
+#### isNetworkError Enhancement
+
+Extended to detect Cloudflare/RPC HTML error pages:
+
+```go
+func isNetworkError(err error) bool {
+    // Standard network patterns
+    networkPatterns := []string{
+        "connection refused", "timeout", "eof", "unavailable", ...
+    }
+
+    // Cloudflare/RPC HTML error page patterns
+    htmlErrorPatterns := []string{
+        "<!doctype html>",       // HTML error page marker
+        "bad gateway",           // 502 error
+        "service temporarily",   // 503 error
+        "gateway timeout",       // 504 error
+        "cloudflare",            // Cloudflare proxy errors
+        "502:", "503:", "504:",  // HTTP status codes
+        "origin is unreachable", // Cloudflare 523
+        "web server is down",    // Cloudflare 521
+    }
+    // ... check patterns ...
+}
+```
+
+#### SanitizeRPCError Function
+
+Converts verbose HTML error pages into clean, human-readable messages:
+
+```go
+func SanitizeRPCError(err error) string
+```
+
+| Error Type              | Sanitized Message                                                 |
+| ----------------------- | ----------------------------------------------------------------- |
+| 502 Bad Gateway + HTML  | "RPC unavailable (502 Bad Gateway - backend server down)"         |
+| 503 Service Unavailable | "RPC unavailable (503 Service Unavailable - backend overloaded)"  |
+| 504 Gateway Timeout     | "RPC unavailable (504 Gateway Timeout - backend not responding)"  |
+| Cloudflare 521          | "RPC unavailable (521 Web Server Down - origin offline)"          |
+| Cloudflare 522          | "RPC unavailable (522 Connection Timed Out - origin unreachable)" |
+| Cloudflare 523          | "RPC unavailable (523 Origin Unreachable - DNS or routing issue)" |
+| Generic HTML error      | "RPC unavailable (HTML error page received instead of JSON)"      |
+| Connection refused      | "RPC unavailable (connection refused - server not listening)"     |
+| Timeout                 | "RPC unavailable (request timeout)"                               |
+
+**File:** `hedera/rpc.go`
+
+All blockchain query error logs now use `SanitizeRPCError()`:
+
+```go
+// Before
+log.Printf("Blockchain query failed: %v", err)  // Dumps full HTML page
+
+// After
+log.Printf("Blockchain query failed: %s", SanitizeRPCError(err))  // Clean message
+```
+
+**Impact:**
+
+- Logs are now readable during RPC outages
+- HTML pollution eliminated from error chains
+- Network errors properly detected for cache fallback
+
+---
+
+### 10. Database Interrogation API
+
+**File:** `common-lib/state-types.go`, `common-lib/state-persistence.go`
+
+A public API for SDK consumers to interrogate the running BBolt database state without requiring HTTP/WebSocket wrappers.
+
+#### Types
+
+```go
+// DatabaseSnapshot represents a complete snapshot of the BBolt database state
+type DatabaseSnapshot struct {
+    Peers           map[string]*SerializedNodeBufferInfo `json:"peers"`
+    Topics          map[string]time.Time                 `json:"topics"`
+    CachedPeerList  *CachedPeerList                      `json:"cached_peer_list,omitempty"`
+    CachedPeerInfos map[string]*CachedPeerInfo           `json:"cached_peer_infos,omitempty"`
+    Stats           map[string]interface{}               `json:"stats"`
+    ExportedAt      time.Time                            `json:"exported_at"`
+}
+
+// InvoiceQueueStatus provides status of the pending invoice queue
+type InvoiceQueueStatus struct {
+    Count      int       `json:"count"`
+    OldestTime time.Time `json:"oldest_time,omitempty"`
+    NewestTime time.Time `json:"newest_time,omitempty"`
+}
+```
+
+#### Public Functions
+
+| Function                           | Purpose                                                                      |
+| ---------------------------------- | ---------------------------------------------------------------------------- |
+| `DumpDatabaseState()`              | Returns complete database snapshot (peers, topics, cached peer infos, stats) |
+| `GetDatabaseStats()`               | Returns database statistics for monitoring                                   |
+| `GetAllPeerStates()`               | Returns all persisted peer states keyed by peer ID                           |
+| `GetPeerStateByID(peerIDStr)`      | Returns state for a specific peer by ID string                               |
+| `IsDatabaseHealthy()`              | Health check - returns true if DB is operational                             |
+| `GetInvoiceQueueStatus()`          | Returns pending invoice queue status                                         |
+| `ToSerializedNodeBufferInfo(info)` | Converts NodeBufferInfo to serializable form                                 |
+
+---
+
+## Testing & Usage
+
+### How to Use the Database Interrogation API
+
+SDK consumers can interrogate the running BBolt database by importing the common-lib package:
+
+```go
+import commonlib "github.com/NeuronInnovations/neuron-go-hedera-sdk/common-lib"
+```
+
+#### 1. Full Database Dump
+
+Get a complete snapshot of all database state:
+
+```go
+snapshot, err := commonlib.DumpDatabaseState()
+if err != nil {
+    log.Printf("Failed to dump database: %v", err)
+    return
+}
+
+// Pretty-print as JSON
+jsonBytes, _ := json.MarshalIndent(snapshot, "", "  ")
+fmt.Println(string(jsonBytes))
+
+// Access specific data
+fmt.Printf("Total peers: %d\n", len(snapshot.Peers))
+fmt.Printf("Total topics: %d\n", len(snapshot.Topics))
+fmt.Printf("Exported at: %v\n", snapshot.ExportedAt)
+```
+
+#### 2. Quick Stats Check
+
+Monitor database health and performance:
+
+```go
+stats := commonlib.GetDatabaseStats()
+
+fmt.Printf("Degraded mode: %v\n", stats["degraded_mode"])
+fmt.Printf("Writes dropped: %v\n", stats["writes_dropped"])
+fmt.Printf("Corrupted records: %v\n", stats["corrupted_records_count"])
+fmt.Printf("Write queue length: %v\n", stats["write_queue_length"])
+fmt.Printf("Snapshot count: %v\n", stats["snapshot_count"])
+```
+
+#### 3. Query All Peers
+
+Iterate over all known peers and their cached data:
+
+```go
+peers, err := commonlib.GetAllPeerStates()
+if err != nil {
+    log.Printf("Failed to get peers: %v", err)
+    return
+}
+
+for peerID, state := range peers {
+    fmt.Printf("Peer: %s\n", peerID)
+    fmt.Printf("  SharedAccID: %d\n", state.SharedAccID)
+    fmt.Printf("  IP: %s\n", state.LastOtherSideMultiAddress)
+    fmt.Printf("  State: %s\n", state.LibP2PState)
+    fmt.Printf("  Cache reconnect attempts: %d\n", state.CacheReconnectAttempts)
+}
+```
+
+#### 4. Query Specific Peer
+
+Look up a specific peer by ID string:
+
+```go
+peerIDStr := "16Uiu2HAmRweAijoixB48FtgLGyrdMWxYXS1Zxf91T5dHt6ugGDMY"
+state, err := commonlib.GetPeerStateByID(peerIDStr)
+if err != nil {
+    log.Printf("Peer not found: %v", err)
+    return
+}
+
+fmt.Printf("SharedAccID: %d\n", state.SharedAccID)
+fmt.Printf("Last IP: %s\n", state.LastOtherSideMultiAddress)
+fmt.Printf("Last active: %v\n", state.LastGoodsReceivedTime)
+```
+
+#### 5. Health Check
+
+Check if the database is operational:
+
+```go
+if !commonlib.IsDatabaseHealthy() {
+    log.Warn("Database is in degraded mode!")
+    // Take appropriate action (e.g., alert, fallback behavior)
+}
+```
+
+#### 6. Monitor Invoice Queue
+
+Check the status of pending Hedera invoices:
+
+```go
+status := commonlib.GetInvoiceQueueStatus()
+
+fmt.Printf("Pending invoices: %d\n", status.Count)
+if status.Count > 0 {
+    fmt.Printf("Oldest queued: %v\n", status.OldestTime)
+    fmt.Printf("Newest queued: %v\n", status.NewestTime)
+
+    // Calculate queue age
+    queueAge := time.Since(status.OldestTime)
+    if queueAge > 10*time.Minute {
+        log.Warn("Hedera connectivity issue - invoices queued for %v", queueAge)
+    }
+}
+```
+
+### Integration Testing Example
+
+Create a simple test wrapper to verify the system is working:
+
+```go
+func TestDatabaseInterrogation(t *testing.T) {
+    // Prerequisite: SDK must be running with GlobalStateManager initialized
+
+    // Test 1: Health check
+    if !commonlib.IsDatabaseHealthy() {
+        t.Fatal("Database should be healthy")
+    }
+
+    // Test 2: Stats should return data
+    stats := commonlib.GetDatabaseStats()
+    if stats["error"] != nil {
+        t.Fatalf("Unexpected error: %v", stats["error"])
+    }
+
+    // Test 3: Dump should succeed
+    snapshot, err := commonlib.DumpDatabaseState()
+    if err != nil {
+        t.Fatalf("DumpDatabaseState failed: %v", err)
+    }
+
+    // Verify snapshot structure
+    if snapshot.ExportedAt.IsZero() {
+        t.Error("ExportedAt should be set")
+    }
+
+    // Test 4: Invoice queue should be accessible
+    status := commonlib.GetInvoiceQueueStatus()
+    if status.Count < 0 {
+        t.Error("Invoice count should be non-negative")
+    }
+
+    t.Logf("Database state: %d peers, %d topics, %d pending invoices",
+        len(snapshot.Peers), len(snapshot.Topics), status.Count)
+}
+```
+
+### Debugging Tips
+
+1. **Check persistence is working:**
+
+   ```go
+   stats := commonlib.GetDatabaseStats()
+   if stats["degraded_mode"].(bool) {
+       log.Error("Persistence is failing - check disk space and permissions")
+   }
+   ```
+
+2. **Verify SharedAccID caching:**
+
+   ```go
+   peers, _ := commonlib.GetAllPeerStates()
+   for id, p := range peers {
+       if p.SharedAccID > 0 && !p.SharedAccIDCreatedAt.IsZero() {
+           age := time.Since(p.SharedAccIDCreatedAt)
+           log.Printf("Peer %s: SharedAccID=%d (cached %v ago)", id, p.SharedAccID, age)
+       }
+   }
+   ```
+
+3. **Monitor reconnection attempts:**
+
+   ```go
+   peers, _ := commonlib.GetAllPeerStates()
+   for id, p := range peers {
+       if p.CacheReconnectAttempts > 0 {
+           log.Printf("Peer %s: %d cache reconnect attempts, last at %v",
+               id, p.CacheReconnectAttempts, p.LastCacheReconnectTime)
+       }
+   }
+   ```
+
+4. **Export full state for analysis:**
+   ```go
+   snapshot, _ := commonlib.DumpDatabaseState()
+   jsonBytes, _ := json.MarshalIndent(snapshot, "", "  ")
+   os.WriteFile("/tmp/neuron-db-snapshot.json", jsonBytes, 0644)
+   log.Printf("Database snapshot saved to /tmp/neuron-db-snapshot.json")
+   ```
 
 ---
 
