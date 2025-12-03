@@ -74,6 +74,37 @@ func createTempDB(t testing.TB) (*StateManager, func()) {
 	return sm, cleanup
 }
 
+// setupGlobalStateManager initializes GlobalStateManager for interrogation API tests.
+// This is used by interrogation_test.go and can be reused by other test files.
+// Returns a cleanup function that must be called to teardown.
+func setupGlobalStateManager(t *testing.T) func() {
+	sm, cleanup := createTempDB(t)
+	GlobalStateManager = sm
+	return func() {
+		GlobalStateManager = nil
+		cleanup()
+	}
+}
+
+// setupGlobalStateManagerWithPeers initializes GlobalStateManager and populates
+// it with the specified number of test peers. Returns the peer ID strings and cleanup.
+func setupGlobalStateManagerWithPeers(t *testing.T, peerCount int) ([]string, func()) {
+	cleanup := setupGlobalStateManager(t)
+
+	peerIDStrings := make([]string, peerCount)
+	for i := 0; i < peerCount; i++ {
+		peerID := generateTestPeerID(i)
+		info := createTestNodeBufferInfo(i)
+		GlobalStateManager.PersistPeer(peerID, info, true)
+		peerIDStrings[i] = peerID.String()
+	}
+
+	// Wait for writes to complete
+	time.Sleep(100 * time.Millisecond)
+
+	return peerIDStrings, cleanup
+}
+
 // =============================================================================
 // Serialization Benchmarks
 // =============================================================================
