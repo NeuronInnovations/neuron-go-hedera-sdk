@@ -147,19 +147,19 @@ func HandleBuyerCase(ctx context.Context, p2pHost host.Host, protocol protocol.I
 			if !validatorLib.IsRequestPermitted() {
 				return
 			}
-			// sign the schedule to release the money
-			hedera_helper.SignSchedule(sid, os.Getenv("private_key"))
-			// add more money to shared acount for next round.
-			// TODO: use the amount from the SLA
-			if !validatorLib.IsRequestPermitted() {
-				return
-			}
+			
+			// CRITICAL: Add money to shared account BEFORE signing schedule
+			// This ensures account always has balance when seller withdraws
 			sharedAcc, _ := hedera.AccountIDFromString(fmt.Sprintf("0.0.%d", scheduleSignRequest.SharedAccID))
-			fmt.Printf("adding 1 millibar (0.001 HBAR) to shared account for next round: %v\n", sharedAcc)
+			fmt.Printf("adding 1 millibar (0.001 HBAR) to shared account before signing schedule: %v\n", sharedAcc)
 			err = hedera_helper.DepositToSharedAccount(sharedAcc, 1)
 			if err != nil {
 				fmt.Println("SELFERROR:could not deposit to shared account ", err)
+				return // Don't sign if deposit fails
 			}
+			
+			// Now sign the schedule to release the money to seller
+			hedera_helper.SignSchedule(sid, os.Getenv("private_key"))
 		case "punchMeRequest":
 			// Handle punchMeRequest from seller for hole punching
 			handlePunchMeRequest(topicMessage, p2pHost, sellerBuffers, protocol)
