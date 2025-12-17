@@ -148,14 +148,29 @@ func HandleBuyerCase(ctx context.Context, p2pHost host.Host, protocol protocol.I
 				return
 			}
 			
-			// CRITICAL: Add money to shared account BEFORE signing schedule
-			// This ensures account always has balance when seller withdraws
+			// CRITICAL: Check balance and add money to shared account BEFORE signing schedule
+			// This ensures account always has at least 1 millibar when seller withdraws
 			sharedAcc, _ := hedera.AccountIDFromString(fmt.Sprintf("0.0.%d", scheduleSignRequest.SharedAccID))
-			fmt.Printf("adding 1 millibar (0.001 HBAR) to shared account before signing schedule: %v\n", sharedAcc)
-			err = hedera_helper.DepositToSharedAccount(sharedAcc, 1)
-			if err != nil {
-				fmt.Println("SELFERROR:could not deposit to shared account ", err)
-				return // Don't sign if deposit fails
+			
+			// Check current balance first
+			accountInfo, balErr := hedera_helper.GetAccountInfoFromNetwork(sharedAcc)
+			if balErr == nil {
+				currentBalance := accountInfo.Balance.As(hedera.HbarUnits.Millibar)
+				if currentBalance < 1.0 {
+					log.Printf("⚠️ SharedAccID %d has low balance (%.3f millibar), topping up before signing schedule", 
+						scheduleSignRequest.SharedAccID, currentBalance)
+					err = hedera_helper.DepositToSharedAccount(sharedAcc, 1)
+					if err != nil {
+						log.Printf("SELFERROR: could not deposit to shared account %v: %v", sharedAcc, err)
+						return // Don't sign if deposit fails
+					}
+					log.Printf("✅ Topped up SharedAccID %d to 1 millibar before signing", scheduleSignRequest.SharedAccID)
+				} else {
+					log.Printf("✅ SharedAccID %d already has sufficient balance (%.3f millibar), skipping top-up", 
+						scheduleSignRequest.SharedAccID, currentBalance)
+				}
+			} else {
+				log.Printf("⚠️ Could not check balance for SharedAccID %d: %v, skipping top-up", scheduleSignRequest.SharedAccID, balErr)
 			}
 			
 			// Now sign the schedule to release the money to seller

@@ -955,6 +955,12 @@ func DepositToSharedAccount(sharedAccountID hedera.AccountID, amount float64) er
 	
 	// Wait for transaction to reach consensus before returning
 	_, err = txResponse.GetReceipt(client)
+	
+	// Log spending for tracking
+	if err == nil {
+		log.Printf("💰 DEPOSIT TRACKED: %.0f millibar to SharedAccID %d", amount, sharedAccountID.Account)
+	}
+	
 	return err
 }
 
