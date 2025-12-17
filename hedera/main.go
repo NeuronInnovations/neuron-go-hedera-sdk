@@ -943,10 +943,18 @@ func GetAccountInfoFromNetwork(accountID hedera.AccountID) (hedera.AccountInfo, 
 func DepositToSharedAccount(sharedAccountID hedera.AccountID, amount float64) error {
 	client := GetHederaClientUsingEnv()
 	defer client.Close()
-	_, err := hedera.NewTransferTransaction().
-		AddHbarTransfer(client.GetOperatorAccountID(), hedera.HbarFrom(-amount, hedera.HbarUnits.Millibar)). // Send 3 HBAR
-		AddHbarTransfer(sharedAccountID, hedera.HbarFrom(amount, hedera.HbarUnits.Millibar)).                // Receive 3 HBAR
+	
+	txResponse, err := hedera.NewTransferTransaction().
+		AddHbarTransfer(client.GetOperatorAccountID(), hedera.HbarFrom(-amount, hedera.HbarUnits.Millibar)).
+		AddHbarTransfer(sharedAccountID, hedera.HbarFrom(amount, hedera.HbarUnits.Millibar)).
 		Execute(client)
+	
+	if err != nil {
+		return err
+	}
+	
+	// Wait for transaction to reach consensus before returning
+	_, err = txResponse.GetReceipt(client)
 	return err
 }
 

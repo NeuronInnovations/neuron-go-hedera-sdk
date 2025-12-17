@@ -747,6 +747,24 @@ func processSeller(seller Seller, p2pHost host.Host, sellerBuffers *commonlib.No
 				log.Printf("✅ Already connected to seller %s with persisted SharedAccID %d (from BBolt), will re-send service request to ensure seller is ready",
 					sellerEvnAddress, bufferInfo.SharedAccID)
 				
+				// CRITICAL: Check balance and top-up if needed before re-sending service request
+				sharedAccID := hedera.AccountID{Shard: 0, Realm: 0, Account: bufferInfo.SharedAccID}
+				accountInfo, balErr := hedera_helper.GetAccountInfoFromNetwork(sharedAccID)
+				if balErr == nil {
+					currentBalance := accountInfo.Balance.As(hedera.HbarUnits.Millibar)
+					if currentBalance < 1.0 {
+						log.Printf("⚠️ SharedAccID %d has low balance (%.3f millibar), topping up to 1 millibar", 
+							bufferInfo.SharedAccID, currentBalance)
+						if topUpErr := hedera_helper.DepositToSharedAccount(sharedAccID, 1); topUpErr != nil {
+							log.Printf("⚠️ Failed to top-up SharedAccID %d: %v", bufferInfo.SharedAccID, topUpErr)
+						} else {
+							log.Printf("✅ Topped up SharedAccID %d with 1 millibar", bufferInfo.SharedAccID)
+						}
+					} else {
+						log.Printf("✅ SharedAccID %d has sufficient balance: %.3f millibar", bufferInfo.SharedAccID, currentBalance)
+					}
+				}
+				
 				// Re-send service request with existing SharedAccID so seller updates buffer state
 				envelope, setupErr := prepareServiceRequestMsgWithOptionalAccount(seller.PublicKey, myReachableAddresses, bufferInfo.SharedAccID)
 				if setupErr != nil {
@@ -837,7 +855,7 @@ func processSeller(seller Seller, p2pHost host.Host, sellerBuffers *commonlib.No
 						} else {
 							// Cache is stale (> 24h), validate against blockchain
 							log.Printf("⏰ Cached SharedAccID %d is stale, validating against blockchain", loadedBuffer.SharedAccID)
-							if isValid, validErr := hedera_helper.ValidateSharedAccount(loadedBuffer.SharedAccID, 100); isValid {
+							if isValid, validErr := hedera_helper.ValidateSharedAccount(loadedBuffer.SharedAccID, 1); isValid {
 								existingSharedAccID = loadedBuffer.SharedAccID
 								log.Printf("🔄 Validated stale SharedAccID %d for seller %s", existingSharedAccID, sellerEvnAddress)
 							} else {
@@ -897,7 +915,7 @@ func processSeller(seller Seller, p2pHost host.Host, sellerBuffers *commonlib.No
 						existingSharedAccID, sellerEvnAddress)
 				} else {
 					// Cache is stale, validate against blockchain
-					if isValid, validErr := hedera_helper.ValidateSharedAccount(existingSharedAccID, 100); !isValid {
+					if isValid, validErr := hedera_helper.ValidateSharedAccount(existingSharedAccID, 1); !isValid {
 						log.Printf("⚠️ Stale SharedAccID %d is invalid (%v), creating new envelope", existingSharedAccID, validErr)
 						needNewEnvelope = true
 					} else {
