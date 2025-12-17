@@ -155,8 +155,8 @@ func HandleBuyerCase(ctx context.Context, p2pHost host.Host, protocol protocol.I
 				return
 			}
 			sharedAcc, _ := hedera.AccountIDFromString(fmt.Sprintf("0.0.%d", scheduleSignRequest.SharedAccID))
-			fmt.Println("adding money to shared account for next round:", sharedAcc)
-			err = hedera_helper.DepositToSharedAccount(sharedAcc, 100)
+			fmt.Printf("adding 1 millibar (0.001 HBAR) to shared account for next round: %v\n", sharedAcc)
+			err = hedera_helper.DepositToSharedAccount(sharedAcc, 1)
 			if err != nil {
 				fmt.Println("SELFERROR:could not deposit to shared account ", err)
 			}
@@ -665,7 +665,7 @@ func prepareServiceRequestMsgWithOptionalAccount(seller string, myReachableAddre
 		os.Getenv("hedera_evm_id"),
 		keylib.ConverHederaPublicKeyToEthereunAddress(seller),
 		"e2436b1e019e993215e832762f9242020d199940",
-		100, // 100 milli hbar
+		1, // 1 milli hbar
 		existingSharedAccID,
 	)
 
@@ -744,9 +744,9 @@ func processSeller(seller Seller, p2pHost host.Host, sellerBuffers *commonlib.No
 			hasSharedAccID := bufferExists && bufferInfo.SharedAccID > 0
 
 			if hasSharedAccID {
-				log.Printf("✅ Already connected to seller %s with persisted SharedAccID %d (from BBolt), skipping Hedera query",
+				log.Printf("✅ Already connected to seller %s with persisted SharedAccID %d (from BBolt), will re-send service request to ensure seller is ready",
 					sellerEvnAddress, bufferInfo.SharedAccID)
-				return
+				// Don't return - continue to send service request to seller so they update their buffer state
 			} else {
 				// Connected via hole punching but no SharedAccID yet - create it asynchronously
 				log.Printf("⚠️ Connected to seller %s but no SharedAccID - creating asynchronously for future cost savings", sellerEvnAddress)

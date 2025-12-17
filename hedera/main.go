@@ -306,6 +306,10 @@ func SellerSendScheduledTransferRequest(
 	toHederaDeviceID hedera.AccountID, // move money into here, that's the device
 	buyerStdIn hedera.TopicID, // inform buyer that a schedule is up for counter signing
 ) error {
+	arbiterAccountID, err := hedera.AccountIDFromEvmAddress(0, 0, "e2436b1e019e993215e832762f9242020d199940")
+	if err != nil {
+		return fmt.Errorf("failed to get arbiter account: %w", err)
+	}
 	client := GetHederaClientUsingEnv()
 	defer client.Close()
 
@@ -324,14 +328,15 @@ func SellerSendScheduledTransferRequest(
 	totalAmount := accountInfo.Balance.As(hedera.HbarUnits.Millibar)
 	log.Printf("Shared account balance: %f millibar", totalAmount)
 
-	// Move the entire amount out of the shared account with 60/40 split
-	sixtyPercent := float64(totalAmount) * 0.6
-	fortyPercent := float64(totalAmount) * 0.4
+	// Move the entire amount out of the shared account with 98/1/1 split
+	ninetyEightPercent := float64(totalAmount) * 0.98
+	onePercent := float64(totalAmount) * 0.01
 
 	transferTx, err := hedera.NewTransferTransaction().
 		AddHbarTransfer(sharedAccID, hedera.HbarFrom(-float64(totalAmount), hedera.HbarUnits.Millibar)).
-		AddHbarTransfer(toHederaParentID, hedera.HbarFrom(sixtyPercent, hedera.HbarUnits.Millibar)). // 60% of total
-		AddHbarTransfer(toHederaDeviceID, hedera.HbarFrom(fortyPercent, hedera.HbarUnits.Millibar)). // 40% of total
+		AddHbarTransfer(toHederaDeviceID, hedera.HbarFrom(ninetyEightPercent, hedera.HbarUnits.Millibar)). // 98% of total
+		AddHbarTransfer(toHederaParentID, hedera.HbarFrom(onePercent, hedera.HbarUnits.Millibar)).          // 1% of total
+		AddHbarTransfer(arbiterAccountID, hedera.HbarFrom(onePercent, hedera.HbarUnits.Millibar)).          // 1% of total
 		SetTransactionMemo(uuid.New().String()).
 		FreezeWith(client)
 

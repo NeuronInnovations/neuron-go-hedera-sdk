@@ -244,16 +244,16 @@ func HandleSellerCase(ctx context.Context, p2pHost host.Host, protocol protocol.
 
 				// TODO: check what it says in the SLA
 				validatorLib.IsRequestPermitted()
-				if !validatorLib.IsRequestPermitted() {
-					log.Println("NACK: Ignore message as it is not match the SLA") // TODO: send to the other side
-					return
-				}
+			if !validatorLib.IsRequestPermitted() {
+				log.Println("NACK: Ignore message as it is not match the SLA") // TODO: send to the other side
+				return
+			}
 
-				if buyerSharedAccountInfo.Balance.AsTinybar() < 100 {
-					hedera_helper.PeerSendErrorMessage(otherSideStdIn, types.BalanceError, "Your balance is too low, but I will serve you anyway", types.DoNothing)
-				}
+			if buyerSharedAccountInfo.Balance.AsTinybar() < 100000 {
+				hedera_helper.PeerSendErrorMessage(otherSideStdIn, types.BalanceError, "Your balance is too low, but I will serve you anyway", types.DoNothing)
+			}
 
-				otherPublicKey := requestMsgFromOtherSide.PublicKey
+			otherPublicKey := requestMsgFromOtherSide.PublicKey
 				// Convert other peer's public key to peer ID
 				otherPeerIDStr, err := keylib.ConvertHederaPublicKeyToPeerID(otherPublicKey)
 				if err != nil {
