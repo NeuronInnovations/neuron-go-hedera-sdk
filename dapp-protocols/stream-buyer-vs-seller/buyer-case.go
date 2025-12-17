@@ -746,7 +746,20 @@ func processSeller(seller Seller, p2pHost host.Host, sellerBuffers *commonlib.No
 			if hasSharedAccID {
 				log.Printf("✅ Already connected to seller %s with persisted SharedAccID %d (from BBolt), will re-send service request to ensure seller is ready",
 					sellerEvnAddress, bufferInfo.SharedAccID)
-				// Don't return - continue to send service request to seller so they update their buffer state
+				
+				// Re-send service request with existing SharedAccID so seller updates buffer state
+				envelope, setupErr := prepareServiceRequestMsgWithOptionalAccount(seller.PublicKey, myReachableAddresses, bufferInfo.SharedAccID)
+				if setupErr != nil {
+					log.Printf("⚠️ Failed to prepare service request for %s: %v", sellerEvnAddress, setupErr)
+					return
+				}
+				
+				if execErr := hedera_helper.SendTransactionEnvelope(envelope); execErr != nil {
+					log.Printf("⚠️ Failed to send service request for %s: %v", sellerEvnAddress, execErr)
+				} else {
+					log.Printf("📤 Re-sent service request to seller %s with SharedAccID %d", sellerEvnAddress, bufferInfo.SharedAccID)
+				}
+				return
 			} else {
 				// Connected via hole punching but no SharedAccID yet - create it asynchronously
 				log.Printf("⚠️ Connected to seller %s but no SharedAccID - creating asynchronously for future cost savings", sellerEvnAddress)
