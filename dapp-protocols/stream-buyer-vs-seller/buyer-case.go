@@ -38,6 +38,9 @@ import (
 	"golang.org/x/time/rate"
 )
 
+// Global callback for tracking deposits (set by main.go)
+var OnDepositCallback func(millibar int64)
+
 type Seller struct {
 	PublicKey string
 	Lat       float64
@@ -165,6 +168,9 @@ func HandleBuyerCase(ctx context.Context, p2pHost host.Host, protocol protocol.I
 						return // Don't sign if deposit fails
 					}
 					log.Printf("✅ Topped up SharedAccID %d to 1 millibar before signing", scheduleSignRequest.SharedAccID)
+					if OnDepositCallback != nil {
+						OnDepositCallback(1)
+					}
 				} else {
 					log.Printf("✅ SharedAccID %d already has sufficient balance (%.3f millibar), skipping top-up", 
 						scheduleSignRequest.SharedAccID, currentBalance)
@@ -774,6 +780,9 @@ func processSeller(seller Seller, p2pHost host.Host, sellerBuffers *commonlib.No
 							log.Printf("⚠️ Failed to top-up SharedAccID %d: %v", bufferInfo.SharedAccID, topUpErr)
 						} else {
 							log.Printf("✅ Topped up SharedAccID %d with 1 millibar", bufferInfo.SharedAccID)
+							if OnDepositCallback != nil {
+								OnDepositCallback(1)
+							}
 						}
 					} else {
 						log.Printf("✅ SharedAccID %d has sufficient balance: %.3f millibar", bufferInfo.SharedAccID, currentBalance)
