@@ -14,22 +14,26 @@ import (
 	"github.com/multiformats/go-multiaddr"
 )
 
-// Package-level variable for the BoltDB instance
-//var db *bbolt.DB
-
 // Package-level variable for the NodeBuffers instance
 var NodeBuffersInstance *NodeBuffers
 
-// Initialize the database in the package init function
+// StateManagerInit initializes the state manager including BBolt database for shared account caching
 func StateManagerInit(buyerOrSellerFlag string, clearCacheFlag bool) {
-
 	NodeBuffersInstance = NewNodeBuffers()
 
-	// Dump database to JSON for debugging
-	//if err := NodeBuffersInstance.dumpToJSON(fmt.Sprintf("neuron-connections-startup-%s.json", buyerOrSellerFlag)); err != nil {
-	//	log.Printf("Warning: Failed to dump database to JSON: %v", err)
-	//}
+	// Initialize BBolt database for shared account caching (graceful degradation if fails)
+	if err := OpenSharedAccountDB(); err != nil {
+		log.Printf("Warning: Failed to open shared account cache: %v", err)
+		log.Printf("Continuing without persistence - new shared accounts will be created each time")
+		// Continue without persistence - graceful degradation per design
+	}
 
+	// Clear cache if flag set
+	if clearCacheFlag && IsSharedAccountDBOpen() {
+		if err := ClearSharedAccountCache(); err != nil {
+			log.Printf("Warning: Failed to clear shared account cache: %v", err)
+		}
+	}
 }
 
 type NodeBuffers struct {
