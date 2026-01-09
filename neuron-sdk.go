@@ -296,8 +296,14 @@ func LaunchSDK(
 
 	<-keyboardCancelChannel
 
-	fmt.Println("Received keyboard signal, shutting  down the libp2p node ...")
-	// shut the node down
+	fmt.Println("Received keyboard signal, shutting down the node...")
+
+	// Close the shared account cache database
+	if err := commonlib.CloseSharedAccountDB(); err != nil {
+		log.Printf("Warning: Error closing shared account cache: %v", err)
+	}
+
+	// Shut down the libp2p node
 	if err := p2pHost.Close(); err != nil {
 		panic(err)
 	}

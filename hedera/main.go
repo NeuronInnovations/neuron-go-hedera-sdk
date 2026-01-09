@@ -203,24 +203,53 @@ func BuyerPrepareServiceRequest(
 		return nil, err
 	}
 
-	// create a shared account and deposit the payment the sensor wants.
-
-	sharedAccTx, err := createSharedAccount(fromHederaPupblicKeyEnc, toHederaPublicKeyEnc, arbiterHederaKeyEnc, amount)
-	if err != nil {
-		return nil, fmt.Errorf("error preparing a shared account: %v", err)
+	// Check cache for existing shared account before creating a new one
+	var sharedAccID hedera.AccountID
+	cachedAccount, cacheErr := commonlib.LoadSharedAccount(fromEthAddress, toEthAddress, arbiterEthAddress)
+	if cacheErr == nil && cachedAccount.SharedAccID != 0 {
+		// Validate the cached account still exists on Hedera (free mirror query)
+		cachedAccID := hedera.AccountID{Shard: 0, Realm: 0, Account: cachedAccount.SharedAccID}
+		if _, validationErr := GetAccountInfoFromMirror(cachedAccID); validationErr == nil {
+			// Cached account is valid, reuse it
+			sharedAccID = cachedAccID
+			log.Printf("Reusing cached shared account %d for seller %s (saved HBAR!)", sharedAccID.Account, toEthAddress)
+		} else {
+			log.Printf("Cached shared account %d no longer valid, creating new one", cachedAccount.SharedAccID)
+			cachedAccount = nil // Force new account creation
+		}
 	}
-	sharedAccTxResponse, err :=
-		sharedAccTx.SetMaxBackoff(time.Second * 5).SetMaxRetry(10).Execute(client)
 
-	if err != nil {
-		return nil, fmt.Errorf("error creating a shared account: %v", err)
-	}
-	sharedAccTxReceipt, err := sharedAccTxResponse.GetReceipt(client)
-	if err != nil {
-		return nil, err
+	// Create new shared account if no valid cached one exists
+	if sharedAccID.Account == 0 {
+		sharedAccTx, err := createSharedAccount(fromHederaPupblicKeyEnc, toHederaPublicKeyEnc, arbiterHederaKeyEnc, amount)
+		if err != nil {
+			return nil, fmt.Errorf("error preparing a shared account: %v", err)
+		}
+		sharedAccTxResponse, err :=
+			sharedAccTx.SetMaxBackoff(time.Second * 5).SetMaxRetry(10).Execute(client)
 
+		if err != nil {
+			return nil, fmt.Errorf("error creating a shared account: %v", err)
+		}
+		sharedAccTxReceipt, err := sharedAccTxResponse.GetReceipt(client)
+		if err != nil {
+			return nil, err
+		}
+		sharedAccID = *sharedAccTxReceipt.AccountID
+		log.Printf("Created new shared account %d for seller %s", sharedAccID.Account, toEthAddress)
+
+		// Cache the newly created shared account for future use
+		saveErr := commonlib.SaveSharedAccount(&commonlib.SharedAccountRecord{
+			BuyerEthAddress:   fromEthAddress,
+			SellerEthAddress:  toEthAddress,
+			ArbiterEthAddress: arbiterEthAddress,
+			SharedAccID:       sharedAccID.Account,
+		})
+		if saveErr != nil {
+			log.Printf("Warning: Failed to cache shared account: %v", saveErr)
+			// Continue without caching - graceful degradation
+		}
 	}
-	sharedAccID := *sharedAccTxReceipt.AccountID
 	fmt.Printf("shared account id: %v\n", sharedAccID)
 	serialized := fmt.Sprintf("%s", fromP2pPublicAddresses)
 	fmt.Printf("Sending serialized multiaddr: %s to seller %s \n", serialized, toEthAddress)
@@ -264,10 +293,12 @@ func SellerSendScheduledTransferRequest(
 	client := GetHederaClientUsingEnv()
 	defer client.Close()
 
+	// Payment split: Device gets 90%, Parent gets 10%
+	// Total: 0.001 HBAR (100,000 tinybars) - minimal amount per transaction
 	transferTx, err := hedera.NewTransferTransaction().
-		AddHbarTransfer(sharedAccID, hedera.HbarFrom(-0.1, hedera.HbarUnits.Hbar)).
-		AddHbarTransfer(toHederaParentID, hedera.HbarFrom(0.01, hedera.HbarUnits.Hbar)).
-		AddHbarTransfer(toHederaDeviceID, hedera.HbarFrom(0.09, hedera.HbarUnits.Hbar)).
+		AddHbarTransfer(sharedAccID, hedera.HbarFrom(-0.001, hedera.HbarUnits.Hbar)).
+		AddHbarTransfer(toHederaParentID, hedera.HbarFrom(0.0001, hedera.HbarUnits.Hbar)).
+		AddHbarTransfer(toHederaDeviceID, hedera.HbarFrom(0.0009, hedera.HbarUnits.Hbar)).
 		// TODO: AddTokenTransfer() transfer tokens to  other fee and reward accounts.
 		SetTransactionMemo(uuid.New().String()).
 		FreezeWith(client)
