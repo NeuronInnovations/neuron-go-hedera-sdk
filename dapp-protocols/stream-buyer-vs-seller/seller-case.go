@@ -171,7 +171,7 @@ func HandleSellerCase(ctx context.Context, p2pHost host.Host, protocol protocol.
 					return
 				}
 
-				if buyerSharedAccountInfo.Balance.AsTinybar() < 1_000_000 { // 0.01 HBAR threshold (was 1 HBAR)
+				if buyerSharedAccountInfo.Balance.AsTinybar() < 10_000_000 { // 0.1 HBAR threshold
 					hedera_helper.PeerSendErrorMessage(otherSideStdIn, commonlib.BalanceError, "Your balance is too low, but I will serve you anyway", commonlib.DoNothing)
 				}
 
