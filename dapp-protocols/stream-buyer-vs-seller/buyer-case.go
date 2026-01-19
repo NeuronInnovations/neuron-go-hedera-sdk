@@ -145,14 +145,14 @@ func HandleBuyerCase(ctx context.Context, p2pHost host.Host, buyerCase func(ctx 
 			// Check balance before depositing - only top up if balance is low
 			// Use GetAccountInfoFromNetwork to get proper Hedera balance type
 			accountInfo, balErr := hedera_helper.GetAccountInfoFromNetwork(sharedAcc)
-			if balErr == nil && accountInfo.Balance.AsTinybar() >= 1_000_000 {
-				// Balance is sufficient (>= 0.01 HBAR), skip deposit
+			if balErr == nil && accountInfo.Balance.AsTinybar() >= 10_000_000 {
+				// Balance is sufficient (>= 0.1 HBAR), skip deposit
 				fmt.Printf("Shared account %s has sufficient balance (%d tinybars), skipping deposit\n",
 					sharedAcc, accountInfo.Balance.AsTinybar())
 			} else {
-				// Balance is low or couldn't check, deposit minimal amount
-				fmt.Println("Adding minimal funds to shared account:", sharedAcc)
-				err = hedera_helper.DepositToSharedAccount(sharedAcc, 0.01) // 0.01 HBAR instead of 1 HBAR
+				// Balance is low or couldn't check, deposit amount
+				fmt.Println("Adding funds to shared account:", sharedAcc)
+				err = hedera_helper.DepositToSharedAccount(sharedAcc, 0.1) // 0.1 HBAR refill
 				if err != nil {
 					fmt.Println("SELFERROR: could not deposit to shared account ", err)
 				}
@@ -381,7 +381,7 @@ func prepareServiceRequestMsg(seller string, myReachableAddresses []multiaddr.Mu
 		os.Getenv("hedera_evm_id"),
 		keylib.ConverHederaPublicKeyToEthereunAddress(seller),
 		"e2436b1e019e993215e832762f9242020d199940", // that's the london address, yes; it's fixed for now but a parameter in env MyArbiterPublicKey in the future.
-		10, // millibar (0.01 HBAR) - minimal initial balance, will be refilled if needed
+		100, // millibar (0.1 HBAR) - initial balance
 	)
 	if err != nil {
 		return commonlib.TopicPostalEnvelope{}, err

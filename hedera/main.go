@@ -294,11 +294,11 @@ func SellerSendScheduledTransferRequest(
 	defer client.Close()
 
 	// Payment split: Device gets 90%, Parent gets 10%
-	// Total: 0.001 HBAR (100,000 tinybars) - minimal amount per transaction
+	// Total: 0.1 HBAR (10,000,000 tinybars)
 	transferTx, err := hedera.NewTransferTransaction().
-		AddHbarTransfer(sharedAccID, hedera.HbarFrom(-0.001, hedera.HbarUnits.Hbar)).
-		AddHbarTransfer(toHederaParentID, hedera.HbarFrom(0.0001, hedera.HbarUnits.Hbar)).
-		AddHbarTransfer(toHederaDeviceID, hedera.HbarFrom(0.0009, hedera.HbarUnits.Hbar)).
+		AddHbarTransfer(sharedAccID, hedera.HbarFrom(-0.1, hedera.HbarUnits.Hbar)).
+		AddHbarTransfer(toHederaParentID, hedera.HbarFrom(0.01, hedera.HbarUnits.Hbar)).
+		AddHbarTransfer(toHederaDeviceID, hedera.HbarFrom(0.09, hedera.HbarUnits.Hbar)).
 		// TODO: AddTokenTransfer() transfer tokens to  other fee and reward accounts.
 		SetTransactionMemo(uuid.New().String()).
 		FreezeWith(client)
