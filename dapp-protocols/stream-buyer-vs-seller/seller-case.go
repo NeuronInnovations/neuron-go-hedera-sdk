@@ -199,6 +199,10 @@ func HandleSellerCase(ctx context.Context, p2pHost host.Host, protocol protocol.
 				if decodeErr != nil {
 					log.Panic(decodeErr)
 				}
+				
+				// Register the public key -> peer ID mapping for log correlation
+				commonlib.RegisterPeerPublicKey(addrInfo.ID, otherPublicKey)
+				
 				initiationError := commonlib.InitialConnect(ctx, p2pHost, *addrInfo, buyerBuffers, protocol)
 				if initiationError != nil {
 					hedera_helper.PeerSendErrorMessage(otherSideStdIn, commonlib.DialError, fmt.Sprintf("I tried to initialise a connection but got this error: %v", initiationError.Error()), commonlib.PunchMe)
@@ -219,6 +223,40 @@ func HandleSellerCase(ctx context.Context, p2pHost host.Host, protocol protocol.
 					return
 				}
 				switch buyerError.ErrorType {
+				case commonlib.ServiceError:
+					// Buyer says they're not getting data - check our connection and try to reconnect
+					if buyerError.PublicKey == "" {
+						log.Println("ServiceError received but no public key provided")
+						return
+					}
+					
+					otherPeerIDStr := keylib.ConvertHederaPublicKeyToPeerID(buyerError.PublicKey)
+					otherPeerID, decodeErr := peer.Decode(otherPeerIDStr)
+					if decodeErr != nil {
+						log.Printf("Could not decode peer ID from public key: %v", decodeErr)
+						return
+					}
+					
+					// Register public key for log correlation
+					commonlib.RegisterPeerPublicKey(otherPeerID, buyerError.PublicKey)
+					
+					bufferInfo, exists := buyerBuffers.GetBuffer(otherPeerID)
+					if !exists {
+						log.Printf("Received ServiceError from unknown peer %s - they need to send a fresh service request", otherPeerID.ShortString())
+						return
+					}
+					
+					// Mark as needing reconnection and attempt it
+					log.Printf("🔄 Buyer %s reports no goods received - checking connection and attempting reconnect", otherPeerID.ShortString())
+					buyerBuffers.UpdateBufferLibP2PState(otherPeerID, commonlib.Reconnecting)
+					
+					reconnectErr := commonlib.ReconnectPeersIfNeeded(ctx, p2pHost, otherPeerID, bufferInfo, buyerBuffers, protocol)
+					if reconnectErr != nil {
+						log.Printf("Reconnect attempt for %s after ServiceError: %v", otherPeerID.ShortString(), reconnectErr)
+					} else {
+						log.Printf("✓ Reconnected to %s after ServiceError", otherPeerID.ShortString())
+					}
+					
 				case commonlib.DialError:
 				case commonlib.FlushError:
 				case commonlib.DisconnectedError:
@@ -229,7 +267,6 @@ func HandleSellerCase(ctx context.Context, p2pHost host.Host, protocol protocol.
 				case commonlib.WriteError:
 				case commonlib.StreamError:
 				case commonlib.IpDecryptionError:
-				case commonlib.ServiceError:
 				default:
 					fmt.Println("Unknown error type: ", buyerError.ErrorType)
 					//TODO: penalize message sender.
