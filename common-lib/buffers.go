@@ -105,6 +105,15 @@ type NodeBufferInfo struct {
 	RequestOrResponse              TopicPostalEnvelope `json:"request_or_response"`
 	NextScheduleRequestTime        time.Time           `json:"next_schedule_request_time"`
 	LastGoodsReceivedTime          time.Time           `json:"last_goods_received_time"`
+	PeerPublicKey                  string              `json:"peer_public_key"` // The peer's public key from Hedera (for log correlation)
+}
+
+// ShortPublicKey returns the last 8 characters of the public key for logging
+func (n *NodeBufferInfo) ShortPublicKey() string {
+	if len(n.PeerPublicKey) >= 8 {
+		return n.PeerPublicKey[len(n.PeerPublicKey)-8:]
+	}
+	return n.PeerPublicKey
 }
 
 func (sb *NodeBuffers) SetStreamHandler(sellerID peer.ID, streamHandler *network.Stream) {
@@ -273,6 +282,27 @@ func (bb *NodeBuffers) SetLastGoodsReceivedTime(buyerID peer.ID) {
 		info.LastGoodsReceivedTime = time.Now()
 
 	}
+}
+
+// SetPeerPublicKey stores the peer's public key for log correlation
+func (bb *NodeBuffers) SetPeerPublicKey(peerID peer.ID, publicKey string) {
+	bb.mu.Lock()
+	defer bb.mu.Unlock()
+	info, exists := bb.Buffers[peerID]
+	if exists {
+		info.PeerPublicKey = publicKey
+	}
+}
+
+// GetPeerPublicKey returns the peer's public key (short version for logging)
+func (bb *NodeBuffers) GetPeerPublicKeyShort(peerID peer.ID) string {
+	bb.mu.Lock()
+	defer bb.mu.Unlock()
+	info, exists := bb.Buffers[peerID]
+	if !exists || len(info.PeerPublicKey) < 8 {
+		return ""
+	}
+	return info.PeerPublicKey[len(info.PeerPublicKey)-8:]
 }
 
 // dumpToJSON dumps the contents of the NodeBuffers to a JSON file for debugging.
