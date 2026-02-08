@@ -213,12 +213,12 @@ var RemoteClosed = fmt.Errorf("remote peer closed connection")
 
 // WriteStats tracks write statistics per peer for debugging
 type WriteStats struct {
-	mu                sync.Mutex
-	droppedFrames     map[peer.ID]uint64
-	successfulWrites  map[peer.ID]uint64
-	lastLogTime       map[peer.ID]time.Time
-	lastSuccessful    map[peer.ID]uint64 // Track last logged successful count for rate calculation
-	peerPublicKeys    map[peer.ID]string // Short public key for log correlation
+	mu               sync.Mutex
+	droppedFrames    map[peer.ID]uint64
+	successfulWrites map[peer.ID]uint64
+	lastLogTime      map[peer.ID]time.Time
+	lastSuccessful   map[peer.ID]uint64 // Track last logged successful count for rate calculation
+	peerPublicKeys   map[peer.ID]string // Short public key for log correlation
 }
 
 var globalWriteStats = &WriteStats{
@@ -227,6 +227,62 @@ var globalWriteStats = &WriteStats{
 	lastLogTime:      make(map[peer.ID]time.Time),
 	lastSuccessful:   make(map[peer.ID]uint64),
 	peerPublicKeys:   make(map[peer.ID]string),
+}
+
+// Per-peer write queues to avoid goroutine explosion under high frame rates.
+// Bounded queues drop frames instead of adding latency.
+const peerWriteQueueSize = 300
+
+type peerWriteQueue struct {
+	ch   chan []byte
+	done chan struct{}
+}
+
+var peerWriteQueues = struct {
+	mu sync.Mutex
+	m  map[peer.ID]*peerWriteQueue
+}{
+	m: make(map[peer.ID]*peerWriteQueue),
+}
+
+func ensurePeerWriteQueue(peerID peer.ID, buffers *NodeBuffers) *peerWriteQueue {
+	peerWriteQueues.mu.Lock()
+	defer peerWriteQueues.mu.Unlock()
+	if q, ok := peerWriteQueues.m[peerID]; ok {
+		return q
+	}
+	q := &peerWriteQueue{ch: make(chan []byte, peerWriteQueueSize), done: make(chan struct{})}
+	peerWriteQueues.m[peerID] = q
+	go func() {
+		for {
+			select {
+			case data := <-q.ch:
+				info, exists := buffers.GetBuffer(peerID)
+				if !exists {
+					continue
+				}
+				if info.LibP2PState != Connected {
+					continue
+				}
+				_ = WriteAndFlushBuffer(info, peerID, buffers, data)
+			case <-q.done:
+				return
+			}
+		}
+	}()
+	return q
+}
+
+func stopPeerWriteQueue(peerID peer.ID) {
+	peerWriteQueues.mu.Lock()
+	q, ok := peerWriteQueues.m[peerID]
+	if ok {
+		delete(peerWriteQueues.m, peerID)
+	}
+	peerWriteQueues.mu.Unlock()
+	if ok {
+		close(q.done)
+	}
 }
 
 // SetPeerPublicKey stores the short public key for a peer (for log correlation)
@@ -262,25 +318,25 @@ func (ws *WriteStats) logStats(peerID peer.ID) {
 		dropped := ws.droppedFrames[peerID]
 		successful := ws.successfulWrites[peerID]
 		lastSuccessful := ws.lastSuccessful[peerID]
-		
+
 		// Calculate frames per second since last log
 		elapsed := time.Since(ws.lastLogTime[peerID]).Seconds()
 		fps := float64(successful-lastSuccessful) / elapsed
-		
+
 		var dropRate float64
 		if dropped+successful > 0 {
 			dropRate = float64(dropped) / float64(dropped+successful) * 100
 		}
-		
+
 		label := ws.peerLabel(peerID)
 		if dropped > 0 {
-			log.Printf("📊 %s: %d sent, %d dropped (%.1f%% drop), %.0f fps", 
+			log.Printf("📊 %s: %d sent, %d dropped (%.1f%% drop), %.0f fps",
 				label, successful, dropped, dropRate, fps)
 		} else {
-			log.Printf("📊 %s: %d sent, 0 dropped, %.0f fps ✓", 
+			log.Printf("📊 %s: %d sent, 0 dropped, %.0f fps ✓",
 				label, successful, fps)
 		}
-		
+
 		ws.lastLogTime[peerID] = time.Now()
 		ws.lastSuccessful[peerID] = successful
 	}
@@ -334,14 +390,14 @@ func WriteAndFlushBuffer(
 
 		if writeErr != nil {
 			errStr := writeErr.Error()
-			
+
 			// If we timed out, just drop this frame - don't reset the stream.
 			// QUIC is handling congestion control; the buffer will drain.
 			if netErr, ok := writeErr.(net.Error); ok && netErr.Timeout() {
 				globalWriteStats.recordDrop(peerID)
 				return FrameDropped
 			}
-			
+
 			// Check for graceful remote close (QUIC Application error 0x0)
 			// This means the remote peer closed the connection intentionally.
 			// Keep the buffer so we can try to reconnect - don't remove it.
@@ -414,35 +470,31 @@ func WriteToAllPeersParallel(buffers *NodeBuffers, data []byte) []PeerWriteResul
 		return nil
 	}
 
-	// Channel to collect errors from goroutines
-	resultChan := make(chan PeerWriteResult, len(bufferMap))
-	var wg sync.WaitGroup
-
+	// Enqueue writes per peer to avoid goroutine explosion; drop if queue full.
+	var errors []PeerWriteResult
 	for peerID, bufferInfo := range bufferMap {
-		// Skip peers that are not connected - don't spam logs trying to write to reconnecting peers
 		if bufferInfo.LibP2PState != Connected {
 			continue
 		}
-		
-		wg.Add(1)
-		go func(pid peer.ID, info *NodeBufferInfo) {
-			defer wg.Done()
-			if err := WriteAndFlushBuffer(*info, pid, buffers, data); err != nil {
-				resultChan <- PeerWriteResult{PeerID: pid, Error: err}
+		q := ensurePeerWriteQueue(peerID, buffers)
+		select {
+		case q.ch <- data:
+			// enqueued
+		default:
+			// Queue full: drop one old frame and try to enqueue the newest.
+			select {
+			case <-q.ch:
+			default:
 			}
-		}(peerID, bufferInfo)
-	}
-
-	// Close channel when all goroutines complete
-	go func() {
-		wg.Wait()
-		close(resultChan)
-	}()
-
-	// Collect errors
-	var errors []PeerWriteResult
-	for result := range resultChan {
-		errors = append(errors, result)
+			select {
+			case q.ch <- data:
+				// enqueued after dropping one
+			default:
+				// Still full - drop newest to keep latency low
+				globalWriteStats.recordDrop(peerID)
+				errors = append(errors, PeerWriteResult{PeerID: peerID, Error: FrameDropped})
+			}
+		}
 	}
 
 	return errors
