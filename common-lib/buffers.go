@@ -197,6 +197,8 @@ func (bb *NodeBuffers) RemoveBuffer(buyerID peer.ID) {
 	bb.mu.Lock()
 	defer bb.mu.Unlock()
 	delete(bb.Buffers, buyerID)
+	// Stop per-peer writer to avoid goroutine leaks on disconnect.
+	stopPeerWriteQueue(buyerID)
 
 }
 
