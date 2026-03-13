@@ -6,6 +6,8 @@ import (
 	"log"
 	"math/big"
 	"os"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/NeuronInnovations/neuron-go-hedera-sdk/keylib"
@@ -133,24 +135,93 @@ type PeerInfo struct {
 	StdErrTopic uint64
 }
 
+type cachedPeerInfo struct {
+	info      PeerInfo
+	expiresAt time.Time
+}
+
+type peerInfoResult struct {
+	info PeerInfo
+	err  error
+}
+
+var (
+	peerInfoMu       sync.Mutex
+	peerInfoCache    = make(map[string]cachedPeerInfo)
+	peerInfoInFlight = make(map[string][]chan peerInfoResult)
+)
+
 // TODO: retry on failure. This one likes to return 502 bad gateway and eth rate limit exceeded.
 // however, currently we stop the world on failure but should keep retrying.
 func GetPeerInfo(hederaAccEvmAddress string) (PeerInfo, error) {
-	log.Println("getting contract info for ", hederaAccEvmAddress)
+	key := normalizeEvmAddress(hederaAccEvmAddress)
+	now := time.Now()
+
+	peerInfoMu.Lock()
+	if cached, ok := peerInfoCache[key]; ok && now.Before(cached.expiresAt) {
+		info := cached.info
+		peerInfoMu.Unlock()
+		return info, nil
+	}
+	if waiters, ok := peerInfoInFlight[key]; ok {
+		ch := make(chan peerInfoResult, 1)
+		peerInfoInFlight[key] = append(waiters, ch)
+		peerInfoMu.Unlock()
+		res := <-ch
+		return res.info, res.err
+	}
+	peerInfoInFlight[key] = nil
+	peerInfoMu.Unlock()
+
+	log.Println("getting contract info for ", key)
+	info, err := fetchPeerInfoWithRetry(key)
+
+	peerInfoMu.Lock()
+	if err == nil {
+		peerInfoCache[key] = cachedPeerInfo{
+			info:      info,
+			expiresAt: time.Now().Add(10 * time.Second),
+		}
+	}
+	waiters := peerInfoInFlight[key]
+	delete(peerInfoInFlight, key)
+	peerInfoMu.Unlock()
+
+	result := peerInfoResult{info: info, err: err}
+	for _, ch := range waiters {
+		ch <- result
+		close(ch)
+	}
+	return info, err
+}
+
+func fetchPeerInfoWithRetry(hederaAccEvmAddress string) (PeerInfo, error) {
 	var peerInfo PeerInfo
 	var err error
 	// Keep this bounded and responsive: this path is called by UI/API-triggered
 	// connect/reconnect flows. Excessive exponential retries can stall the buyer.
-	maxRetries := 5
-	baseDelay := 250 * time.Millisecond
-	maxDelay := 2 * time.Second
+	maxRetries := 3
+	baseDelay := 200 * time.Millisecond
+	maxDelay := 1 * time.Second
+	perAttemptTimeout := 2 * time.Second
 
 	for i := 0; i < maxRetries; i++ {
 		contractCaller := GetHRpcClient()
-		peerInfo, err = contractCaller.HederaAddressToPeer(
-			&bind.CallOpts{},
-			common.HexToAddress(hederaAccEvmAddress),
-		)
+		callCh := make(chan peerInfoResult, 1)
+		go func() {
+			info, callErr := contractCaller.HederaAddressToPeer(
+				&bind.CallOpts{},
+				common.HexToAddress(hederaAccEvmAddress),
+			)
+			callCh <- peerInfoResult{info: info, err: callErr}
+		}()
+		select {
+		case res := <-callCh:
+			peerInfo = res.info
+			err = res.err
+		case <-time.After(perAttemptTimeout):
+			err = fmt.Errorf("GetPeerInfo timeout after %s", perAttemptTimeout)
+		}
 		if err == nil {
 			return peerInfo, nil
 		}
@@ -162,6 +233,15 @@ func GetPeerInfo(hederaAccEvmAddress string) (PeerInfo, error) {
 		time.Sleep(delay)
 	}
 	return peerInfo, err
+}
+
+func normalizeEvmAddress(evm string) string {
+	s := strings.TrimSpace(strings.ToLower(evm))
+	s = strings.TrimPrefix(s, "0x")
+	if s == "" {
+		return ""
+	}
+	return "0x" + s
 }
 func GetAllPeers() ([]string, error) {
 	contractCaller := GetHRpcClient()

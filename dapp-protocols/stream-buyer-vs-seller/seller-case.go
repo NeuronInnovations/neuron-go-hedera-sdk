@@ -93,8 +93,11 @@ func HandleSellerCase(ctx context.Context, p2pHost host.Host, protocol protocol.
 				err2 := hedera_helper.SellerSendScheduledTransferRequest(sharedAccID, myParrentAccountID, myDeviceAccountID, buyerStdIn)
 
 				if err2 != nil {
-					log.Panic(err2)
+					log.Printf("invoice send failed for %s: %v", peerID, err2)
+					continue
 				}
+				// Avoid blasting Hedera with burst writes when many buyers are connected.
+				time.Sleep(600 * time.Millisecond)
 
 			}
 			time.Sleep(45 * time.Minute)

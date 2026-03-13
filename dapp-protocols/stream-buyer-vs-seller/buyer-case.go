@@ -88,6 +88,48 @@ func HandleBuyerCase(ctx context.Context, p2pHost host.Host, buyerCase func(ctx 
 		sellerBuffers = commonlib.NewNodeBuffers()
 	}
 
+	// Keep topic callback lightweight: heavy retry/recovery work goes through
+	// a bounded queue so Hedera-related calls cannot block callback progress.
+	const recoveryWorkerCount = 3
+	recoveryJobs := make(chan Seller, 128)
+	var recoveryQueuedMu sync.Mutex
+	recoveryQueued := make(map[string]bool) // keyed by seller public key
+
+	for i := 0; i < recoveryWorkerCount; i++ {
+		go func() {
+			for seller := range recoveryJobs {
+				processSeller(seller, p2pHost, sellerBuffers, constMyReachableAddresses)
+				recoveryQueuedMu.Lock()
+				delete(recoveryQueued, seller.PublicKey)
+				recoveryQueuedMu.Unlock()
+			}
+		}()
+	}
+
+	enqueueRecovery := func(publicKey string) {
+		publicKey = strings.TrimSpace(publicKey)
+		if publicKey == "" {
+			return
+		}
+		recoveryQueuedMu.Lock()
+		if recoveryQueued[publicKey] {
+			recoveryQueuedMu.Unlock()
+			return
+		}
+		recoveryQueued[publicKey] = true
+		recoveryQueuedMu.Unlock()
+
+		select {
+		case recoveryJobs <- Seller{PublicKey: publicKey}:
+		default:
+			// Queue is full; do not block callback path.
+			recoveryQueuedMu.Lock()
+			delete(recoveryQueued, publicKey)
+			recoveryQueuedMu.Unlock()
+			log.Printf("recovery queue full, skipping immediate retry for seller %s", publicKey)
+		}
+	}
+
 	go buyerCase(ctx, p2pHost, sellerBuffers)
 
 	// ------- LISTEN -----------
@@ -133,30 +175,30 @@ func HandleBuyerCase(ctx context.Context, p2pHost host.Host, buyerCase func(ctx 
 			if !validatorLib.IsRequestPermitted() {
 				return
 			}
-			// sign the schedule to release the money
-			hedera_helper.SignSchedule(sid, os.Getenv("private_key"))
-			// add more money to shared acount for next round.
-			// TODO: use the amount from the SLA
-			if !validatorLib.IsRequestPermitted() {
-				return
-			}
-			sharedAcc, _ := hedera.AccountIDFromString(fmt.Sprintf("0.0.%d", scheduleSignRequest.SharedAccID))
-
-			// Check balance before depositing - only top up if balance is low
-			// Use GetAccountInfoFromNetwork to get proper Hedera balance type
-			accountInfo, balErr := hedera_helper.GetAccountInfoFromNetwork(sharedAcc)
-			if balErr == nil && accountInfo.Balance.AsTinybar() >= 10_000_000 {
-				// Balance is sufficient (>= 0.1 HBAR), skip deposit
-				fmt.Printf("Shared account %s has sufficient balance (%d tinybars), skipping deposit\n",
-					sharedAcc, accountInfo.Balance.AsTinybar())
-			} else {
-				// Balance is low or couldn't check, deposit amount
-				fmt.Println("Adding funds to shared account:", sharedAcc)
-				err = hedera_helper.DepositToSharedAccount(sharedAcc, 0.1) // 0.1 HBAR refill
-				if err != nil {
-					fmt.Println("SELFERROR: could not deposit to shared account ", err)
+			// Process payment maintenance asynchronously so it cannot block
+			// connect/reconnect message handling in this topic callback path.
+			go func(req *commonlib.NeuronScheduleSignRequestMsg, scheduleID hedera.ScheduleID) {
+				if err := hedera_helper.SignScheduleBestEffort(scheduleID, os.Getenv("private_key")); err != nil {
+					log.Printf("best-effort schedule sign skipped/failed (%d): %v", req.ScheduleID, err)
+					return
 				}
-			}
+				if !validatorLib.IsRequestPermitted() {
+					return
+				}
+				sharedAcc, _ := hedera.AccountIDFromString(fmt.Sprintf("0.0.%d", req.SharedAccID))
+
+				accountInfo, balErr := hedera_helper.GetAccountInfoFromNetwork(sharedAcc)
+				if balErr == nil && accountInfo.Balance.AsTinybar() >= 10_000_000 {
+					fmt.Printf("Shared account %s has sufficient balance (%d tinybars), skipping deposit\n",
+						sharedAcc, accountInfo.Balance.AsTinybar())
+					return
+				}
+
+				fmt.Println("Adding funds to shared account:", sharedAcc)
+				if depErr := hedera_helper.DepositToSharedAccountBestEffort(sharedAcc, 0.1); depErr != nil {
+					log.Printf("best-effort deposit skipped/failed (%s): %v", sharedAcc, depErr)
+				}
+			}(scheduleSignRequest, sid)
 		case "peerError": // error from seller
 			sellerError := new(commonlib.NeuronPeerErrorMsg)
 			err := json.Unmarshal(topicMessage.Contents, &sellerError)
@@ -180,8 +222,8 @@ func HandleBuyerCase(ctx context.Context, p2pHost host.Host, buyerCase func(ctx 
 				fmt.Println("Write error: ", sellerError)
 				switch sellerError.RecoverAction {
 				case commonlib.SendFreshHederaRequest:
-					// look into the buffers, we have the request there and send it again
-					processSeller(Seller{PublicKey: sellerError.PublicKey}, p2pHost, sellerBuffers, constMyReachableAddresses)
+					// Queue recoveries; keep topic callback non-blocking.
+					enqueueRecovery(sellerError.PublicKey)
 				case commonlib.PunchMe:
 				case commonlib.DoNothing:
 				}
@@ -210,7 +252,9 @@ func HandleBuyerCase(ctx context.Context, p2pHost host.Host, buyerCase func(ctx 
 		listOfSellersLock sync.RWMutex
 	)
 
-	startSecondLoop := make(chan struct{})
+	// Buffered so an early startup signal (env/explorer path) is not lost
+	// before the worker goroutine begins receiving.
+	startSecondLoop := make(chan struct{}, 1)
 
 	// if the list of sellers source is the environment file the we get it from there (otherwise ask explorer)
 	if *flags.ListOfSellersSourceFlag == "env" {
@@ -219,124 +263,132 @@ func HandleBuyerCase(ctx context.Context, p2pHost host.Host, buyerCase func(ctx 
 			log.Println("list_of_sellers is empty")
 			return
 		}
-
-		go func() {
-			for {
-				for _, seller := range strings.Split(listOfSellersEnvList, ",") {
-					sEvm := keylib.ConverHederaPublicKeyToEthereunAddress(seller)
-					peerInfo, err := hedera_helper.GetPeerInfo(sEvm)
-					if err != nil {
-						log.Fatal(err)
-					}
-
-					if m, ok := getPeerHeartbeatIfRecent(peerInfo); ok {
-						heartbeatMessage := new(commonlib.NeuronHeartBeatMsg)
-						base64Decoded, _ := base64.StdEncoding.DecodeString(m.Message)
-						err = json.Unmarshal([]byte(base64Decoded), &heartbeatMessage)
-						if err != nil {
-							log.Println("error unmarshalling heartbeat message: ", err)
-						} else {
-							// make a Seller object and fill it up
-							seller := Seller{
-								PublicKey: seller,
-								Lat:       heartbeatMessage.Location.Latitude,
-								Lon:       heartbeatMessage.Location.Longitude,
-							}
-							listOfSellersLock.Lock()
-							listOfSellers[seller] = true
-							listOfSellersLock.Unlock()
-						}
-					} else {
-						log.Println("Node heartbeat is not ok. I'll skip him in this round but will try again in 120 seconds  ", seller, peerInfo)
-					}
-				}
-				select {
-				case startSecondLoop <- struct{}{}:
-				default:
-				}
-				time.Sleep(120 * time.Second)
+		// Env source is explicit and static: avoid repeated sequential contract scans
+		// that can choke runtime add/connect flows.
+		for _, seller := range strings.Split(listOfSellersEnvList, ",") {
+			seller = strings.TrimSpace(seller)
+			if seller == "" {
+				continue
 			}
-		}()
+			listOfSellersLock.Lock()
+			listOfSellers[Seller{PublicKey: seller}] = true
+			listOfSellersLock.Unlock()
+		}
+		select {
+		case startSecondLoop <- struct{}{}:
+		default:
+		}
 	} else { // if the flag list-of-sellers is not set to env then get it from the explorer
 		go func() {
 			var limiter = rate.NewLimiter(5, 1)
+			const explorerWorkerCount = 8
 			for {
 				// get the list of devices from the explorer  every 120 seconds
 				devices, err := hedera_helper.GetAllDevicesFromExplorer()
 				if err != nil {
 					log.Println("💀  GetAllPeers error: ", err)
-					hedera_helper.SendSelfErrorMessage(commonlib.ExplorerReachError, "Could not get devices from the explorer", commonlib.RebootMe)
+					// Keep explorer discovery fully non-blocking: avoid Hedera write-path
+					// side effects from this background task.
+					time.Sleep(10 * time.Second)
 					continue
 				}
 
 				log.Println("🔎  got ", len(devices), " devices from the explorer")
+				discovered := make(map[Seller]bool)
+				var discoveredMu sync.Mutex
+				jobs := make(chan map[string]interface{}, len(devices))
+				var wg sync.WaitGroup
 
-				for _, device := range devices {
+				worker := func() {
+					defer wg.Done()
+					for device := range jobs {
+						publicKey, ok := device["publickey"].(string)
+						if !ok {
+							continue
+						}
+						devicerole, ok := device["devicerole"].(float64)
+						if !ok || devicerole != 0 { // seller device only
+							continue
+						}
+						stdout, ok := device["topic_stdout"].(string)
+						if !ok || strings.TrimSpace(stdout) == "" {
+							continue
+						}
+						stdoutTyped, err := hedera.TopicIDFromString(stdout)
+						if err != nil {
+							continue
+						}
 
-					if publicKey, ok := device["publickey"].(string); ok {
-						if devicerole, ok := device["devicerole"].(float64); ok {
-							if devicerole == 0 { // it's a seller dvice
-								stdout := device["topic_stdout"].(string)
-								stdoutTyped, _ := hedera.TopicIDFromString(stdout)
-								// do an api call to see if there is a heartbeat
-								limiter.Wait(context.Background())
-								m, lastMessageError := hedera_helper.GetLastMessageFromTopic(stdoutTyped)
-								if lastMessageError != nil {
-									continue
-								}
-								if m.Timestamp.IsZero() || m.Timestamp.Before(time.Now().Add(-10*time.Minute)) {
-									continue
-								}
-								hpub, err := hedera.PublicKeyFromString(publicKey)
-								if err != nil {
-									log.Println("💀  hedera.PublicKeyFromString error: ", err)
-									continue
-								}
+						// Global mirror pacing with per-job timeout.
+						waitCtx, waitCancel := context.WithTimeout(context.Background(), 2*time.Second)
+						waitErr := limiter.Wait(waitCtx)
+						waitCancel()
+						if waitErr != nil {
+							continue
+						}
 
-								// finally, include the seller in the list
+						m, lastMessageError := getLastMessageFromTopicWithTimeout(stdoutTyped, 4*time.Second)
+						if lastMessageError != nil {
+							continue
+						}
+						if m.Timestamp.IsZero() || m.Timestamp.Before(time.Now().Add(-10*time.Minute)) {
+							continue
+						}
+						hpub, err := hedera.PublicKeyFromString(publicKey)
+						if err != nil {
+							continue
+						}
 
-								publicKey = hpub.StringRaw()
-								heartbeatMessage := new(commonlib.NeuronHeartBeatMsg)
-								base64Decoded, _ := base64.StdEncoding.DecodeString(m.Message)
-								err = json.Unmarshal([]byte(base64Decoded), &heartbeatMessage)
-								if err != nil {
-									log.Println("error un marshalling heartbeat message: ", err)
-								} else {
+						publicKey = hpub.StringRaw()
+						heartbeatMessage := new(commonlib.NeuronHeartBeatMsg)
+						base64Decoded, _ := base64.StdEncoding.DecodeString(m.Message)
+						err = json.Unmarshal([]byte(base64Decoded), &heartbeatMessage)
+						if err != nil {
+							continue
+						}
 
-									seller := Seller{
-										PublicKey: publicKey,
-										Lat:       heartbeatMessage.Location.Latitude,
-										Lon:       heartbeatMessage.Location.Longitude,
-									}
+						seller := Seller{
+							PublicKey: publicKey,
+							Lat:       heartbeatMessage.Location.Latitude,
+							Lon:       heartbeatMessage.Location.Longitude,
+						}
 
-									// if the radius flag is set then check if the seller is in the radius
-									if *flags.RadiusFlag > 0 {
-
-										centerLat := commonlib.MyLocation.Latitude
-										centerLon := commonlib.MyLocation.Longitude
-										// get the radius
-										radius := flags.RadiusFlag
-										// calculate the distance using the haversine formula
-										center := haversine.Coord{Lat: centerLat, Lon: centerLon}
-										farPoint := haversine.Coord{Lat: seller.Lat, Lon: seller.Lon}
-										_, distanceKm := haversine.Distance(center, farPoint)
-										// check if the distance is less than the radius
-										if int(distanceKm) < *radius {
-											listOfSellersLock.Lock()
-											listOfSellers[seller] = true
-											listOfSellersLock.Unlock()
-										}
-									} else { // no filtering by radius set.
-										listOfSellersLock.Lock()
-										listOfSellers[seller] = true
-										listOfSellersLock.Unlock()
-									}
-								}
-								// todo: deduplicate the list
+						if *flags.RadiusFlag > 0 {
+							centerLat := commonlib.MyLocation.Latitude
+							centerLon := commonlib.MyLocation.Longitude
+							radius := flags.RadiusFlag
+							center := haversine.Coord{Lat: centerLat, Lon: centerLon}
+							farPoint := haversine.Coord{Lat: seller.Lat, Lon: seller.Lon}
+							_, distanceKm := haversine.Distance(center, farPoint)
+							if int(distanceKm) >= *radius {
+								continue
 							}
 						}
+
+						discoveredMu.Lock()
+						discovered[seller] = true
+						discoveredMu.Unlock()
 					}
 				}
+
+				for i := 0; i < explorerWorkerCount; i++ {
+					wg.Add(1)
+					go worker()
+				}
+				for _, device := range devices {
+					jobs <- device
+				}
+				close(jobs)
+				wg.Wait()
+
+				if len(discovered) > 0 {
+					listOfSellersLock.Lock()
+					for seller := range discovered {
+						listOfSellers[seller] = true
+					}
+					listOfSellersLock.Unlock()
+				}
+
 				select {
 				case startSecondLoop <- struct{}{}:
 				default:
@@ -367,7 +419,7 @@ func HandleBuyerCase(ctx context.Context, p2pHost host.Host, buyerCase func(ctx 
 
 			// Process sellers concurrently so one slow/rate-limited seller lookup
 			// does not stall all other sellers in the cycle.
-			const maxConcurrentSellerWorkers = 8
+			const maxConcurrentSellerWorkers = 3
 			sem := make(chan struct{}, maxConcurrentSellerWorkers)
 			var wg sync.WaitGroup
 			for _, seller := range sellersCopy {
@@ -385,6 +437,24 @@ func HandleBuyerCase(ctx context.Context, p2pHost host.Host, buyerCase func(ctx 
 		} // end for
 	}()
 
+}
+
+func getLastMessageFromTopicWithTimeout(topicID hedera.TopicID, timeout time.Duration) (hedera_helper.HCSMessage, error) {
+	type result struct {
+		m   hedera_helper.HCSMessage
+		err error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		m, err := hedera_helper.GetLastMessageFromTopic(topicID)
+		ch <- result{m: m, err: err}
+	}()
+	select {
+	case r := <-ch:
+		return r.m, r.err
+	case <-time.After(timeout):
+		return hedera_helper.HCSMessage{}, fmt.Errorf("timeout waiting for mirror topic %s", topicID)
+	}
 }
 
 func prepareServiceRequestMsg(seller string, myReachableAddresses []multiaddr.Multiaddr) (commonlib.TopicPostalEnvelope, error) {
@@ -422,18 +492,15 @@ func processSeller(seller Seller, p2pHost host.Host, sellerBuffers *commonlib.No
 	conns := p2pHost.Network().ConnsToPeer(peerID)
 
 	if len(conns) == 0 {
-		// Only hit contract RPC when we are actually going to attempt a request.
-		// This avoids periodic RPC pressure from sellers that are already connected
-		// or still in local reconnect backoff windows.
-		perrInfo, err := hedera_helper.GetPeerInfo(sellerEvnAddress)
-		if err != nil {
-			return
-		}
-		if !perrInfo.Available {
-			return
-		}
-
 		if !peerHasBuffer { // no cons and never requested
+			// Initial attempt: check contract availability once before sending.
+			perrInfo, err := hedera_helper.GetPeerInfo(sellerEvnAddress)
+			if err != nil {
+				return
+			}
+			if !perrInfo.Available {
+				return
+			}
 			envelope, setupErr := prepareServiceRequestMsg(seller.PublicKey, myReachableAddresses)
 			if setupErr != nil {
 				sellerBuffers.AddBuffer2(peerID, envelope, false, commonlib.NotInitiated, neuronbuffers.LibP2PState(commonlib.BadMessageError))
@@ -448,7 +515,7 @@ func processSeller(seller Seller, p2pHost host.Host, sellerBuffers *commonlib.No
 				// has errors
 				sellerBuffers.AddBuffer2(peerID, envelope, true, commonlib.SendFail, commonlib.Connecting)
 				sellerBuffers.SetPeerPublicKey(peerID, seller.PublicKey)
-				log.Printf("💀 send hedera transaction envelope error %s, will allow to try later %v \n", sellerEvnAddress, setupErr)
+				log.Printf("💀 send hedera transaction envelope error %s, will allow to try later %v \n", sellerEvnAddress, execErr)
 				hedera_helper.SendSelfErrorMessage(neuronbuffers.ServiceError, "Could not send the reqquest to: "+sellerEvnAddress, commonlib.DoNothing)
 				return
 			}
@@ -464,7 +531,7 @@ func processSeller(seller Seller, p2pHost host.Host, sellerBuffers *commonlib.No
 				log.Println("re-submit because it's time now", isTooEarly, a, b)
 			}
 			sellerBuffers.IncrementReconnectAttempts(peerID)
-			secondExecError := hedera_helper.SendTransactionEnvelope(peerBuffer.RequestOrResponse)
+			secondExecError := hedera_helper.SendTransactionEnvelopeBestEffort(peerBuffer.RequestOrResponse)
 			if secondExecError != nil {
 				log.Printf("💀-2  skip that seller %s because ExecuteHederaTransaction error: %v", sellerEvnAddress, secondExecError)
 				// TODO: 💥 tell to myself that I could not send the transaction to the other side
