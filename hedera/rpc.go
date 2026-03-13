@@ -139,8 +139,11 @@ func GetPeerInfo(hederaAccEvmAddress string) (PeerInfo, error) {
 	log.Println("getting contract info for ", hederaAccEvmAddress)
 	var peerInfo PeerInfo
 	var err error
-	maxRetries := 25
-	baseDelay := time.Second
+	// Keep this bounded and responsive: this path is called by UI/API-triggered
+	// connect/reconnect flows. Excessive exponential retries can stall the buyer.
+	maxRetries := 5
+	baseDelay := 250 * time.Millisecond
+	maxDelay := 2 * time.Second
 
 	for i := 0; i < maxRetries; i++ {
 		contractCaller := GetHRpcClient()
@@ -152,7 +155,11 @@ func GetPeerInfo(hederaAccEvmAddress string) (PeerInfo, error) {
 			return peerInfo, nil
 		}
 		fmt.Println("Error getting rpc peer info, retrying:", i, "th time", err)
-		time.Sleep(baseDelay * (1 << i)) // Exponential backoff
+		delay := baseDelay * time.Duration(1<<i) // Exponential backoff
+		if delay > maxDelay {
+			delay = maxDelay
+		}
+		time.Sleep(delay)
 	}
 	return peerInfo, err
 }

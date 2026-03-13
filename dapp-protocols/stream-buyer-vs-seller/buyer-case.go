@@ -365,9 +365,21 @@ func HandleBuyerCase(ctx context.Context, p2pHost host.Host, buyerCase func(ctx 
 			}
 			listOfSellersLock.RUnlock() // Unlock after copying
 
+			// Process sellers concurrently so one slow/rate-limited seller lookup
+			// does not stall all other sellers in the cycle.
+			const maxConcurrentSellerWorkers = 8
+			sem := make(chan struct{}, maxConcurrentSellerWorkers)
+			var wg sync.WaitGroup
 			for _, seller := range sellersCopy {
-				processSeller(seller, p2pHost, sellerBuffers, constMyReachableAddresses)
+				wg.Add(1)
+				sem <- struct{}{}
+				go func(s Seller) {
+					defer wg.Done()
+					defer func() { <-sem }()
+					processSeller(s, p2pHost, sellerBuffers, constMyReachableAddresses)
+				}(seller)
 			}
+			wg.Wait()
 
 			time.Sleep(60 * time.Second)
 		} // end for
@@ -393,14 +405,6 @@ func processSeller(seller Seller, p2pHost host.Host, sellerBuffers *commonlib.No
 	sellerEvnAddress := keylib.ConverHederaPublicKeyToEthereunAddress(seller.PublicKey)
 	peerIDStr := keylib.ConvertHederaPublicKeyToPeerID(seller.PublicKey)
 	peerID, _ := peer.Decode(peerIDStr)
-	perrInfo, err := hedera_helper.GetPeerInfo(sellerEvnAddress)
-
-	if err != nil {
-		return
-	}
-	if !perrInfo.Available {
-		return
-	}
 
 	peerBuffer, peerHasBuffer := sellerBuffers.GetBuffer(peerID)
 
@@ -418,11 +422,22 @@ func processSeller(seller Seller, p2pHost host.Host, sellerBuffers *commonlib.No
 	conns := p2pHost.Network().ConnsToPeer(peerID)
 
 	if len(conns) == 0 {
+		// Only hit contract RPC when we are actually going to attempt a request.
+		// This avoids periodic RPC pressure from sellers that are already connected
+		// or still in local reconnect backoff windows.
+		perrInfo, err := hedera_helper.GetPeerInfo(sellerEvnAddress)
+		if err != nil {
+			return
+		}
+		if !perrInfo.Available {
+			return
+		}
 
 		if !peerHasBuffer { // no cons and never requested
 			envelope, setupErr := prepareServiceRequestMsg(seller.PublicKey, myReachableAddresses)
 			if setupErr != nil {
 				sellerBuffers.AddBuffer2(peerID, envelope, false, commonlib.NotInitiated, neuronbuffers.LibP2PState(commonlib.BadMessageError))
+				sellerBuffers.SetPeerPublicKey(peerID, seller.PublicKey)
 				log.Printf("💀 envelope setup error; seller %s will be blacklisted, err: %v \n", sellerEvnAddress, setupErr)
 				hedera_helper.SendSelfErrorMessage(neuronbuffers.BadMessageError, "Could not create envelope for: "+sellerEvnAddress, commonlib.DoNothing)
 				return
@@ -432,12 +447,14 @@ func processSeller(seller Seller, p2pHost host.Host, sellerBuffers *commonlib.No
 			if execErr := hedera_helper.SendTransactionEnvelope(envelope); execErr != nil {
 				// has errors
 				sellerBuffers.AddBuffer2(peerID, envelope, true, commonlib.SendFail, commonlib.Connecting)
+				sellerBuffers.SetPeerPublicKey(peerID, seller.PublicKey)
 				log.Printf("💀 send hedera transaction envelope error %s, will allow to try later %v \n", sellerEvnAddress, setupErr)
 				hedera_helper.SendSelfErrorMessage(neuronbuffers.ServiceError, "Could not send the reqquest to: "+sellerEvnAddress, commonlib.DoNothing)
 				return
 			}
 			// has no errors
 			sellerBuffers.AddBuffer2(peerID, envelope, true, commonlib.SendOK, commonlib.Connecting)
+			sellerBuffers.SetPeerPublicKey(peerID, seller.PublicKey)
 
 		} else { // have buffer,  no cons and requested before: re-submit for up to backoff
 			if isTooEarly, _ := commonlib.IsRequestTooEarly(sellerBuffers, peerID); isTooEarly {
@@ -461,10 +478,9 @@ func processSeller(seller Seller, p2pHost host.Host, sellerBuffers *commonlib.No
 		}
 	} else { // there are cons
 		if !peerHasBuffer {
-			// it's possible to not have a buffer when you reboot but people still talk to you and that's why you have cons.
-			// just close those cons and issue a new request, you can be lazy and let the loop do that in the next iteration.
-			fmt.Println("I am connected but have no buffer. .. i'll close the peer and just hang around for the loop to issue a fresh request ", peerID)
-			p2pHost.Network().ClosePeer(peerID)
+			// Do not aggressively close from buyer side. A can have late/valid inbound
+			// streams while buffer state catches up; force-closing here causes random drops.
+			fmt.Println("Connected but no buffer yet; keeping connection open and waiting", peerID)
 			return
 		}
 
@@ -474,8 +490,8 @@ func processSeller(seller Seller, p2pHost host.Host, sellerBuffers *commonlib.No
 			streams += len(conn.GetStreams())
 		}
 		if streams == 0 { // there are cons but no streams
-			log.Println("I am connected but have no streams. .. i'll  close the peer and just hang around ", peerID, streams)
-			p2pHost.Network().ClosePeer(peerID)
+			// Keep the connection open and allow stream establishment/recovery.
+			log.Println("Connected but no streams yet; keeping peer open", peerID, streams)
 			return
 		} else {
 			sellerBuffers.UpdateBufferRendezvousState(peerID, commonlib.SendOK)
