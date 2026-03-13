@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -37,14 +38,18 @@ func StateManagerInit(buyerOrSellerFlag string, clearCacheFlag bool) {
 }
 
 type NodeBuffers struct {
-	mu      sync.Mutex
-	Buffers map[peer.ID]*NodeBufferInfo
+	mu               sync.Mutex
+	Buffers          map[peer.ID]*NodeBufferInfo
+	peerIDByEvm      map[string]peer.ID // lookup: do not use peer IDs as external keys
+	peerIDByPublicKey map[string]peer.ID
 }
 
 // NewNodeBuffers creates a new instance of NodeBuffers
 func NewNodeBuffers() *NodeBuffers {
 	return &NodeBuffers{
-		Buffers: make(map[peer.ID]*NodeBufferInfo),
+		Buffers:          make(map[peer.ID]*NodeBufferInfo),
+		peerIDByEvm:      make(map[string]peer.ID),
+		peerIDByPublicKey: make(map[string]peer.ID),
 	}
 }
 
@@ -106,6 +111,7 @@ type NodeBufferInfo struct {
 	NextScheduleRequestTime        time.Time           `json:"next_schedule_request_time"`
 	LastGoodsReceivedTime          time.Time           `json:"last_goods_received_time"`
 	PeerPublicKey                  string              `json:"peer_public_key"` // The peer's public key from Hedera (for log correlation)
+	EvmAddress                     string              `json:"evm_address"`    // The peer's EVM address when known (for lookup; do not use peer ID as key)
 }
 
 // ShortPublicKey returns the last 8 characters of the public key for logging
@@ -192,14 +198,21 @@ func (bb *NodeBuffers) GetBuffer(buyerID peer.ID) (NodeBufferInfo, bool) {
 	return *info, true
 }
 
-// RemoveBuffer removes a buyerID and its associated NodeBufferInfo
+// RemoveBuffer removes a buyerID and its associated NodeBufferInfo, and cleans lookup maps.
 func (bb *NodeBuffers) RemoveBuffer(buyerID peer.ID) {
 	bb.mu.Lock()
 	defer bb.mu.Unlock()
+	if info, exists := bb.Buffers[buyerID]; exists {
+		if info.EvmAddress != "" {
+			delete(bb.peerIDByEvm, normalizeEvmLookup(info.EvmAddress))
+		}
+		if info.PeerPublicKey != "" {
+			delete(bb.peerIDByPublicKey, normalizeLookupKey(info.PeerPublicKey))
+		}
+	}
 	delete(bb.Buffers, buyerID)
 	// Stop per-peer writer to avoid goroutine leaks on disconnect.
 	stopPeerWriteQueue(buyerID)
-
 }
 
 // UpdateBufferLibP2PState updates the LibP2PState of a buffer for a given buyerID
@@ -286,14 +299,80 @@ func (bb *NodeBuffers) SetLastGoodsReceivedTime(buyerID peer.ID) {
 	}
 }
 
-// SetPeerPublicKey stores the peer's public key for log correlation
+// SetPeerPublicKey stores the peer's public key and registers it for lookup (do not use peer ID as external key).
 func (bb *NodeBuffers) SetPeerPublicKey(peerID peer.ID, publicKey string) {
 	bb.mu.Lock()
 	defer bb.mu.Unlock()
 	info, exists := bb.Buffers[peerID]
 	if exists {
 		info.PeerPublicKey = publicKey
+		if publicKey != "" {
+			bb.peerIDByPublicKey[normalizeLookupKey(publicKey)] = peerID
+		}
 	}
+}
+
+// SetPeerEvmAddress sets the peer's EVM address and registers it for lookup (do not use peer ID as external key).
+func (bb *NodeBuffers) SetPeerEvmAddress(peerID peer.ID, evmAddress string) {
+	bb.mu.Lock()
+	defer bb.mu.Unlock()
+	info, exists := bb.Buffers[peerID]
+	if exists {
+		info.EvmAddress = evmAddress
+		if evmAddress != "" {
+			bb.peerIDByEvm[normalizeEvmLookup(evmAddress)] = peerID
+		}
+	}
+}
+
+// GetPeerIDByEvm returns the peer.ID for the given EVM address, if registered. Use this instead of using peer IDs as keys.
+func (bb *NodeBuffers) GetPeerIDByEvm(evmAddress string) (peer.ID, bool) {
+	bb.mu.Lock()
+	defer bb.mu.Unlock()
+	pid, ok := bb.peerIDByEvm[normalizeEvmLookup(evmAddress)]
+	return pid, ok
+}
+
+// GetPeerIDByPublicKey returns the peer.ID for the given public key, if registered.
+func (bb *NodeBuffers) GetPeerIDByPublicKey(publicKey string) (peer.ID, bool) {
+	bb.mu.Lock()
+	defer bb.mu.Unlock()
+	pid, ok := bb.peerIDByPublicKey[normalizeLookupKey(publicKey)]
+	return pid, ok
+}
+
+// GetEvmByPeerID returns the EVM address for the given peer ID, if set.
+func (bb *NodeBuffers) GetEvmByPeerID(pid peer.ID) (string, bool) {
+	bb.mu.Lock()
+	defer bb.mu.Unlock()
+	info, exists := bb.Buffers[pid]
+	if !exists || info.EvmAddress == "" {
+		return "", false
+	}
+	return info.EvmAddress, true
+}
+
+// GetPublicKeyByPeerID returns the public key for the given peer ID, if set.
+func (bb *NodeBuffers) GetPublicKeyByPeerID(pid peer.ID) (string, bool) {
+	bb.mu.Lock()
+	defer bb.mu.Unlock()
+	info, exists := bb.Buffers[pid]
+	if !exists || info.PeerPublicKey == "" {
+		return "", false
+	}
+	return info.PeerPublicKey, true
+}
+
+func normalizeEvmLookup(evm string) string {
+	s := strings.TrimSpace(strings.ToLower(evm))
+	if strings.HasPrefix(s, "0x") {
+		return s
+	}
+	return "0x" + s
+}
+
+func normalizeLookupKey(s string) string {
+	return strings.TrimSpace(strings.ToLower(s))
 }
 
 // GetPeerPublicKey returns the peer's public key (short version for logging)
