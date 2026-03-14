@@ -656,27 +656,29 @@ func downloadAndListen(topicID hedera.TopicID, callback func(message hedera.Topi
 	defer client.Close()
 	// Channel to signal message receipt
 	messageReceived := make(chan struct{}, 1)
+	subscriptionDone := make(chan struct{}, 1)
 	// Main loop to keep subscribing
+	lastStdInTimestamp := time.Now().UTC()
+	reconnectDelay := 1 * time.Second
 mainLoop:
-	// Get the last time you received a message from the environment variable called "last_stdin_timestamp"
-	var lastStdInTimestamp time.Time
-	/* TODO: re-introdce timestamps
-	lastStdInTimestampEnv := os.Getenv("last_stdin_timestamp")
-	if lastStdInTimestampEnv != "" {
-		lastStdInTimestamp, _ = time.Parse(time.RFC3339Nano, lastStdInTimestampEnv)
-	} else {
-		lastStdInTimestamp = time.Now().UTC()
-		commonlib.UpdateEnvVariable("last_stdin_timestamp", lastStdInTimestamp.Format(time.RFC3339Nano), commonlib.MyEnvFile)
-		log.Default().Println("last_stdin_timestamp not set, defaulting to now")
-	}
-	*/
-	lastStdInTimestamp = time.Now().UTC()
-
-	handle, err := subscribe(client, topicID, lastStdInTimestamp, callback, messageReceived)
+	// Re-subscribe from last seen timestamp (with small overlap) so we don't
+	// miss messages during subscription churn.
+	startTime := lastStdInTimestamp.Add(-2 * time.Second)
+	handle, err := subscribe(client, topicID, startTime, func(message hedera.TopicMessage) {
+		ts := message.ConsensusTimestamp
+		if !ts.IsZero() && ts.After(lastStdInTimestamp) {
+			lastStdInTimestamp = ts
+		}
+		callback(message)
+	}, messageReceived, subscriptionDone)
 	if err != nil {
 		log.Println("SELFERROR:Error subscribing to topic: ", err) // TODO: send error to error topic
+		time.Sleep(reconnectDelay)
+		reconnectDelay = minDuration(reconnectDelay*2, 30*time.Second)
+		goto mainLoop
 	}
-	timeout := time.NewTimer(3 * time.Minute)
+	reconnectDelay = 1 * time.Second
+	timeout := time.NewTimer(45 * time.Second)
 	defer timeout.Stop()
 
 	for {
@@ -686,16 +688,29 @@ mainLoop:
 			if !timeout.Stop() {
 				<-timeout.C // Drain the channel
 			}
-			timeout.Reset(3 * time.Minute)
+			timeout.Reset(45 * time.Second)
+		case <-subscriptionDone:
+			// Underlying SDK completed subscription unexpectedly; resubscribe now.
+			handle.Unsubscribe()
+			time.Sleep(reconnectDelay)
+			reconnectDelay = minDuration(reconnectDelay*2, 30*time.Second)
+			goto mainLoop
 		case <-timeout.C:
-			// Timeout, no messages received for 3 minutes (could be because subsription didn't work too)
+			// Watchdog: no messages for a while could mean dead subscription.
 			handle.Unsubscribe()
 			goto mainLoop // Break out of the outer loop to restart the subscription]
 		}
 	}
 }
 
-func subscribe(client *hedera.Client, topicID hedera.TopicID, startTime time.Time, callback func(message hedera.TopicMessage), messageReceived chan struct{}) (hedera.SubscriptionHandle, error) {
+func subscribe(
+	client *hedera.Client,
+	topicID hedera.TopicID,
+	startTime time.Time,
+	callback func(message hedera.TopicMessage),
+	messageReceived chan struct{},
+	subscriptionDone chan struct{},
+) (hedera.SubscriptionHandle, error) {
 
 	handle, err := hedera.NewTopicMessageQuery().
 		SetTopicID(topicID).
@@ -710,12 +725,19 @@ func subscribe(client *hedera.Client, topicID hedera.TopicID, startTime time.Tim
 		SetErrorHandler(
 			func(stat status.Status) {
 				//log.Printf("Subs Query error: %v...\n", stat)
-
+				select {
+				case subscriptionDone <- struct{}{}:
+				default:
+				}
 			},
 		).
 		SetCompletionHandler(
 			func() {
 				log.Printf("Subscription completed unexpectedly\n")
+				select {
+				case subscriptionDone <- struct{}{}:
+				default:
+				}
 			},
 		).
 		Subscribe(
@@ -737,6 +759,13 @@ func subscribe(client *hedera.Client, topicID hedera.TopicID, startTime time.Tim
 	}
 
 	return handle, nil
+}
+
+func minDuration(a time.Duration, b time.Duration) time.Duration {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 func SignSchedule(scheduleId hedera.ScheduleID, privateKey string) error {

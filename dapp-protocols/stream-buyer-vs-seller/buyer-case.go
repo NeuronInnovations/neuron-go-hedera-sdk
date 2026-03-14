@@ -18,6 +18,7 @@ import (
 	"github.com/NeuronInnovations/neuron-go-hedera-sdk/upnp"
 
 	"github.com/NeuronInnovations/neuron-go-hedera-sdk/keylib"
+	"github.com/NeuronInnovations/neuron-go-hedera-sdk/controlplane"
 
 	hedera_helper "github.com/NeuronInnovations/neuron-go-hedera-sdk/hedera"
 
@@ -87,6 +88,7 @@ func HandleBuyerCase(ctx context.Context, p2pHost host.Host, buyerCase func(ctx 
 	if sellerBuffers == nil {
 		sellerBuffers = commonlib.NewNodeBuffers()
 	}
+	controlExec := controlplane.NewExecutor(ctx, 6, 256)
 
 	// Keep topic callback lightweight: heavy retry/recovery work goes through
 	// a bounded queue so Hedera-related calls cannot block callback progress.
@@ -98,7 +100,7 @@ func HandleBuyerCase(ctx context.Context, p2pHost host.Host, buyerCase func(ctx 
 	for i := 0; i < recoveryWorkerCount; i++ {
 		go func() {
 			for seller := range recoveryJobs {
-				processSeller(seller, p2pHost, sellerBuffers, constMyReachableAddresses)
+				processSeller(seller, p2pHost, sellerBuffers, constMyReachableAddresses, controlExec)
 				recoveryQueuedMu.Lock()
 				delete(recoveryQueued, seller.PublicKey)
 				recoveryQueuedMu.Unlock()
@@ -185,18 +187,22 @@ func HandleBuyerCase(ctx context.Context, p2pHost host.Host, buyerCase func(ctx 
 				if !validatorLib.IsRequestPermitted() {
 					return
 				}
-				sharedAcc, _ := hedera.AccountIDFromString(fmt.Sprintf("0.0.%d", req.SharedAccID))
+				if submitErr := controlExec.Submit(controlplane.PriorityLow, 150*time.Millisecond, func(taskCtx context.Context) {
+					sharedAcc, _ := hedera.AccountIDFromString(fmt.Sprintf("0.0.%d", req.SharedAccID))
 
-				accountInfo, balErr := hedera_helper.GetAccountInfoFromNetwork(sharedAcc)
-				if balErr == nil && accountInfo.Balance.AsTinybar() >= 10_000_000 {
-					fmt.Printf("Shared account %s has sufficient balance (%d tinybars), skipping deposit\n",
-						sharedAcc, accountInfo.Balance.AsTinybar())
-					return
-				}
+					accountInfo, balErr := hedera_helper.GetAccountInfoFromNetwork(sharedAcc)
+					if balErr == nil && accountInfo.Balance.AsTinybar() >= 10_000_000 {
+						fmt.Printf("Shared account %s has sufficient balance (%d tinybars), skipping deposit\n",
+							sharedAcc, accountInfo.Balance.AsTinybar())
+						return
+					}
 
-				fmt.Println("Adding funds to shared account:", sharedAcc)
-				if depErr := hedera_helper.DepositToSharedAccountBestEffort(sharedAcc, 0.1); depErr != nil {
-					log.Printf("best-effort deposit skipped/failed (%s): %v", sharedAcc, depErr)
+					fmt.Println("Adding funds to shared account:", sharedAcc)
+					if depErr := hedera_helper.DepositToSharedAccountBestEffort(sharedAcc, 0.1); depErr != nil {
+						log.Printf("best-effort deposit skipped/failed (%s): %v", sharedAcc, depErr)
+					}
+				}); submitErr != nil {
+					log.Printf("control queue full for deposit maintenance (%d): %v", req.ScheduleID, submitErr)
 				}
 			}(scheduleSignRequest, sid)
 		case "peerError": // error from seller
@@ -428,7 +434,7 @@ func HandleBuyerCase(ctx context.Context, p2pHost host.Host, buyerCase func(ctx 
 				go func(s Seller) {
 					defer wg.Done()
 					defer func() { <-sem }()
-					processSeller(s, p2pHost, sellerBuffers, constMyReachableAddresses)
+					processSeller(s, p2pHost, sellerBuffers, constMyReachableAddresses, controlExec)
 				}(seller)
 			}
 			wg.Wait()
@@ -471,7 +477,13 @@ func prepareServiceRequestMsg(seller string, myReachableAddresses []multiaddr.Mu
 	return *res, err
 }
 
-func processSeller(seller Seller, p2pHost host.Host, sellerBuffers *commonlib.NodeBuffers, myReachableAddresses []multiaddr.Multiaddr) {
+func processSeller(
+	seller Seller,
+	p2pHost host.Host,
+	sellerBuffers *commonlib.NodeBuffers,
+	myReachableAddresses []multiaddr.Multiaddr,
+	controlExec *controlplane.Executor,
+) {
 	sellerEvnAddress := keylib.ConverHederaPublicKeyToEthereunAddress(seller.PublicKey)
 	peerIDStr := keylib.ConvertHederaPublicKeyToPeerID(seller.PublicKey)
 	peerID, _ := peer.Decode(peerIDStr)
@@ -494,8 +506,28 @@ func processSeller(seller Seller, p2pHost host.Host, sellerBuffers *commonlib.No
 	if len(conns) == 0 {
 		if !peerHasBuffer { // no cons and never requested
 			// Initial attempt: check contract availability once before sending.
-			perrInfo, err := hedera_helper.GetPeerInfo(sellerEvnAddress)
-			if err != nil {
+			type peerInfoRes struct {
+				info hedera_helper.PeerInfo
+				err  error
+			}
+			peerInfoCh := make(chan peerInfoRes, 1)
+			if submitErr := controlExec.Submit(controlplane.PriorityNormal, 120*time.Millisecond, func(taskCtx context.Context) {
+				info, err := hedera_helper.GetPeerInfo(sellerEvnAddress)
+				select {
+				case peerInfoCh <- peerInfoRes{info: info, err: err}:
+				case <-taskCtx.Done():
+				}
+			}); submitErr != nil {
+				return
+			}
+			var perrInfo hedera_helper.PeerInfo
+			select {
+			case res := <-peerInfoCh:
+				if res.err != nil {
+					return
+				}
+				perrInfo = res.info
+			case <-time.After(3500 * time.Millisecond):
 				return
 			}
 			if !perrInfo.Available {
@@ -511,7 +543,23 @@ func processSeller(seller Seller, p2pHost host.Host, sellerBuffers *commonlib.No
 			}
 
 			sellerBuffers.IncrementReconnectAttempts(peerID)
-			if execErr := hedera_helper.SendTransactionEnvelope(envelope); execErr != nil {
+			sendErrCh := make(chan error, 1)
+			if submitErr := controlExec.Submit(controlplane.PriorityHigh, 120*time.Millisecond, func(taskCtx context.Context) {
+				err := hedera_helper.SendTransactionEnvelope(envelope)
+				select {
+				case sendErrCh <- err:
+				case <-taskCtx.Done():
+				}
+			}); submitErr != nil {
+				return
+			}
+			var execErr error
+			select {
+			case execErr = <-sendErrCh:
+			case <-time.After(5 * time.Second):
+				execErr = fmt.Errorf("send timeout")
+			}
+			if execErr != nil {
 				// has errors
 				sellerBuffers.AddBuffer2(peerID, envelope, true, commonlib.SendFail, commonlib.Connecting)
 				sellerBuffers.SetPeerPublicKey(peerID, seller.PublicKey)
@@ -531,7 +579,22 @@ func processSeller(seller Seller, p2pHost host.Host, sellerBuffers *commonlib.No
 				log.Println("re-submit because it's time now", isTooEarly, a, b)
 			}
 			sellerBuffers.IncrementReconnectAttempts(peerID)
-			secondExecError := hedera_helper.SendTransactionEnvelopeBestEffort(peerBuffer.RequestOrResponse)
+			resendErrCh := make(chan error, 1)
+			if submitErr := controlExec.Submit(controlplane.PriorityLow, 100*time.Millisecond, func(taskCtx context.Context) {
+				err := hedera_helper.SendTransactionEnvelopeBestEffort(peerBuffer.RequestOrResponse)
+				select {
+				case resendErrCh <- err:
+				case <-taskCtx.Done():
+				}
+			}); submitErr != nil {
+				return
+			}
+			var secondExecError error
+			select {
+			case secondExecError = <-resendErrCh:
+			case <-time.After(3500 * time.Millisecond):
+				secondExecError = fmt.Errorf("best-effort resend timeout")
+			}
 			if secondExecError != nil {
 				log.Printf("💀-2  skip that seller %s because ExecuteHederaTransaction error: %v", sellerEvnAddress, secondExecError)
 				// TODO: 💥 tell to myself that I could not send the transaction to the other side
