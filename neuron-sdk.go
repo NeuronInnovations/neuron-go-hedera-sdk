@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"sync"
 
 	neuronbuffers "github.com/NeuronInnovations/neuron-go-hedera-sdk/common-lib"
 
@@ -48,6 +49,22 @@ import (
 var fixPrivKey_g crypto.PrivKey
 
 var Version string
+var (
+	buyerSellerProviderMu sync.RWMutex
+	buyerSellerProvider   func() []string
+)
+
+func SetBuyerSellerProvider(provider func() []string) {
+	buyerSellerProviderMu.Lock()
+	defer buyerSellerProviderMu.Unlock()
+	buyerSellerProvider = provider
+}
+
+func getBuyerSellerProvider() func() []string {
+	buyerSellerProviderMu.RLock()
+	defer buyerSellerProviderMu.RUnlock()
+	return buyerSellerProvider
+}
 
 func init() {
 
@@ -339,7 +356,7 @@ func launchBuyerVersusSellerApp(
 ) {
 	switch *flags.BuyerOrSellerFlag {
 	case "buyer":
-		streambuyervsseller.HandleBuyerCase(ctx, p2pHost, buyerCase, buyerCaseTopicCallBack, onGiveUpReconnect)
+		streambuyervsseller.HandleBuyerCase(ctx, p2pHost, buyerCase, buyerCaseTopicCallBack, onGiveUpReconnect, getBuyerSellerProvider())
 	case "seller":
 		streambuyervsseller.HandleSellerCase(ctx, p2pHost, protocol, sellerCase, sellerCaseTopicCallBack)
 	case "validator":
