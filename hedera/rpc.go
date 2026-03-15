@@ -2,6 +2,7 @@ package hedera_helper
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"log"
 	"math/big"
@@ -242,6 +243,36 @@ func normalizeEvmAddress(evm string) string {
 		return ""
 	}
 	return "0x" + s
+}
+
+// GetPeerIDFromEvmViaMirror derives the libp2p peer ID for an EVM address by
+// looking up the Hedera account via the mirror and converting its public key
+// to a peer ID (same key the libp2p host uses for that identity).
+// Use when the contract returns a nickname or invalid peer ID.
+func GetPeerIDFromEvmViaMirror(evmAddress string) (peerID string, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("derive peer ID from public key: %v", r)
+			peerID = ""
+		}
+	}()
+	key := normalizeEvmAddress(evmAddress)
+	if key == "" {
+		return "", fmt.Errorf("invalid evm address")
+	}
+	accountID, err := hedera.AccountIDFromEvmAddress(0, 0, key)
+	if err != nil {
+		return "", fmt.Errorf("account from evm: %w", err)
+	}
+	accInfo, err := GetAccountInfoFromMirror(accountID)
+	if err != nil {
+		return "", fmt.Errorf("mirror account info: %w", err)
+	}
+	if accInfo.PublicKey == "" {
+		return "", errors.New("no public key in mirror account")
+	}
+	peerID = keylib.ConvertHederaPublicKeyToPeerID(accInfo.PublicKey)
+	return peerID, nil
 }
 func GetAllPeers() ([]string, error) {
 	contractCaller := GetHRpcClient()

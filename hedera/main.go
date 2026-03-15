@@ -31,8 +31,10 @@ var (
 	hederaWriteSem     = make(chan struct{}, 2)
 	// Reserved lane for user-triggered connect/reconnect envelopes so
 	// background maintenance writes cannot starve interactive flows.
-	hederaPriorityWriteLimiter = rate.NewLimiter(rate.Every(250*time.Millisecond), 1)
-	hederaPriorityWriteSem     = make(chan struct{}, 1)
+	// Allow multiple concurrent priority sends so adding seller B does not block
+	// seller A's send (and vice versa); otherwise the second add waits for the first.
+	hederaPriorityWriteLimiter = rate.NewLimiter(rate.Every(250*time.Millisecond), 4)
+	hederaPriorityWriteSem     = make(chan struct{}, 4)
 	hRpcMu             sync.Mutex
 	hRpcClient         *ethclient.Client
 	hRpcCaller         *hederacontract.HederacontractCaller
@@ -354,41 +356,56 @@ func BuyerPrepareServiceRequestWithSellerInfo(
 		}
 	}
 
-	// Create new shared account if no valid cached one exists
+	// Create new shared account if no valid cached one exists.
+	// Run the Hedera I/O in a separate goroutine so the connect path doesn't
+	// block other work (dial/listen, other peers) while the create completes.
 	if sharedAccID.Account == 0 {
 		sharedAccTx, err := createSharedAccount(fromHederaPupblicKeyEnc, toHederaPublicKeyEnc, arbiterHederaKeyEnc, amount)
 		if err != nil {
 			return nil, fmt.Errorf("error preparing a shared account: %v", err)
 		}
-		release, slotErr := acquireHederaWriteSlot("CreateSharedAccount")
-		if slotErr != nil {
-			return nil, slotErr
+		type createResult struct {
+			id  hedera.AccountID
+			err error
 		}
-		sharedAccTxResponse, err :=
-			sharedAccTx.SetMaxBackoff(time.Second * 5).SetMaxRetry(10).Execute(client)
-		release()
-
-		if err != nil {
-			return nil, fmt.Errorf("error creating a shared account: %v", err)
+		resCh := make(chan createResult, 1)
+		go func() {
+			createClient := GetHederaClientUsingEnv()
+			defer createClient.Close()
+			release, slotErr := acquireHederaWriteSlot("CreateSharedAccount")
+			if slotErr != nil {
+				resCh <- createResult{err: slotErr}
+				return
+			}
+			sharedAccTxResponse, err := sharedAccTx.SetMaxBackoff(time.Second * 5).SetMaxRetry(10).Execute(createClient)
+			release()
+			if err != nil {
+				resCh <- createResult{err: fmt.Errorf("error creating a shared account: %v", err)}
+				return
+			}
+			sharedAccTxReceipt, err := sharedAccTxResponse.GetReceipt(createClient)
+			if err != nil {
+				resCh <- createResult{err: err}
+				return
+			}
+			accID := *sharedAccTxReceipt.AccountID
+			log.Printf("Created new shared account %d for seller %s", accID.Account, toEthAddress)
+			saveErr := commonlib.SaveSharedAccount(&commonlib.SharedAccountRecord{
+				BuyerEthAddress:   fromEthAddress,
+				SellerEthAddress:  toEthAddress,
+				ArbiterEthAddress: arbiterEthAddress,
+				SharedAccID:       accID.Account,
+			})
+			if saveErr != nil {
+				log.Printf("Warning: Failed to cache shared account: %v", saveErr)
+			}
+			resCh <- createResult{id: accID}
+		}()
+		res := <-resCh
+		if res.err != nil {
+			return nil, res.err
 		}
-		sharedAccTxReceipt, err := sharedAccTxResponse.GetReceipt(client)
-		if err != nil {
-			return nil, err
-		}
-		sharedAccID = *sharedAccTxReceipt.AccountID
-		log.Printf("Created new shared account %d for seller %s", sharedAccID.Account, toEthAddress)
-
-		// Cache the newly created shared account for future use
-		saveErr := commonlib.SaveSharedAccount(&commonlib.SharedAccountRecord{
-			BuyerEthAddress:   fromEthAddress,
-			SellerEthAddress:  toEthAddress,
-			ArbiterEthAddress: arbiterEthAddress,
-			SharedAccID:       sharedAccID.Account,
-		})
-		if saveErr != nil {
-			log.Printf("Warning: Failed to cache shared account: %v", saveErr)
-			// Continue without caching - graceful degradation
-		}
+		sharedAccID = res.id
 	}
 	fmt.Printf("shared account id: %v\n", sharedAccID)
 	serialized := fmt.Sprintf("%s", fromP2pPublicAddresses)

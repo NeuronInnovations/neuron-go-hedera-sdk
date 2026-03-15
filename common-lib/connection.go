@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"math"
 	"net"
 	"strings"
 	"sync"
@@ -20,6 +19,7 @@ import (
 )
 
 func InitialConnect(ctx context.Context, p2pHost host.Host, addrInfo peer.AddrInfo, buyerBuffers *NodeBuffers, protocol protocol.ID) error {
+	start := time.Now()
 
 	// show address info
 	fmt.Println("address info of initial connect", addrInfo)
@@ -43,13 +43,16 @@ func InitialConnect(ctx context.Context, p2pHost host.Host, addrInfo peer.AddrIn
 	// now there are two cases to test.
 	// a buffer is there but state is not connected, or it is not there.
 
+	log.Printf("[TRACE SELLER CONNECT] start peer=%s addrs=%v connectedness=%s", addrInfo.ID, addrInfo.Addrs, p2pHost.Network().Connectedness(addrInfo.ID))
 	conErr := HolePunchConnectIfNotConnected(ctx, p2pHost, addrInfo, true)
 	//conErr := p2pHost.Connect(ctx, *pid)
 	if conErr != nil {
 		log.Println(conErr)
+		log.Printf("[TRACE SELLER CONNECT] connect failed peer=%s elapsed=%v err=%v", addrInfo.ID, time.Since(start).Round(time.Millisecond), conErr)
 		return fmt.Errorf("%s:error connecting: %w", CanNotConnectUnknownReason, conErr)
 		//continue
 	}
+	log.Printf("[TRACE SELLER CONNECT] connect ok peer=%s elapsed=%v conn_count=%d", addrInfo.ID, time.Since(start).Round(time.Millisecond), len(p2pHost.Network().ConnsToPeer(addrInfo.ID)))
 
 	fmt.Println("connected, create a stream ", addrInfo.ID)
 
@@ -61,22 +64,27 @@ func InitialConnect(ctx context.Context, p2pHost host.Host, addrInfo peer.AddrIn
 	defer cancel()
 
 	for _, conn := range p2pHost.Network().ConnsToPeer(addrInfo.ID) {
-		log.Println("Connection to %s open with muxer: %s", addrInfo.ID, conn.ConnState())
+		log.Printf("Connection to %s open with muxer: %v", addrInfo.ID, conn.ConnState())
 	}
 
+	log.Printf("[TRACE SELLER CONNECT] NewStream first attempt peer=%s elapsed=%v", addrInfo.ID, time.Since(start).Round(time.Millisecond))
 	s, strErr := p2pHost.NewStream(streamCtx, addrInfo.ID, protocol)
 	if strErr != nil {
 		log.Printf("First attempt failed, resetting connection and retrying: %v", strErr)
+		log.Printf("[TRACE SELLER CONNECT] NewStream first attempt failed peer=%s elapsed=%v err=%v", addrInfo.ID, time.Since(start).Round(time.Millisecond), strErr)
 		p2pHost.Network().ClosePeer(addrInfo.ID)
 		time.Sleep(1 * time.Second) // Brief delay before retry
+		log.Printf("[TRACE SELLER CONNECT] NewStream retry peer=%s elapsed=%v", addrInfo.ID, time.Since(start).Round(time.Millisecond))
 		s, strErr = p2pHost.NewStream(ctx, addrInfo.ID, protocol)
 		if strErr != nil {
 			log.Println("failed to create a new stream in InitialConnect. ", strErr)
 			log.Println("this is what we know about the buffer:  exists:", exists, " bufferrInfo", info)
+			log.Printf("[TRACE SELLER CONNECT] NewStream retry failed peer=%s elapsed=%v err=%v", addrInfo.ID, time.Since(start).Round(time.Millisecond), strErr)
 			return fmt.Errorf("%s:error connecting: %w", CanNotConnectStreamError, strErr)
 		}
 		//continue
 	}
+	log.Printf("[TRACE SELLER CONNECT] NewStream ok peer=%s elapsed=%v stream_id=%s", addrInfo.ID, time.Since(start).Round(time.Millisecond), s.ID())
 	fmt.Printf("😍😍 Stream connected and pumping %s -> %s ! 😍😍\n", addrInfo, p2pHost.ID())
 	//streamWriter := bufio.NewWriterSize(s, 100)
 	//streamWriter := bufio.NewWriter(s)
@@ -174,28 +182,47 @@ func ReconnectPeersIfNeeded(ctx context.Context, p2pHost host.Host, peerID peer.
 	return nil
 }
 
+// ErrGiveUpReconnect is returned by IsRequestTooEarly when we've been retrying for over 5 days and should stop.
+var ErrGiveUpReconnect = fmt.Errorf("give up reconnect after 5 days")
+
+// IsRequestTooEarly decides if we should wait before re-sending a service request for a peer with no connection.
+// Uses a day-based schedule: day 1 every 10m, day 2 every 30m, day 3 every 1h, day 4 every 3h, day 5 every 6h, then give up.
 func IsRequestTooEarly(connectedBuffersOfBuyers *NodeBuffers, peerID peer.ID) (bool, error) {
-	reconnectAttempts, lastAttemptTime, exists := connectedBuffersOfBuyers.GetReconnectInfo(peerID)
+	_, lastAttemptTime, firstAttemptTime, exists := connectedBuffersOfBuyers.GetReconnectInfo(peerID)
 	if !exists {
 		return true, fmt.Errorf("%s:could not find the record for the peer %s in the state map. Make an initial connection", WeDoNotKnowPeer, peerID)
 	}
+	if firstAttemptTime.IsZero() {
+		// Legacy buffer without FirstConnectionAttempt; treat as "just started", allow 10m interval
+		firstAttemptTime = lastAttemptTime
+	}
 
-	// Start with an initial backoff of 30 seconds
-	initialBackoff := time.Second * 30
-	backoffDuration := initialBackoff * time.Duration(math.Pow(2, float64(reconnectAttempts)))
+	elapsed := time.Since(firstAttemptTime)
 
-	// Cap the backoff duration at 12 hours
-	maxBackoff := time.Hour * 12
-	if backoffDuration > maxBackoff {
-		backoffDuration = maxBackoff
+	// Give up after 5 days
+	if elapsed > 5*24*time.Hour {
+		return true, ErrGiveUpReconnect
+	}
+
+	// Day-based resubmit interval: day 1 = 10m, day 2 = 30m, day 3 = 1h, day 4 = 3h, day 5 = 6h
+	var interval time.Duration
+	switch {
+	case elapsed <= 24*time.Hour:
+		interval = 10 * time.Minute
+	case elapsed <= 2*24*time.Hour:
+		interval = 30 * time.Minute
+	case elapsed <= 3*24*time.Hour:
+		interval = 1 * time.Hour
+	case elapsed <= 4*24*time.Hour:
+		interval = 3 * time.Hour
+	default:
+		interval = 6 * time.Hour
 	}
 
 	timeSinceLastAttempt := time.Since(lastAttemptTime)
-
-	if timeSinceLastAttempt < backoffDuration {
-		return true, fmt.Errorf("%s:time since last attempt %v is less than backoff duration %v", HoldYourHorses, timeSinceLastAttempt, backoffDuration)
+	if timeSinceLastAttempt < interval {
+		return true, fmt.Errorf("%s:time since last attempt %v is less than interval %v", HoldYourHorses, timeSinceLastAttempt, interval)
 	}
-
 	return false, nil
 }
 

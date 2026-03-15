@@ -107,6 +107,7 @@ func LaunchSDK(
 	sellerCase func(ctx context.Context, p2pHost host.Host, buffers *neuronbuffers.NodeBuffers),
 	sellerCaseTopicListener func(topicMessage hedera.TopicMessage),
 	// validatorCase func(ctx context.Context, p2pHost host.Host, buffers *neuronbuffers.NodeBuffers),
+	onGiveUpReconnect ...func(evm string),
 ) {
 	ctx := context.Background()
 	Version = version
@@ -251,7 +252,19 @@ func LaunchSDK(
 				case event.EvtPeerConnectednessChanged:
 					log.Println("peer connectednes", e.Connectedness.String())
 				case event.EvtPeerIdentificationCompleted:
-					log.Println("peer identification completed", e.Peer)
+					evmStr := ""
+					if pk := p2pHost.Peerstore().PubKey(e.Peer); pk != nil {
+						if raw, err := pk.Raw(); err == nil && len(raw) > 0 {
+							evmStr = keylib.ConverHederaPublicKeyToEthereunAddress(hex.EncodeToString(raw))
+							if evmStr != "" {
+								evmStr = " (evm 0x" + evmStr + ")"
+							}
+						}
+					}
+					if evmStr == "" {
+						evmStr = " (evm unknown)"
+					}
+					log.Println("peer identification completed", e.Peer, evmStr)
 
 				default:
 					log.Println("unknown event", e)
@@ -271,7 +284,11 @@ func LaunchSDK(
 		fmt.Println("Finished announcing to hedera. MyStdIn: ", commonlib.MyStdIn, " MyStdOut: ", commonlib.MyStdOut, " MyStdErr: ", commonlib.MyStdErr)
 
 		// BuyerVsSellerApp is the first style of agent communication pattern; when more modes are added, this will need to be refactored
-		go launchBuyerVersusSellerApp(ctx, p2pHost, protocol, buyerCase, buyerCaseTopicListener, sellerCase, sellerCaseTopicListener)
+		var giveUpCB func(evm string)
+		if len(onGiveUpReconnect) > 0 {
+			giveUpCB = onGiveUpReconnect[0]
+		}
+		go launchBuyerVersusSellerApp(ctx, p2pHost, protocol, buyerCase, buyerCaseTopicListener, sellerCase, sellerCaseTopicListener, giveUpCB)
 
 	default:
 		log.Panic("Unknown mode: ", *flags.PeerOrRelayFlag)
@@ -318,11 +335,11 @@ func launchBuyerVersusSellerApp(
 	sellerCase func(ctx context.Context, p2pHost host.Host, buffers *neuronbuffers.NodeBuffers),
 	sellerCaseTopicCallBack func(topicMessage hedera.TopicMessage),
 	// validatorCase func(ctx context.Context, p2pHost host.Host, buffers *neuronbuffers.NodeBuffers),
-
+	onGiveUpReconnect func(evm string),
 ) {
 	switch *flags.BuyerOrSellerFlag {
 	case "buyer":
-		streambuyervsseller.HandleBuyerCase(ctx, p2pHost, buyerCase, buyerCaseTopicCallBack)
+		streambuyervsseller.HandleBuyerCase(ctx, p2pHost, buyerCase, buyerCaseTopicCallBack, onGiveUpReconnect)
 	case "seller":
 		streambuyervsseller.HandleSellerCase(ctx, p2pHost, protocol, sellerCase, sellerCaseTopicCallBack)
 	case "validator":

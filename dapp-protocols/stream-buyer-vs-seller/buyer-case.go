@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -42,7 +43,7 @@ type Seller struct {
 	Lon       float64
 }
 
-func HandleBuyerCase(ctx context.Context, p2pHost host.Host, buyerCase func(ctx context.Context, p2pHost host.Host, buffers *neuronbuffers.NodeBuffers), buyerCaseTopicCallBack func(topicMessage hedera.TopicMessage)) {
+func HandleBuyerCase(ctx context.Context, p2pHost host.Host, buyerCase func(ctx context.Context, p2pHost host.Host, buffers *neuronbuffers.NodeBuffers), buyerCaseTopicCallBack func(topicMessage hedera.TopicMessage), onGiveUpReconnect func(evm string)) {
 	fmt.Println("Acting as a data buyer (I'll be initiating a request and then waiting for data to come in)")
 
 	if !whoami.NatReachability {
@@ -100,7 +101,7 @@ func HandleBuyerCase(ctx context.Context, p2pHost host.Host, buyerCase func(ctx 
 	for i := 0; i < recoveryWorkerCount; i++ {
 		go func() {
 			for seller := range recoveryJobs {
-				processSeller(seller, p2pHost, sellerBuffers, constMyReachableAddresses, controlExec)
+				processSeller(seller, p2pHost, sellerBuffers, constMyReachableAddresses, controlExec, onGiveUpReconnect)
 				recoveryQueuedMu.Lock()
 				delete(recoveryQueued, seller.PublicKey)
 				recoveryQueuedMu.Unlock()
@@ -434,7 +435,7 @@ func HandleBuyerCase(ctx context.Context, p2pHost host.Host, buyerCase func(ctx 
 				go func(s Seller) {
 					defer wg.Done()
 					defer func() { <-sem }()
-					processSeller(s, p2pHost, sellerBuffers, constMyReachableAddresses, controlExec)
+					processSeller(s, p2pHost, sellerBuffers, constMyReachableAddresses, controlExec, onGiveUpReconnect)
 				}(seller)
 			}
 			wg.Wait()
@@ -483,6 +484,7 @@ func processSeller(
 	sellerBuffers *commonlib.NodeBuffers,
 	myReachableAddresses []multiaddr.Multiaddr,
 	controlExec *controlplane.Executor,
+	onGiveUpReconnect func(evm string),
 ) {
 	sellerEvnAddress := keylib.ConverHederaPublicKeyToEthereunAddress(seller.PublicKey)
 	peerIDStr := keylib.ConvertHederaPublicKeyToPeerID(seller.PublicKey)
@@ -537,6 +539,7 @@ func processSeller(
 			if setupErr != nil {
 				sellerBuffers.AddBuffer2(peerID, envelope, false, commonlib.NotInitiated, neuronbuffers.LibP2PState(commonlib.BadMessageError))
 				sellerBuffers.SetPeerPublicKey(peerID, seller.PublicKey)
+				sellerBuffers.SetPeerEvmAddress(peerID, sellerEvnAddress)
 				log.Printf("💀 envelope setup error; seller %s will be blacklisted, err: %v \n", sellerEvnAddress, setupErr)
 				hedera_helper.SendSelfErrorMessage(neuronbuffers.BadMessageError, "Could not create envelope for: "+sellerEvnAddress, commonlib.DoNothing)
 				return
@@ -563,6 +566,7 @@ func processSeller(
 				// has errors
 				sellerBuffers.AddBuffer2(peerID, envelope, true, commonlib.SendFail, commonlib.Connecting)
 				sellerBuffers.SetPeerPublicKey(peerID, seller.PublicKey)
+				sellerBuffers.SetPeerEvmAddress(peerID, sellerEvnAddress)
 				log.Printf("💀 send hedera transaction envelope error %s, will allow to try later %v \n", sellerEvnAddress, execErr)
 				hedera_helper.SendSelfErrorMessage(neuronbuffers.ServiceError, "Could not send the reqquest to: "+sellerEvnAddress, commonlib.DoNothing)
 				return
@@ -570,14 +574,21 @@ func processSeller(
 			// has no errors
 			sellerBuffers.AddBuffer2(peerID, envelope, true, commonlib.SendOK, commonlib.Connecting)
 			sellerBuffers.SetPeerPublicKey(peerID, seller.PublicKey)
+			sellerBuffers.SetPeerEvmAddress(peerID, sellerEvnAddress)
 
-		} else { // have buffer,  no cons and requested before: re-submit for up to backoff
-			if isTooEarly, _ := commonlib.IsRequestTooEarly(sellerBuffers, peerID); isTooEarly {
+		} else { // have buffer, no cons and requested before: re-submit on day-based schedule, give up after 5 days
+			isTooEarly, tooEarlyErr := commonlib.IsRequestTooEarly(sellerBuffers, peerID)
+			if isTooEarly {
+				if tooEarlyErr != nil && errors.Is(tooEarlyErr, commonlib.ErrGiveUpReconnect) {
+					log.Printf("[INFO] Giving up re-submit for seller %s (evm %s) after 5 days", peerIDStr, sellerEvnAddress)
+					if onGiveUpReconnect != nil {
+						onGiveUpReconnect(sellerEvnAddress)
+					}
+				}
 				return
-			} else {
-				a, b, _ := sellerBuffers.GetReconnectInfo(peerID)
-				log.Println("re-submit because it's time now", isTooEarly, a, b)
 			}
+			attempts, _, firstAttempt, _ := sellerBuffers.GetReconnectInfo(peerID)
+			log.Printf("[INFO] re-submit (attempt %d, first try %s ago) for %s", attempts, time.Since(firstAttempt).Round(time.Minute), sellerEvnAddress)
 			sellerBuffers.IncrementReconnectAttempts(peerID)
 			resendErrCh := make(chan error, 1)
 			if submitErr := controlExec.Submit(controlplane.PriorityLow, 100*time.Millisecond, func(taskCtx context.Context) {
@@ -627,7 +638,8 @@ func processSeller(
 			sellerBuffers.UpdateBufferRendezvousState(peerID, commonlib.SendOK)
 			sellerBuffers.UpdateBufferLibP2PState(peerID, commonlib.Connected)
 			sellerBuffers.SetLastOtherSideMultiAddress(peerID, conns[0].RemoteMultiaddr())
-
+			// Reset reconnect schedule so when we go down again we start from day 1 (10 min)
+			sellerBuffers.ResetReconnectSchedule(peerID)
 		}
 	} // end if there are conns
 }

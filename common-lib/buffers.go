@@ -104,9 +104,10 @@ type NodeBufferInfo struct {
 	LibP2PState                    LibP2PState         `json:"lib_p2p_state"`
 	RendezvousState                RendezvousState     `json:"rendezvous_state"`
 	IsOtherSideValidAccount        bool                `json:"is_other_side_valid_account"`
-	NoOfConnectionAttempts         int                 `json:"no_of_connection_attempts"`
-	LastConnectionAttempt          time.Time           `json:"last_connection_attempt"`
-	NextScheduledConnectionAttempt time.Time           `json:"next_scheduled_connection_attempt"`
+	NoOfConnectionAttempts          int                 `json:"no_of_connection_attempts"`
+	LastConnectionAttempt           time.Time           `json:"last_connection_attempt"`
+	FirstConnectionAttempt          time.Time           `json:"first_connection_attempt"` // when we first started trying (for day-based resubmit schedule)
+	NextScheduledConnectionAttempt  time.Time           `json:"next_scheduled_connection_attempt"`
 	RequestOrResponse              TopicPostalEnvelope `json:"request_or_response"`
 	NextScheduleRequestTime        time.Time           `json:"next_schedule_request_time"`
 	LastGoodsReceivedTime          time.Time           `json:"last_goods_received_time"`
@@ -147,13 +148,15 @@ func (sb *NodeBuffers) SetLastOtherSideMultiAddress(sellerID peer.ID, lastOtherS
 func (sb *NodeBuffers) AddBuffer2(sellerID peer.ID, request TopicPostalEnvelope, isValidAccount bool, rendezvousState RendezvousState, libP2PState LibP2PState) {
 	sb.mu.Lock()
 	defer sb.mu.Unlock()
+	now := time.Now()
 	sb.Buffers[sellerID] = &NodeBufferInfo{
 		StreamHandler:           nil,
 		RendezvousState:         rendezvousState,
 		LibP2PState:             libP2PState,
 		IsOtherSideValidAccount: isValidAccount,
 		NoOfConnectionAttempts:  1,
-		LastConnectionAttempt:   time.Now(),
+		LastConnectionAttempt:   now,
+		FirstConnectionAttempt:  now,
 		RequestOrResponse:       request,
 	}
 
@@ -249,10 +252,13 @@ func (bb *NodeBuffers) IncrementReconnectAttempts(buyerID peer.ID) {
 	defer bb.mu.Unlock()
 	info, exists := bb.Buffers[buyerID]
 	if exists {
-		info.NoOfConnectionAttempts += 1
-		info.LastConnectionAttempt = time.Now()
-		info.NextScheduledConnectionAttempt = time.Now().Add(time.Second * time.Duration(1<<info.NoOfConnectionAttempts))
-
+		now := time.Now()
+		if info.FirstConnectionAttempt.IsZero() {
+			info.FirstConnectionAttempt = now
+		}
+		info.NoOfConnectionAttempts++
+		info.LastConnectionAttempt = now
+		info.NextScheduledConnectionAttempt = now.Add(time.Second * time.Duration(1<<info.NoOfConnectionAttempts))
 	}
 }
 
@@ -267,15 +273,37 @@ func (bb *NodeBuffers) SetNeuronSellerRequest(buyerID peer.ID, msg TopicPostalEn
 	}
 }
 
-// GetReconnectInfo returns the reconnection attempt count and last attempt time for a buffer
-func (bb *NodeBuffers) GetReconnectInfo(buyerID peer.ID) (int, time.Time, bool) {
+// ResetReconnectSchedule clears the "first attempt" time so the next outage is treated as a new run (day 1, 10 min interval).
+// Call when we achieve connection so that if we go down again later we restart the day-based schedule.
+func (bb *NodeBuffers) ResetReconnectSchedule(peerID peer.ID) {
+	bb.mu.Lock()
+	defer bb.mu.Unlock()
+	info, exists := bb.Buffers[peerID]
+	if exists {
+		info.FirstConnectionAttempt = time.Time{}
+	}
+}
+
+// ResetReconnectScheduleByEvm clears the reconnect schedule for the peer with the given EVM address so the next retry cycle starts from day 1.
+// Use after "give up" when the user manually triggers a new connection attempt (e.g. Restart).
+func (bb *NodeBuffers) ResetReconnectScheduleByEvm(evmAddress string) bool {
+	pid, ok := bb.GetPeerIDByEvm(evmAddress)
+	if !ok {
+		return false
+	}
+	bb.ResetReconnectSchedule(pid)
+	return true
+}
+
+// GetReconnectInfo returns the reconnection attempt count, last attempt time, and first attempt time for a buffer
+func (bb *NodeBuffers) GetReconnectInfo(buyerID peer.ID) (int, time.Time, time.Time, bool) {
 	bb.mu.Lock()
 	defer bb.mu.Unlock()
 	info, exists := bb.Buffers[buyerID]
 	if !exists {
-		return 0, time.Time{}, false
+		return 0, time.Time{}, time.Time{}, false
 	}
-	return info.NoOfConnectionAttempts, info.LastConnectionAttempt, true
+	return info.NoOfConnectionAttempts, info.LastConnectionAttempt, info.FirstConnectionAttempt, true
 }
 
 // GetBufferMap returns a copy of the internal map of buffers and their states
