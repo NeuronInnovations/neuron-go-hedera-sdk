@@ -42,7 +42,7 @@ type Seller struct {
 	Lon       float64
 }
 
-func HandleBuyerCase(ctx context.Context, p2pHost host.Host, buyerCase func(ctx context.Context, p2pHost host.Host, buffers *neuronbuffers.NodeBuffers), buyerCaseTopicCallBack func(topicMessage hedera.TopicMessage), onGiveUpReconnect func(evm string)) {
+func HandleBuyerCase(ctx context.Context, p2pHost host.Host, buyerCase func(ctx context.Context, p2pHost host.Host, buffers *neuronbuffers.NodeBuffers), buyerCaseTopicCallBack func(topicMessage hedera.TopicMessage), onGiveUpReconnect func(evm string), sellerProvider func() []string) {
 	fmt.Println("Acting as a data buyer (I'll be initiating a request and then waiting for data to come in)")
 
 	if !whoami.NatReachability {
@@ -252,6 +252,46 @@ func HandleBuyerCase(ctx context.Context, p2pHost host.Host, buyerCase func(ctx 
 	// -------------------------- END OF BUYER SIDE callback --------------------------
 
 	// -------------------------- LIST SELLERS AND BUY       --------------------------
+
+	if sellerProvider != nil {
+		log.Println("[INFO] Using external seller provider for buyer discovery")
+		go func() {
+			for {
+				sellerKeys := sellerProvider()
+				sellersCopy := make([]Seller, 0, len(sellerKeys))
+				seen := make(map[string]bool)
+				for _, seller := range sellerKeys {
+					seller = strings.TrimSpace(seller)
+					if seller == "" || seen[seller] {
+						continue
+					}
+					seen[seller] = true
+					sellersCopy = append(sellersCopy, Seller{PublicKey: seller})
+				}
+
+				const maxConcurrentSellerWorkers = 3
+				sem := make(chan struct{}, maxConcurrentSellerWorkers)
+				var wg sync.WaitGroup
+				for _, seller := range sellersCopy {
+					wg.Add(1)
+					sem <- struct{}{}
+					go func(s Seller) {
+						defer wg.Done()
+						defer func() { <-sem }()
+						processSeller(s, p2pHost, sellerBuffers, constMyReachableAddresses, controlExec, onGiveUpReconnect)
+					}(seller)
+				}
+				wg.Wait()
+
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(60 * time.Second):
+				}
+			}
+		}()
+		return
+	}
 
 	var (
 		listOfSellers     = make(map[Seller]bool)
