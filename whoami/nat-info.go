@@ -62,7 +62,7 @@ var (
 )
 
 var (
-	addrStrPtr         = "stun.voipgate.com:3478"
+	stunServers        = []string{"stun.voipgate.com:3478", "stun.l.google.com:19302", "stun1.l.google.com:19302", "stun2.l.google.com:19302", "stun3.l.google.com:19302", "stun4.l.google.com:19302", "global.stun.twilio.com:3478", "frankfurt.stun.twilio.com:3478"}
 	timeoutPtr         = 3
 	log                logging.LeveledLogger
 	errResponseMessage = errors.New("error reading from response message channel")
@@ -73,7 +73,15 @@ var (
 func GetNatInfoAndUpdateGlobals(portFlag *string) (string, string, int, bool) {
 	natype, mapDesc, filterDesc, ip, stunRetrievedPort, err := getNatInfo(*portFlag)
 	if err != nil {
-		panic(err)
+		log.Warnf("NAT/STUN discovery failed: %v", err)
+		natPort, _ := strconv.Atoi(*portFlag)
+		NatDeviceType = "unknown"
+		NatIPAddress = ""
+		NatPort = natPort
+		NatReachability = false
+		fmt.Println("STUN Retrieved Port:", -1)
+		fmt.Println("Reachability", NatIPAddress, NatPort, -1, NatDeviceType, "reacheable:", NatReachability)
+		return NatDeviceType, NatIPAddress, NatPort, NatReachability
 	}
 
 	// Compute natDeviceType and natReachability values
@@ -101,9 +109,25 @@ func GetNatInfoAndUpdateGlobals(portFlag *string) (string, string, int, bool) {
 
 func getNatInfo(bind string) (string, string, string, string, int, error) {
 	log = logging.NewDefaultLeveledLoggerForScope("", logging.LogLevelInfo, os.Stdout)
-	mappingResult, mappingdetail, ipAddr, port, err := mappingTests(addrStrPtr, bind)
-	filterdatail, _ := filteringTests(addrStrPtr, bind)
-	return mappingResult, mappingdetail, filterdatail, ipAddr, port, err
+	var lastErr error
+	for _, server := range stunServers {
+		mappingResult, mappingdetail, ipAddr, port, err := mappingTests(server, bind)
+		if err != nil {
+			lastErr = err
+			log.Warnf("STUN mapping test failed for %s: %v", server, err)
+			continue
+		}
+		filterdatail, ferr := filteringTests(server, bind)
+		if ferr != nil {
+			log.Warnf("STUN filtering test failed for %s: %v", server, ferr)
+			filterdatail = "unknown"
+		}
+		return mappingResult, mappingdetail, filterdatail, ipAddr, port, nil
+	}
+	if lastErr == nil {
+		lastErr = errResponseMessage
+	}
+	return "", "", "", "", -1, lastErr
 }
 
 // RFC5780: 4.3.  Determining NAT Mapping Behavior
@@ -381,8 +405,7 @@ func listen(conn *net.UDPConn) (messages chan *stun.Message) {
 			err = m.Decode()
 			if err != nil {
 				log.Infof("Error decoding message: %v", err)
-				close(messages)
-				return
+				continue
 			}
 
 			messages <- m

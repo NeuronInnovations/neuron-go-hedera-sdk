@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -18,8 +17,8 @@ import (
 
 	"github.com/NeuronInnovations/neuron-go-hedera-sdk/upnp"
 
-	"github.com/NeuronInnovations/neuron-go-hedera-sdk/keylib"
 	"github.com/NeuronInnovations/neuron-go-hedera-sdk/controlplane"
+	"github.com/NeuronInnovations/neuron-go-hedera-sdk/keylib"
 
 	hedera_helper "github.com/NeuronInnovations/neuron-go-hedera-sdk/hedera"
 
@@ -576,45 +575,10 @@ func processSeller(
 			sellerBuffers.SetPeerPublicKey(peerID, seller.PublicKey)
 			sellerBuffers.SetPeerEvmAddress(peerID, sellerEvnAddress)
 
-		} else { // have buffer, no cons and requested before: re-submit on day-based schedule, give up after 5 days
-			isTooEarly, tooEarlyErr := commonlib.IsRequestTooEarly(sellerBuffers, peerID)
-			if isTooEarly {
-				if tooEarlyErr != nil && errors.Is(tooEarlyErr, commonlib.ErrGiveUpReconnect) {
-					log.Printf("[INFO] Giving up re-submit for seller %s (evm %s) after 5 days", peerIDStr, sellerEvnAddress)
-					if onGiveUpReconnect != nil {
-						onGiveUpReconnect(sellerEvnAddress)
-					}
-				}
+		} else { // have buffer, no cons and requested before: app owns re-submit scheduling
+			if peerBuffer.RendezvousState != commonlib.SendOK {
 				return
 			}
-			attempts, _, firstAttempt, _ := sellerBuffers.GetReconnectInfo(peerID)
-			log.Printf("[INFO] re-submit (attempt %d, first try %s ago) for %s", attempts, time.Since(firstAttempt).Round(time.Minute), sellerEvnAddress)
-			sellerBuffers.IncrementReconnectAttempts(peerID)
-			resendErrCh := make(chan error, 1)
-			if submitErr := controlExec.Submit(controlplane.PriorityLow, 100*time.Millisecond, func(taskCtx context.Context) {
-				err := hedera_helper.SendTransactionEnvelopeBestEffort(peerBuffer.RequestOrResponse)
-				select {
-				case resendErrCh <- err:
-				case <-taskCtx.Done():
-				}
-			}); submitErr != nil {
-				return
-			}
-			var secondExecError error
-			select {
-			case secondExecError = <-resendErrCh:
-			case <-time.After(3500 * time.Millisecond):
-				secondExecError = fmt.Errorf("best-effort resend timeout")
-			}
-			if secondExecError != nil {
-				log.Printf("💀-2  skip that seller %s because ExecuteHederaTransaction error: %v", sellerEvnAddress, secondExecError)
-				// TODO: 💥 tell to myself that I could not send the transaction to the other side
-				hedera_helper.SendSelfErrorMessage(neuronbuffers.ServiceError, "Could not send the reqquest to: "+sellerEvnAddress, commonlib.DoNothing)
-				sellerBuffers.UpdateBufferRendezvousState(peerID, commonlib.SendFail)
-				sellerBuffers.UpdateBufferLibP2PState(peerID, commonlib.CanNotConnectUnknownReason)
-				return
-			}
-			sellerBuffers.UpdateBufferRendezvousState(peerID, commonlib.SendOK)
 			sellerBuffers.UpdateBufferLibP2PState(peerID, commonlib.Connecting)
 		}
 	} else { // there are cons
