@@ -134,6 +134,7 @@ func HandleSellerCase(ctx context.Context, p2pHost host.Host, protocol protocol.
 
 			switch messageType {
 			case "serviceRequest":
+				reqStart := time.Now().UTC()
 				requestMsgFromOtherSide := new(commonlib.NeuronServiceRequestMsg)
 				err := json.Unmarshal(message.Contents, &requestMsgFromOtherSide)
 				if err != nil {
@@ -148,6 +149,12 @@ func HandleSellerCase(ctx context.Context, p2pHost host.Host, protocol protocol.
 					Realm: 0,
 					Topic: requestMsgFromOtherSide.StdInTopic,
 				}
+				log.Printf("[TRACE SELLER REQUEST] received serviceRequest tx=%s consensus=%s buyer_pub=%s shared_acc=%d",
+					message.TransactionID,
+					message.ConsensusTimestamp,
+					requestMsgFromOtherSide.PublicKey,
+					requestMsgFromOtherSide.SharedAccID,
+				)
 
 				if requestMsgFromOtherSide.Version != "0.4" {
 					fmt.Println("NACK: Ignore message as it does not match the current version", requestMsgFromOtherSide.Version) // TODO: send to the other side
@@ -166,6 +173,11 @@ func HandleSellerCase(ctx context.Context, p2pHost host.Host, protocol protocol.
 					fmt.Println("That buyer either doesn't exist on the hedera network or hedera struggles to fetch him:", err)
 					return
 				}
+				log.Printf("[TRACE SELLER REQUEST] buyer account info ok tx=%s elapsed=%v account=%s",
+					message.TransactionID,
+					time.Since(reqStart).Round(time.Millisecond),
+					buyerSharedAccountInfo.AccountID,
+				)
 
 				// TODO: check what it says in the SLA
 				validatorLib.IsRequestPermitted()
@@ -202,13 +214,31 @@ func HandleSellerCase(ctx context.Context, p2pHost host.Host, protocol protocol.
 				if decodeErr != nil {
 					log.Panic(decodeErr)
 				}
+				log.Printf("[TRACE SELLER REQUEST] dialing buyer tx=%s buyer_peer=%s addr=%s elapsed=%v",
+					message.TransactionID,
+					addrInfo.ID,
+					pidStr,
+					time.Since(reqStart).Round(time.Millisecond),
+				)
 				
 				// Register the public key -> peer ID mapping for log correlation
 				commonlib.RegisterPeerPublicKey(addrInfo.ID, otherPublicKey)
 				
 				initiationError := commonlib.InitialConnect(ctx, p2pHost, *addrInfo, buyerBuffers, protocol)
 				if initiationError != nil {
+					log.Printf("[TRACE SELLER REQUEST] InitialConnect failed tx=%s buyer_peer=%s elapsed=%v err=%v",
+						message.TransactionID,
+						addrInfo.ID,
+						time.Since(reqStart).Round(time.Millisecond),
+						initiationError,
+					)
 					hedera_helper.PeerSendErrorMessage(otherSideStdIn, commonlib.DialError, fmt.Sprintf("I tried to initialise a connection but got this error: %v", initiationError.Error()), commonlib.PunchMe)
+				} else {
+					log.Printf("[TRACE SELLER REQUEST] InitialConnect succeeded tx=%s buyer_peer=%s elapsed=%v",
+						message.TransactionID,
+						addrInfo.ID,
+						time.Since(reqStart).Round(time.Millisecond),
+					)
 				}
 
 				envelope := commonlib.TopicPostalEnvelope{
