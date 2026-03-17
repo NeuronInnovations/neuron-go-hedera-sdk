@@ -38,17 +38,17 @@ func StateManagerInit(buyerOrSellerFlag string, clearCacheFlag bool) {
 }
 
 type NodeBuffers struct {
-	mu               sync.Mutex
-	Buffers          map[peer.ID]*NodeBufferInfo
-	peerIDByEvm      map[string]peer.ID // lookup: do not use peer IDs as external keys
+	mu                sync.Mutex
+	Buffers           map[peer.ID]*NodeBufferInfo
+	peerIDByEvm       map[string]peer.ID // lookup: do not use peer IDs as external keys
 	peerIDByPublicKey map[string]peer.ID
 }
 
 // NewNodeBuffers creates a new instance of NodeBuffers
 func NewNodeBuffers() *NodeBuffers {
 	return &NodeBuffers{
-		Buffers:          make(map[peer.ID]*NodeBufferInfo),
-		peerIDByEvm:      make(map[string]peer.ID),
+		Buffers:           make(map[peer.ID]*NodeBufferInfo),
+		peerIDByEvm:       make(map[string]peer.ID),
 		peerIDByPublicKey: make(map[string]peer.ID),
 	}
 }
@@ -98,21 +98,27 @@ type TopicPostalEnvelope struct {
 
 // NodeBufferInfo holds runtime info related to a remote peer.
 type NodeBufferInfo struct {
-	Writer                         network.Stream      `json:"-"` //  TODO: only one needed
+	Writer                         network.Stream      `json:"-"` // TODO: only one needed
 	StreamHandler                  *network.Stream     `json:"-"`
 	LastOtherSideMultiAddress      string              `json:"last_other_side_multi_address"`
 	LibP2PState                    LibP2PState         `json:"lib_p2p_state"`
 	RendezvousState                RendezvousState     `json:"rendezvous_state"`
 	IsOtherSideValidAccount        bool                `json:"is_other_side_valid_account"`
-	NoOfConnectionAttempts          int                 `json:"no_of_connection_attempts"`
-	LastConnectionAttempt           time.Time           `json:"last_connection_attempt"`
-	FirstConnectionAttempt          time.Time           `json:"first_connection_attempt"` // when we first started trying (for day-based resubmit schedule)
-	NextScheduledConnectionAttempt  time.Time           `json:"next_scheduled_connection_attempt"`
+	NoOfConnectionAttempts         int                 `json:"no_of_connection_attempts"`
+	RequestAttemptsSinceSuccess    int                 `json:"request_attempts_since_success"`
+	SuccessfulConnections          int                 `json:"successful_connections"`
+	DisconnectCount                int                 `json:"disconnect_count"`
+	DisconnectScore                int                 `json:"disconnect_score"`
+	LastConnectionAttempt          time.Time           `json:"last_connection_attempt"`
+	FirstConnectionAttempt         time.Time           `json:"first_connection_attempt"` // when we first started trying (for give-up horizon)
+	LastSuccessAt                  time.Time           `json:"last_success_at"`
+	LastDisconnectAt               time.Time           `json:"last_disconnect_at"`
+	NextScheduledConnectionAttempt time.Time           `json:"next_scheduled_connection_attempt"`
 	RequestOrResponse              TopicPostalEnvelope `json:"request_or_response"`
 	NextScheduleRequestTime        time.Time           `json:"next_schedule_request_time"`
 	LastGoodsReceivedTime          time.Time           `json:"last_goods_received_time"`
 	PeerPublicKey                  string              `json:"peer_public_key"` // The peer's public key from Hedera (for log correlation)
-	EvmAddress                     string              `json:"evm_address"`    // The peer's EVM address when known (for lookup; do not use peer ID as key)
+	EvmAddress                     string              `json:"evm_address"`     // The peer's EVM address when known (for lookup; do not use peer ID as key)
 }
 
 // ShortPublicKey returns the last 8 characters of the public key for logging
@@ -149,35 +155,101 @@ func (sb *NodeBuffers) AddBuffer2(sellerID peer.ID, request TopicPostalEnvelope,
 	sb.mu.Lock()
 	defer sb.mu.Unlock()
 	now := time.Now()
-	sb.Buffers[sellerID] = &NodeBufferInfo{
-		StreamHandler:           nil,
-		RendezvousState:         rendezvousState,
-		LibP2PState:             libP2PState,
-		IsOtherSideValidAccount: isValidAccount,
-		NoOfConnectionAttempts:  1,
-		LastConnectionAttempt:   now,
-		FirstConnectionAttempt:  now,
-		RequestOrResponse:       request,
+	prev := sb.Buffers[sellerID]
+	successfulConnections := 0
+	disconnectCount := 0
+	disconnectScore := 0
+	lastSuccessAt := time.Time{}
+	lastDisconnectAt := time.Time{}
+	lastGoodsReceivedAt := time.Time{}
+	lastOtherSideMultiAddress := ""
+	peerPublicKey := ""
+	evmAddress := ""
+	if prev != nil {
+		successfulConnections = prev.SuccessfulConnections
+		disconnectCount = prev.DisconnectCount
+		disconnectScore = effectiveDisconnectScore(now, prev.DisconnectScore, prev.LastSuccessAt, prev.LastDisconnectAt)
+		lastSuccessAt = prev.LastSuccessAt
+		lastDisconnectAt = prev.LastDisconnectAt
+		lastGoodsReceivedAt = prev.LastGoodsReceivedTime
+		lastOtherSideMultiAddress = prev.LastOtherSideMultiAddress
+		peerPublicKey = prev.PeerPublicKey
+		evmAddress = prev.EvmAddress
 	}
-
+	sb.Buffers[sellerID] = &NodeBufferInfo{
+		StreamHandler:                  nil,
+		LastOtherSideMultiAddress:      lastOtherSideMultiAddress,
+		RendezvousState:                rendezvousState,
+		LibP2PState:                    libP2PState,
+		IsOtherSideValidAccount:        isValidAccount,
+		NoOfConnectionAttempts:         1,
+		RequestAttemptsSinceSuccess:    1,
+		SuccessfulConnections:          successfulConnections,
+		DisconnectCount:                disconnectCount,
+		DisconnectScore:                disconnectScore,
+		LastConnectionAttempt:          now,
+		FirstConnectionAttempt:         now,
+		LastSuccessAt:                  lastSuccessAt,
+		LastDisconnectAt:               lastDisconnectAt,
+		NextScheduledConnectionAttempt: now.Add(computeRetryDelay(1, successfulConnections > 0, disconnectScore)),
+		RequestOrResponse:              request,
+		LastGoodsReceivedTime:          lastGoodsReceivedAt,
+		PeerPublicKey:                  peerPublicKey,
+		EvmAddress:                     evmAddress,
+	}
 }
 
 // AddBuffer3 adds a new bufio.Writer for a buyerID with a specified state and a bufio.Writer
 func (bb *NodeBuffers) AddBuffer3(buyerID peer.ID, streamWriter network.Stream, rendezvousState RendezvousState, libP2PState LibP2PState) {
 	bb.mu.Lock()
 	defer bb.mu.Unlock()
+	now := time.Now()
+	prev := bb.Buffers[buyerID]
+	successfulConnections := 1
+	disconnectCount := 0
+	disconnectScore := 0
+	lastDisconnectAt := time.Time{}
+	lastGoodsReceivedAt := time.Time{}
+	requestOrResponse := TopicPostalEnvelope{}
+	lastOtherSideMultiAddress := ""
+	peerPublicKey := ""
+	evmAddress := ""
+	if prev != nil {
+		successfulConnections = prev.SuccessfulConnections + 1
+		disconnectCount = prev.DisconnectCount
+		disconnectScore = effectiveDisconnectScore(now, prev.DisconnectScore, prev.LastSuccessAt, prev.LastDisconnectAt)
+		if disconnectScore > 0 {
+			disconnectScore--
+		}
+		lastDisconnectAt = prev.LastDisconnectAt
+		lastGoodsReceivedAt = prev.LastGoodsReceivedTime
+		requestOrResponse = prev.RequestOrResponse
+		lastOtherSideMultiAddress = prev.LastOtherSideMultiAddress
+		peerPublicKey = prev.PeerPublicKey
+		evmAddress = prev.EvmAddress
+	}
 	bb.Buffers[buyerID] = &NodeBufferInfo{
 		Writer:                         streamWriter,
+		LastOtherSideMultiAddress:      lastOtherSideMultiAddress,
 		RendezvousState:                rendezvousState,
 		LibP2PState:                    libP2PState,
 		IsOtherSideValidAccount:        true,
 		NoOfConnectionAttempts:         0,
-		LastConnectionAttempt:          time.Now(),
-		RequestOrResponse:              TopicPostalEnvelope{},
+		RequestAttemptsSinceSuccess:    0,
+		SuccessfulConnections:          successfulConnections,
+		DisconnectCount:                disconnectCount,
+		DisconnectScore:                disconnectScore,
+		LastConnectionAttempt:          now,
+		FirstConnectionAttempt:         time.Time{},
+		LastSuccessAt:                  now,
+		LastDisconnectAt:               lastDisconnectAt,
+		RequestOrResponse:              requestOrResponse,
 		NextScheduleRequestTime:        time.Time{},
 		NextScheduledConnectionAttempt: time.Time{},
+		LastGoodsReceivedTime:          lastGoodsReceivedAt,
+		PeerPublicKey:                  peerPublicKey,
+		EvmAddress:                     evmAddress,
 	}
-
 }
 
 // UpdateBufferIsValidAccount updates account validity
@@ -229,6 +301,8 @@ func (bb *NodeBuffers) UpdateBufferLibP2PState(buyerID peer.ID, state LibP2PStat
 	info.LibP2PState = state
 	if state == Connected {
 		info.NoOfConnectionAttempts = 0
+		info.RequestAttemptsSinceSuccess = 0
+		info.LastSuccessAt = time.Now()
 	}
 	info.LastConnectionAttempt = time.Now()
 
@@ -257,8 +331,10 @@ func (bb *NodeBuffers) IncrementReconnectAttempts(buyerID peer.ID) {
 			info.FirstConnectionAttempt = now
 		}
 		info.NoOfConnectionAttempts++
+		info.RequestAttemptsSinceSuccess++
 		info.LastConnectionAttempt = now
-		info.NextScheduledConnectionAttempt = now.Add(time.Second * time.Duration(1<<info.NoOfConnectionAttempts))
+		info.DisconnectScore = effectiveDisconnectScore(now, info.DisconnectScore, info.LastSuccessAt, info.LastDisconnectAt)
+		info.NextScheduledConnectionAttempt = now.Add(computeRetryDelay(info.RequestAttemptsSinceSuccess, info.SuccessfulConnections > 0, info.DisconnectScore))
 	}
 }
 
@@ -280,7 +356,10 @@ func (bb *NodeBuffers) ResetReconnectSchedule(peerID peer.ID) {
 	defer bb.mu.Unlock()
 	info, exists := bb.Buffers[peerID]
 	if exists {
+		info.NoOfConnectionAttempts = 0
+		info.RequestAttemptsSinceSuccess = 0
 		info.FirstConnectionAttempt = time.Time{}
+		info.NextScheduledConnectionAttempt = time.Time{}
 	}
 }
 
@@ -303,7 +382,7 @@ func (bb *NodeBuffers) GetReconnectInfo(buyerID peer.ID) (int, time.Time, time.T
 	if !exists {
 		return 0, time.Time{}, time.Time{}, false
 	}
-	return info.NoOfConnectionAttempts, info.LastConnectionAttempt, info.FirstConnectionAttempt, true
+	return info.RequestAttemptsSinceSuccess, info.LastConnectionAttempt, info.FirstConnectionAttempt, true
 }
 
 // GetBufferMap returns a copy of the internal map of buffers and their states
@@ -325,6 +404,139 @@ func (bb *NodeBuffers) SetLastGoodsReceivedTime(buyerID peer.ID) {
 		info.LastGoodsReceivedTime = time.Now()
 
 	}
+}
+
+func (bb *NodeBuffers) RecordDisconnectEvent(buyerID peer.ID) bool {
+	bb.mu.Lock()
+	defer bb.mu.Unlock()
+	info, exists := bb.Buffers[buyerID]
+	if !exists {
+		return false
+	}
+	now := time.Now()
+	info.DisconnectScore = effectiveDisconnectScore(now, info.DisconnectScore, info.LastSuccessAt, info.LastDisconnectAt)
+	info.DisconnectCount++
+	if info.DisconnectScore < 8 {
+		info.DisconnectScore++
+	}
+	info.LastDisconnectAt = now
+	return true
+}
+
+func (bb *NodeBuffers) RetryPolicySnapshot(buyerID peer.ID) (int, int, bool, time.Time, time.Time, bool) {
+	bb.mu.Lock()
+	defer bb.mu.Unlock()
+	info, exists := bb.Buffers[buyerID]
+	if !exists {
+		return 0, 0, false, time.Time{}, time.Time{}, false
+	}
+	effectiveScore := effectiveDisconnectScore(time.Now(), info.DisconnectScore, info.LastSuccessAt, info.LastDisconnectAt)
+	return info.RequestAttemptsSinceSuccess, effectiveScore, info.SuccessfulConnections > 0, info.LastConnectionAttempt, info.FirstConnectionAttempt, true
+}
+
+func effectiveDisconnectScore(now time.Time, rawScore int, lastSuccessAt, lastDisconnectAt time.Time) int {
+	score := rawScore
+	if score < 0 {
+		score = 0
+	}
+	if !lastDisconnectAt.IsZero() {
+		sinceDisconnect := now.Sub(lastDisconnectAt)
+		switch {
+		case sinceDisconnect >= 6*time.Hour:
+			score = 0
+		case sinceDisconnect >= 2*time.Hour:
+			score -= 2
+		case sinceDisconnect >= 1*time.Hour:
+			score--
+		}
+	}
+	if !lastSuccessAt.IsZero() {
+		stableFor := now.Sub(lastSuccessAt)
+		switch {
+		case stableFor >= 2*time.Hour:
+			score = 0
+		case stableFor >= time.Hour:
+			score -= 4
+		case stableFor >= 30*time.Minute:
+			score -= 2
+		case stableFor >= 10*time.Minute:
+			score--
+		}
+	}
+	if score < 0 {
+		return 0
+	}
+	return score
+}
+
+// computeRetryDelay balances fast recovery with seller protection:
+// sellers that have never connected get a few aggressive retries to overcome
+// missed topic consumption/timing, while sellers with repeated disconnects back
+// off until stability returns. disconnectScore decays after sustained healthy
+// time so recovered sellers become eligible for aggressive reconnect again.
+func computeRetryDelay(attemptsSinceSuccess int, hasEverConnected bool, disconnectScore int) time.Duration {
+	if attemptsSinceSuccess < 1 {
+		attemptsSinceSuccess = 1
+	}
+
+	var schedule []time.Duration
+	switch {
+	case !hasEverConnected && disconnectScore <= 3:
+		schedule = []time.Duration{
+			30 * time.Second,
+			90 * time.Second,
+			3 * time.Minute,
+			10 * time.Minute,
+			30 * time.Minute,
+			time.Hour,
+			3 * time.Hour,
+			6 * time.Hour,
+		}
+	case !hasEverConnected:
+		schedule = []time.Duration{
+			3 * time.Minute,
+			10 * time.Minute,
+			30 * time.Minute,
+			time.Hour,
+			3 * time.Hour,
+			6 * time.Hour,
+		}
+	case disconnectScore <= 1:
+		schedule = []time.Duration{
+			15 * time.Second,
+			time.Minute,
+			3 * time.Minute,
+			10 * time.Minute,
+			30 * time.Minute,
+			time.Hour,
+			3 * time.Hour,
+			6 * time.Hour,
+		}
+	case disconnectScore <= 3:
+		schedule = []time.Duration{
+			time.Minute,
+			3 * time.Minute,
+			10 * time.Minute,
+			30 * time.Minute,
+			time.Hour,
+			3 * time.Hour,
+			6 * time.Hour,
+		}
+	default:
+		schedule = []time.Duration{
+			10 * time.Minute,
+			30 * time.Minute,
+			time.Hour,
+			3 * time.Hour,
+			6 * time.Hour,
+		}
+	}
+
+	idx := attemptsSinceSuccess - 1
+	if idx >= len(schedule) {
+		return schedule[len(schedule)-1]
+	}
+	return schedule[idx]
 }
 
 // SetPeerPublicKey stores the peer's public key and registers it for lookup (do not use peer ID as external key).

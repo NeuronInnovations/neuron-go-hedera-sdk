@@ -165,6 +165,7 @@ func ReconnectPeersIfNeeded(ctx context.Context, p2pHost host.Host, peerID peer.
 	s, err := p2pHost.NewStream(ctx, peerID, protocol)
 	if err != nil {
 		log.Println("Stream creation failed to", peerID, ":", err)
+		connectedBuffersOfBuyers.RecordDisconnectEvent(peerID)
 		connectedBuffersOfBuyers.IncrementReconnectAttempts(peerID)
 
 		if bufferInfo.NoOfConnectionAttempts > 20 {
@@ -185,15 +186,15 @@ func ReconnectPeersIfNeeded(ctx context.Context, p2pHost host.Host, peerID peer.
 // ErrGiveUpReconnect is returned by IsRequestTooEarly when we've been retrying for over 5 days and should stop.
 var ErrGiveUpReconnect = fmt.Errorf("give up reconnect after 5 days")
 
-// IsRequestTooEarly decides if we should wait before re-sending a service request for a peer with no connection.
-// Uses a day-based schedule: day 1 every 10m, day 2 every 30m, day 3 every 1h, day 4 every 3h, day 5 every 6h, then give up.
+// IsRequestTooEarly decides if we should wait before re-sending a service request.
+// New peers get aggressive early retries; unstable peers back off until they normalize.
 func IsRequestTooEarly(connectedBuffersOfBuyers *NodeBuffers, peerID peer.ID) (bool, error) {
-	_, lastAttemptTime, firstAttemptTime, exists := connectedBuffersOfBuyers.GetReconnectInfo(peerID)
+	attemptsSinceSuccess, disconnectScore, hasEverConnected, lastAttemptTime, firstAttemptTime, exists := connectedBuffersOfBuyers.RetryPolicySnapshot(peerID)
 	if !exists {
 		return true, fmt.Errorf("%s:could not find the record for the peer %s in the state map. Make an initial connection", WeDoNotKnowPeer, peerID)
 	}
 	if firstAttemptTime.IsZero() {
-		// Legacy buffer without FirstConnectionAttempt; treat as "just started", allow 10m interval
+		// Legacy buffer without FirstConnectionAttempt; treat as "just started".
 		firstAttemptTime = lastAttemptTime
 	}
 
@@ -204,24 +205,11 @@ func IsRequestTooEarly(connectedBuffersOfBuyers *NodeBuffers, peerID peer.ID) (b
 		return true, ErrGiveUpReconnect
 	}
 
-	// Day-based resubmit interval: day 1 = 10m, day 2 = 30m, day 3 = 1h, day 4 = 3h, day 5 = 6h
-	var interval time.Duration
-	switch {
-	case elapsed <= 24*time.Hour:
-		interval = 10 * time.Minute
-	case elapsed <= 2*24*time.Hour:
-		interval = 30 * time.Minute
-	case elapsed <= 3*24*time.Hour:
-		interval = 1 * time.Hour
-	case elapsed <= 4*24*time.Hour:
-		interval = 3 * time.Hour
-	default:
-		interval = 6 * time.Hour
-	}
+	interval := computeRetryDelay(attemptsSinceSuccess, hasEverConnected, disconnectScore)
 
 	timeSinceLastAttempt := time.Since(lastAttemptTime)
 	if timeSinceLastAttempt < interval {
-		return true, fmt.Errorf("%s:time since last attempt %v is less than interval %v", HoldYourHorses, timeSinceLastAttempt, interval)
+		return true, fmt.Errorf("%s:time since last attempt %v is less than interval %v (attempts=%d ever_connected=%v disconnect_score=%d)", HoldYourHorses, timeSinceLastAttempt, interval, attemptsSinceSuccess, hasEverConnected, disconnectScore)
 	}
 	return false, nil
 }
@@ -431,6 +419,7 @@ func WriteAndFlushBuffer(
 			if strings.Contains(errStr, "Application error 0x0") {
 				log.Printf("Remote peer %s closed connection gracefully - will attempt reconnection", peerID.ShortString())
 				bufferInfo.Writer.Reset()
+				connectedBuffersOfBuyers.RecordDisconnectEvent(peerID)
 				connectedBuffersOfBuyers.UpdateBufferLibP2PState(peerID, Reconnecting)
 				// Don't remove buffer - keep it for reconnection attempts
 				globalWriteStats.reset(peerID)
@@ -443,6 +432,7 @@ func WriteAndFlushBuffer(
 			if strings.Contains(errStr, "Application error 0x1") {
 				log.Printf("Remote peer %s rejected stream (0x1) - possibly duplicate, will retry later", peerID.ShortString())
 				bufferInfo.Writer.Reset()
+				connectedBuffersOfBuyers.RecordDisconnectEvent(peerID)
 				connectedBuffersOfBuyers.UpdateBufferLibP2PState(peerID, Reconnecting)
 				globalWriteStats.reset(peerID)
 				return RemoteClosed
@@ -451,6 +441,7 @@ func WriteAndFlushBuffer(
 			// For actual connection errors (broken pipe, reset, etc.), reset the stream
 			log.Printf("Write error to %s: %v - resetting stream", peerID, writeErr)
 			bufferInfo.Writer.Reset()
+			connectedBuffersOfBuyers.RecordDisconnectEvent(peerID)
 			connectedBuffersOfBuyers.UpdateBufferLibP2PState(peerID, ConnectionLost)
 			connectedBuffersOfBuyers.IncrementReconnectAttempts(peerID)
 			connectedBuffersOfBuyers.RemoveBuffer(peerID)

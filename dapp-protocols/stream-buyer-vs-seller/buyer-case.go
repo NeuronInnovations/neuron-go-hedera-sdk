@@ -619,6 +619,52 @@ func processSeller(
 			if peerBuffer.RendezvousState != commonlib.SendOK {
 				return
 			}
+			tooEarly, retryErr := commonlib.IsRequestTooEarly(sellerBuffers, peerID)
+			if tooEarly {
+				if retryErr == commonlib.ErrGiveUpReconnect {
+					if onGiveUpReconnect != nil {
+						onGiveUpReconnect(sellerEvnAddress)
+					}
+				}
+				return
+			}
+			if peerBuffer.RequestOrResponse.OtherStdInTopic.Topic == 0 {
+				log.Printf("missing stored Hedera envelope for seller %s; skipping resend", sellerEvnAddress)
+				return
+			}
+			peerInfo, err := hedera_helper.GetPeerInfo(sellerEvnAddress)
+			if err != nil {
+				log.Printf("retry heartbeat precheck failed for seller %s: %v", sellerEvnAddress, err)
+				return
+			}
+			if _, alive := getPeerHeartbeatIfRecent(peerInfo); !alive {
+				log.Printf("skipping resend for seller %s: no recent heartbeat", sellerEvnAddress)
+				return
+			}
+			sellerBuffers.UpdateBufferLibP2PState(peerID, commonlib.Reconnecting)
+			sellerBuffers.IncrementReconnectAttempts(peerID)
+			sendErrCh := make(chan error, 1)
+			envelope := peerBuffer.RequestOrResponse
+			if submitErr := controlExec.Submit(controlplane.PriorityHigh, 120*time.Millisecond, func(taskCtx context.Context) {
+				err := hedera_helper.SendTransactionEnvelopeBestEffort(envelope)
+				select {
+				case sendErrCh <- err:
+				case <-taskCtx.Done():
+				}
+			}); submitErr != nil {
+				return
+			}
+			select {
+			case execErr := <-sendErrCh:
+				if execErr != nil {
+					log.Printf("retry send hedera transaction envelope error %s: %v", sellerEvnAddress, execErr)
+					return
+				}
+				log.Printf("resent hedera service request to seller %s", sellerEvnAddress)
+			case <-time.After(2 * time.Second):
+				log.Printf("retry send hedera transaction envelope timeout %s", sellerEvnAddress)
+				return
+			}
 			sellerBuffers.UpdateBufferLibP2PState(peerID, commonlib.Connecting)
 		}
 	} else { // there are cons
