@@ -2,6 +2,7 @@ package hedera_helper
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"log"
@@ -51,7 +52,6 @@ func EnsureTopicsAndNotifyContract(p2pHost host.Host) (hedera.TopicID, hedera.To
 				freshTopicNum := func(topicName string) (hedera.TopicID, error) {
 					var emptyTopicID hedera.TopicID
 					c := GetHederaClientUsingEnv()
-					defer c.Close()
 					transactionResponse, err := hedera.NewTopicCreateTransaction().
 						SetTransactionMemo(topicName).
 						SetAdminKey(c.GetOperatorPublicKey()).
@@ -94,7 +94,6 @@ func EnsureTopicsAndNotifyContract(p2pHost host.Host) (hedera.TopicID, hedera.To
 				fmt.Println("newContractID: ", newContractID.EvmAddress)
 
 				c := GetHederaClientUsingEnv()
-				defer c.Close()
 				callResult, err := hedera.NewContractExecuteTransaction().
 					SetContractID(newContractID).
 					SetTransactionMemo("broadcast liveness topic for self").
@@ -181,7 +180,7 @@ func GetPeerInfo(hederaAccEvmAddress string) (PeerInfo, error) {
 	if err == nil {
 		peerInfoCache[key] = cachedPeerInfo{
 			info:      info,
-			expiresAt: time.Now().Add(10 * time.Second),
+			expiresAt: time.Now().Add(30 * time.Second),
 		}
 	}
 	waiters := peerInfoInFlight[key]
@@ -208,24 +207,23 @@ func fetchPeerInfoWithRetry(hederaAccEvmAddress string) (PeerInfo, error) {
 
 	for i := 0; i < maxRetries; i++ {
 		contractCaller := GetHRpcClient()
-		callCh := make(chan peerInfoResult, 1)
-		go func() {
-			info, callErr := contractCaller.HederaAddressToPeer(
-				&bind.CallOpts{},
-				common.HexToAddress(hederaAccEvmAddress),
-			)
-			callCh <- peerInfoResult{info: info, err: callErr}
-		}()
-		select {
-		case res := <-callCh:
-			peerInfo = res.info
-			err = res.err
-		case <-time.After(perAttemptTimeout):
-			err = fmt.Errorf("GetPeerInfo timeout after %s", perAttemptTimeout)
-		}
-		if err == nil {
+		ctx, cancel := context.WithTimeout(context.Background(), perAttemptTimeout)
+		info, callErr := contractCaller.HederaAddressToPeer(
+			&bind.CallOpts{Context: ctx},
+			common.HexToAddress(hederaAccEvmAddress),
+		)
+		cancel()
+		if callErr == nil {
+			peerInfo = PeerInfo{
+				Available:   info.Available,
+				PeerID:      info.PeerID,
+				StdOutTopic: info.StdOutTopic,
+				StdInTopic:  info.StdInTopic,
+				StdErrTopic: info.StdErrTopic,
+			}
 			return peerInfo, nil
 		}
+		err = callErr
 		fmt.Println("Error getting rpc peer info, retrying:", i, "th time", err)
 		delay := baseDelay * time.Duration(1<<i) // Exponential backoff
 		if delay > maxDelay {

@@ -137,11 +137,8 @@ func HandleBuyerCase(ctx context.Context, p2pHost host.Host, buyerCase func(ctx 
 	// ------- LISTEN -----------
 
 	go hedera_helper.ListenToTopicAndCallBack(commonlib.MyStdIn, func(topicMessage hedera.TopicMessage) {
-		fmt.Printf("received %s: ", topicMessage.Contents)
-
-		// TODO: is this someone I want to respond to? Have I asked him for services?
-
-		fmt.Printf("request from other side: %s ", topicMessage.Contents)
+		// Avoid dumping every raw Hedera message in busy buyer runs; the payload
+		// volume is high enough to become a throughput bottleneck.
 
 		//lastStdInTimestamp := topicMessage.ConsensusTimestamp.Format(time.RFC3339Nano)
 
@@ -225,7 +222,7 @@ func HandleBuyerCase(ctx context.Context, p2pHost host.Host, buyerCase func(ctx 
 			case commonlib.BalanceError:
 			case commonlib.VersionError:
 			case commonlib.WriteError:
-				fmt.Println("Write error: ", sellerError)
+				log.Printf("seller write error publicKey=%s recover=%s", sellerError.PublicKey, sellerError.RecoverAction)
 				switch sellerError.RecoverAction {
 				case commonlib.SendFreshHederaRequest:
 					// Queue recoveries; keep topic callback non-blocking.
@@ -587,7 +584,7 @@ func processSeller(
 			sellerBuffers.IncrementReconnectAttempts(peerID)
 			sendErrCh := make(chan error, 1)
 			if submitErr := controlExec.Submit(controlplane.PriorityHigh, 120*time.Millisecond, func(taskCtx context.Context) {
-				err := hedera_helper.SendTransactionEnvelope(envelope)
+				err := hedera_helper.SendTransactionEnvelopePriority(envelope)
 				select {
 				case sendErrCh <- err:
 				case <-taskCtx.Done():

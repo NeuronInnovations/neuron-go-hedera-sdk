@@ -7,6 +7,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	_ "net/http/pprof"
 
@@ -244,6 +245,27 @@ var globalWriteStats = &WriteStats{
 	peerPublicKeys:   make(map[peer.ID]string),
 }
 
+type WriteQueuePressure struct {
+	ActiveQueues       int
+	QueuedFrames       int
+	MaxQueueDepth      int
+	EnqueuedFrames     uint64
+	DroppedFrames      uint64
+	WriteTimeouts      uint64
+	RemoteClosedWrites uint64
+	WriteErrors        uint64
+	SuccessfulWrites   uint64
+}
+
+var globalWritePressure = struct {
+	enqueuedFrames     uint64
+	droppedFrames      uint64
+	writeTimeouts      uint64
+	remoteClosedWrites uint64
+	writeErrors        uint64
+	successfulWrites   uint64
+}{}
+
 // Per-peer write queues to avoid goroutine explosion under high frame rates.
 // Bounded queues drop frames instead of adding latency.
 const peerWriteQueueSize = 300
@@ -297,6 +319,33 @@ func stopPeerWriteQueue(peerID peer.ID) {
 	peerWriteQueues.mu.Unlock()
 	if ok {
 		close(q.done)
+	}
+}
+
+func GetWriteQueuePressure() WriteQueuePressure {
+	peerWriteQueues.mu.Lock()
+	activeQueues := len(peerWriteQueues.m)
+	queuedFrames := 0
+	maxQueueDepth := 0
+	for _, q := range peerWriteQueues.m {
+		depth := len(q.ch)
+		queuedFrames += depth
+		if depth > maxQueueDepth {
+			maxQueueDepth = depth
+		}
+	}
+	peerWriteQueues.mu.Unlock()
+
+	return WriteQueuePressure{
+		ActiveQueues:       activeQueues,
+		QueuedFrames:       queuedFrames,
+		MaxQueueDepth:      maxQueueDepth,
+		EnqueuedFrames:     atomic.LoadUint64(&globalWritePressure.enqueuedFrames),
+		DroppedFrames:      atomic.LoadUint64(&globalWritePressure.droppedFrames),
+		WriteTimeouts:      atomic.LoadUint64(&globalWritePressure.writeTimeouts),
+		RemoteClosedWrites: atomic.LoadUint64(&globalWritePressure.remoteClosedWrites),
+		WriteErrors:        atomic.LoadUint64(&globalWritePressure.writeErrors),
+		SuccessfulWrites:   atomic.LoadUint64(&globalWritePressure.successfulWrites),
 	}
 }
 
@@ -409,6 +458,8 @@ func WriteAndFlushBuffer(
 			// If we timed out, just drop this frame - don't reset the stream.
 			// QUIC is handling congestion control; the buffer will drain.
 			if netErr, ok := writeErr.(net.Error); ok && netErr.Timeout() {
+				atomic.AddUint64(&globalWritePressure.writeTimeouts, 1)
+				atomic.AddUint64(&globalWritePressure.droppedFrames, 1)
 				globalWriteStats.recordDrop(peerID)
 				return FrameDropped
 			}
@@ -417,6 +468,7 @@ func WriteAndFlushBuffer(
 			// This means the remote peer closed the connection intentionally.
 			// Keep the buffer so we can try to reconnect - don't remove it.
 			if strings.Contains(errStr, "Application error 0x0") {
+				atomic.AddUint64(&globalWritePressure.remoteClosedWrites, 1)
 				log.Printf("Remote peer %s closed connection gracefully - will attempt reconnection", peerID.ShortString())
 				bufferInfo.Writer.Reset()
 				connectedBuffersOfBuyers.RecordDisconnectEvent(peerID)
@@ -430,6 +482,7 @@ func WriteAndFlushBuffer(
 			// The remote peer rejected our stream, possibly because one already exists.
 			// Keep the buffer so we can try to reconnect later.
 			if strings.Contains(errStr, "Application error 0x1") {
+				atomic.AddUint64(&globalWritePressure.remoteClosedWrites, 1)
 				log.Printf("Remote peer %s rejected stream (0x1) - possibly duplicate, will retry later", peerID.ShortString())
 				bufferInfo.Writer.Reset()
 				connectedBuffersOfBuyers.RecordDisconnectEvent(peerID)
@@ -439,6 +492,7 @@ func WriteAndFlushBuffer(
 			}
 
 			// For actual connection errors (broken pipe, reset, etc.), reset the stream
+			atomic.AddUint64(&globalWritePressure.writeErrors, 1)
 			log.Printf("Write error to %s: %v - resetting stream", peerID, writeErr)
 			bufferInfo.Writer.Reset()
 			connectedBuffersOfBuyers.RecordDisconnectEvent(peerID)
@@ -450,6 +504,7 @@ func WriteAndFlushBuffer(
 		}
 
 		globalWriteStats.recordSuccess(peerID)
+		atomic.AddUint64(&globalWritePressure.successfulWrites, 1)
 		return nil
 	}
 	return fmt.Errorf("%s:buffer is not Connected %v", bufferInfo.LibP2PState, peerID)
@@ -497,6 +552,7 @@ func WriteToAllPeersParallel(buffers *NodeBuffers, data []byte) []PeerWriteResul
 		q := ensurePeerWriteQueue(peerID, buffers)
 		select {
 		case q.ch <- data:
+			atomic.AddUint64(&globalWritePressure.enqueuedFrames, 1)
 			// enqueued
 		default:
 			// Queue full: drop one old frame and try to enqueue the newest.
@@ -506,9 +562,12 @@ func WriteToAllPeersParallel(buffers *NodeBuffers, data []byte) []PeerWriteResul
 			}
 			select {
 			case q.ch <- data:
+				atomic.AddUint64(&globalWritePressure.enqueuedFrames, 1)
+				atomic.AddUint64(&globalWritePressure.droppedFrames, 1)
 				// enqueued after dropping one
 			default:
 				// Still full - drop newest to keep latency low
+				atomic.AddUint64(&globalWritePressure.droppedFrames, 1)
 				globalWriteStats.recordDrop(peerID)
 				errors = append(errors, PeerWriteResult{PeerID: peerID, Error: FrameDropped})
 			}

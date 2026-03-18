@@ -32,45 +32,66 @@ var (
 	ErrDatabaseNotOpen = errors.New("shared account database not initialized")
 )
 
-// OpenSharedAccountDB opens the BBolt database at ~/.neuron/shared_accounts.db
-// Uses production-optimized settings for flash storage (SD cards)
+// OpenSharedAccountDB opens the BBolt database for shared account caching.
+// Path is chosen in order: NEURON_SHARED_ACCOUNT_DB (full file path), NEURON_CACHE_DIR (directory),
+// then ~/.neuron, then ./.neuron (current directory). First successful open wins so the cache
+// works even when HOME is unset or read-only.
+// Uses production-optimized settings for flash storage (SD cards).
 func OpenSharedAccountDB() error {
-	homeDir, err := os.UserHomeDir()
-	if err != nil {
-		return fmt.Errorf("cannot get home dir: %w", err)
+	var candidates []string
+
+	// 1) Explicit full path to DB file
+	if p := os.Getenv("NEURON_SHARED_ACCOUNT_DB"); p != "" {
+		candidates = append(candidates, p)
+	}
+	// 2) Directory from env; we'll put shared_accounts.db inside it
+	if d := os.Getenv("NEURON_CACHE_DIR"); d != "" {
+		candidates = append(candidates, filepath.Join(d, dbFileName))
+	}
+	// 3) Home directory
+	if homeDir, err := os.UserHomeDir(); err == nil {
+		candidates = append(candidates, filepath.Join(homeDir, ".neuron", dbFileName))
+	}
+	// 4) Current working directory (fallback when HOME is missing or read-only)
+	if cwd, err := os.Getwd(); err == nil {
+		candidates = append(candidates, filepath.Join(cwd, ".neuron", dbFileName))
 	}
 
-	neuronDir := filepath.Join(homeDir, ".neuron")
-	if err := os.MkdirAll(neuronDir, 0700); err != nil {
-		return fmt.Errorf("cannot create neuron dir: %w", err)
+	opts := &bolt.Options{
+		Timeout:      5 * time.Second,
+		NoGrowSync:   true,
+		FreelistType: bolt.FreelistMapType,
 	}
 
-	dbPath := filepath.Join(neuronDir, dbFileName)
+	for _, dbPath := range candidates {
+		dir := filepath.Dir(dbPath)
+		if err := os.MkdirAll(dir, 0700); err != nil {
+			log.Printf("Shared account cache: skip %s (mkdir: %v)", dbPath, err)
+			continue
+		}
 
-	// BBolt v1.4.3 with production-optimized settings
-	db, err := bolt.Open(dbPath, 0600, &bolt.Options{
-		Timeout:      5 * time.Second,      // Prevent hanging on lock
-		NoGrowSync:   true,                 // Reduce flash wear
-		FreelistType: bolt.FreelistMapType, // Better for updates
-	})
-	if err != nil {
-		return fmt.Errorf("cannot open database: %w", err)
+		db, err := bolt.Open(dbPath, 0600, opts)
+		if err != nil {
+			log.Printf("Shared account cache: skip %s (open: %v)", dbPath, err)
+			continue
+		}
+
+		err = db.Update(func(tx *bolt.Tx) error {
+			_, err := tx.CreateBucketIfNotExists([]byte(bucketSharedAccounts))
+			return err
+		})
+		if err != nil {
+			db.Close()
+			log.Printf("Shared account cache: skip %s (bucket: %v)", dbPath, err)
+			continue
+		}
+
+		sharedAccountDB = db
+		log.Printf("Shared account cache opened: %s", dbPath)
+		return nil
 	}
-	sharedAccountDB = db
 
-	// Create bucket if not exists (per BBolt v1.4.3 API)
-	err = db.Update(func(tx *bolt.Tx) error {
-		_, err := tx.CreateBucketIfNotExists([]byte(bucketSharedAccounts))
-		return err
-	})
-	if err != nil {
-		db.Close()
-		sharedAccountDB = nil
-		return fmt.Errorf("cannot create bucket: %w", err)
-	}
-
-	log.Printf("Shared account cache opened: %s", dbPath)
-	return nil
+	return fmt.Errorf("could not open shared account cache at any path (tried %d)", len(candidates))
 }
 
 // CloseSharedAccountDB closes the database and releases the file lock
