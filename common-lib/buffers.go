@@ -37,6 +37,13 @@ func StateManagerInit(buyerOrSellerFlag string, clearCacheFlag bool) {
 	}
 }
 
+// NodeBuffers holds per-peer connection state. All access is protected by mu.
+// When a connection drops, both the app (e.g. stream read error → RecordDisconnectEvent)
+// and the SDK (processSeller from recovery/60s loop) can touch the same buffer.
+// Contention: many concurrent disconnects cause lock contention on mu. Avoid
+// doing heavy work (Hedera/gRPC) while holding mu; processSeller yields the
+// first reconnect window after LastDisconnectAt so the app's adaptive retry
+// can own the first resend and we don't double-submit.
 type NodeBuffers struct {
 	mu                sync.Mutex
 	Buffers           map[peer.ID]*NodeBufferInfo
@@ -469,11 +476,10 @@ func effectiveDisconnectScore(now time.Time, rawScore int, lastSuccessAt, lastDi
 	return score
 }
 
-// computeRetryDelay balances fast recovery with seller protection:
-// sellers that have never connected get a few aggressive retries to overcome
-// missed topic consumption/timing, while sellers with repeated disconnects back
-// off until stability returns. disconnectScore decays after sustained healthy
-// time so recovered sellers become eligible for aggressive reconnect again.
+// computeRetryDelay balances recovery with gRPC/Hedera load and seller protection.
+// Intervals are conservative to avoid reconnection storms: when many streams drop,
+// aggressive retries would choke the system and cause more drops. disconnectScore
+// decays after sustained healthy time so recovered sellers get faster retries again.
 func computeRetryDelay(attemptsSinceSuccess int, hasEverConnected bool, disconnectScore int) time.Duration {
 	if attemptsSinceSuccess < 1 {
 		attemptsSinceSuccess = 1
@@ -483,10 +489,10 @@ func computeRetryDelay(attemptsSinceSuccess int, hasEverConnected bool, disconne
 	switch {
 	case !hasEverConnected && disconnectScore <= 3:
 		schedule = []time.Duration{
-			30 * time.Second,
 			90 * time.Second,
 			3 * time.Minute,
-			10 * time.Minute,
+			8 * time.Minute,
+			15 * time.Minute,
 			30 * time.Minute,
 			time.Hour,
 			3 * time.Hour,
@@ -494,19 +500,19 @@ func computeRetryDelay(attemptsSinceSuccess int, hasEverConnected bool, disconne
 		}
 	case !hasEverConnected:
 		schedule = []time.Duration{
-			3 * time.Minute,
+			5 * time.Minute,
 			10 * time.Minute,
-			30 * time.Minute,
+			20 * time.Minute,
 			time.Hour,
 			3 * time.Hour,
 			6 * time.Hour,
 		}
 	case disconnectScore <= 1:
 		schedule = []time.Duration{
-			15 * time.Second,
-			time.Minute,
-			3 * time.Minute,
-			10 * time.Minute,
+			45 * time.Second,
+			2 * time.Minute,
+			5 * time.Minute,
+			12 * time.Minute,
 			30 * time.Minute,
 			time.Hour,
 			3 * time.Hour,
@@ -514,9 +520,9 @@ func computeRetryDelay(attemptsSinceSuccess int, hasEverConnected bool, disconne
 		}
 	case disconnectScore <= 3:
 		schedule = []time.Duration{
-			time.Minute,
-			3 * time.Minute,
-			10 * time.Minute,
+			2 * time.Minute,
+			5 * time.Minute,
+			12 * time.Minute,
 			30 * time.Minute,
 			time.Hour,
 			3 * time.Hour,

@@ -41,6 +41,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/core/protocol"
+	libp2pconnmgr "github.com/libp2p/go-libp2p/p2p/net/connmgr"
 	quictransprt "github.com/libp2p/go-libp2p/p2p/transport/quic"
 	"github.com/multiformats/go-multiaddr"
 	manet "github.com/multiformats/go-multiaddr/net"
@@ -170,6 +171,17 @@ func LaunchSDK(
 			return filtered
 		}),
 	}
+	// Raise conn-manager limits for high fan-in buyer runs.
+	// This reduces ConnGarbageCollected (0x1005) mass-prune waves under sustained load.
+	cm, cmErr := libp2pconnmgr.NewConnManager(
+		320, // low watermark
+		384, // high watermark
+		libp2pconnmgr.WithGracePeriod(90*time.Second),
+	)
+	if cmErr != nil {
+		log.Panicf("failed to initialize connection manager: %v", cmErr)
+	}
+	options = append(options, libp2p.ConnectionManager(cm))
 
 	// The node's operating mode (relay or peer) is determined by the value of the "--mode" flag.
 	//
