@@ -92,8 +92,10 @@ func HandleBuyerCase(ctx context.Context, p2pHost host.Host, buyerCase func(ctx 
 
 	// Keep topic callback lightweight: heavy retry/recovery work goes through
 	// a bounded queue so Hedera-related calls cannot block callback progress.
-	const recoveryWorkerCount = 3
-	recoveryJobs := make(chan Seller, 128)
+	// Use a single recovery worker and small queue to avoid reconnection storms
+	// that choke gRPC/Hedera when many sellers disconnect at once.
+	const recoveryWorkerCount = 1
+	recoveryJobs := make(chan Seller, 32)
 	var recoveryQueuedMu sync.Mutex
 	recoveryQueued := make(map[string]bool) // keyed by seller public key
 
@@ -155,6 +157,7 @@ func HandleBuyerCase(ctx context.Context, p2pHost host.Host, buyerCase func(ctx 
 		}
 		switch messageType {
 		case "scheduleSignRequest": // invoice from seller, schedule countersignature request
+			receivedAt := time.Now()
 			scheduleSignRequest := new(commonlib.NeuronScheduleSignRequestMsg)
 			err := json.Unmarshal(topicMessage.Contents, &scheduleSignRequest)
 			if err != nil {
@@ -171,26 +174,41 @@ func HandleBuyerCase(ctx context.Context, p2pHost host.Host, buyerCase func(ctx 
 				//TODO: shall we send this to the error topic?
 				return
 			}
+			log.Printf("[SCHEDSIGN] received scheduleID=%d sharedAcc=%d consensus=%v recv_to_parse_ms=%d",
+				scheduleSignRequest.ScheduleID,
+				scheduleSignRequest.SharedAccID,
+				topicMessage.ConsensusTimestamp,
+				time.Since(receivedAt).Milliseconds(),
+			)
 			if !validatorLib.IsRequestPermitted() {
 				return
 			}
 			// Process payment maintenance asynchronously so it cannot block
 			// connect/reconnect message handling in this topic callback path.
 			go func(req *commonlib.NeuronScheduleSignRequestMsg, scheduleID hedera.ScheduleID) {
+				workerStart := time.Now()
 				if err := hedera_helper.SignScheduleBestEffort(scheduleID, os.Getenv("private_key")); err != nil {
 					log.Printf("best-effort schedule sign skipped/failed (%d): %v", req.ScheduleID, err)
 					return
+				}
+				signMs := time.Since(workerStart).Milliseconds()
+				log.Printf("[SCHEDSIGN] sign completed scheduleID=%d duration_ms=%d", req.ScheduleID, signMs)
+				if signMs > 500 {
+					log.Printf("[SCHEDSIGN] sign slow scheduleID=%d duration_ms=%d", req.ScheduleID, signMs)
 				}
 				if !validatorLib.IsRequestPermitted() {
 					return
 				}
 				if submitErr := controlExec.Submit(controlplane.PriorityLow, 150*time.Millisecond, func(taskCtx context.Context) {
+					depositStart := time.Now()
 					sharedAcc, _ := hedera.AccountIDFromString(fmt.Sprintf("0.0.%d", req.SharedAccID))
 
 					accountInfo, balErr := hedera_helper.GetAccountInfoFromNetwork(sharedAcc)
 					if balErr == nil && accountInfo.Balance.AsTinybar() >= 10_000_000 {
 						fmt.Printf("Shared account %s has sufficient balance (%d tinybars), skipping deposit\n",
 							sharedAcc, accountInfo.Balance.AsTinybar())
+						log.Printf("[SCHEDSIGN] deposit check skipped scheduleID=%d shared=%s duration_ms=%d",
+							req.ScheduleID, sharedAcc, time.Since(depositStart).Milliseconds())
 						return
 					}
 
@@ -198,6 +216,8 @@ func HandleBuyerCase(ctx context.Context, p2pHost host.Host, buyerCase func(ctx 
 					if depErr := hedera_helper.DepositToSharedAccountBestEffort(sharedAcc, 0.1); depErr != nil {
 						log.Printf("best-effort deposit skipped/failed (%s): %v", sharedAcc, depErr)
 					}
+					log.Printf("[SCHEDSIGN] deposit maintenance finished scheduleID=%d shared=%s duration_ms=%d",
+						req.ScheduleID, sharedAcc, time.Since(depositStart).Milliseconds())
 				}); submitErr != nil {
 					log.Printf("control queue full for deposit maintenance (%d): %v", req.ScheduleID, submitErr)
 				}
@@ -614,6 +634,14 @@ func processSeller(
 
 		} else { // have buffer, no cons and requested before: app owns re-submit scheduling
 			if peerBuffer.RendezvousState != commonlib.SendOK {
+				return
+			}
+			// Avoid fighting with the app's reconnect path: when the app (e.g. 4dsky-edge-buyer)
+			// sees a stream/connection drop it calls RecordDisconnectEvent and scheduleAdaptiveRetry.
+			// If we immediately resend here we duplicate Hedera work and contend on buffers.
+			// Yield the first reconnect window to the app so only one path does Hedera submit.
+			const reconnectYieldAfterDisconnect = 60 * time.Second
+			if !peerBuffer.LastDisconnectAt.IsZero() && time.Since(peerBuffer.LastDisconnectAt) < reconnectYieldAfterDisconnect {
 				return
 			}
 			tooEarly, retryErr := commonlib.IsRequestTooEarly(sellerBuffers, peerID)
