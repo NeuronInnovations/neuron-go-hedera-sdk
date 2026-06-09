@@ -12,6 +12,7 @@ __debug*
 .vscode/launch.json
 sdk
 neuron-sdk
-/.personal
 CLAUDE.
 .serena
+CLAUDE.md
+.sem/cache.db
