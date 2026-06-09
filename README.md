@@ -114,7 +114,6 @@ hedera_evm_id=
 hedera_id=
 location=
 list_of_sellers=
-eth_rpc_url=https://testnet.hashio.io/api
 mirror_api_url=https://testnet.mirrornode.hedera.com/api/v1
 neuron_explorer_url=https://explorer.neuron.world/api/v1/device/wip-all
 smart_contract_address=0x87e2fc64dc1eae07300c2fc50d6700549e1632ca
@@ -124,10 +123,11 @@ Below is an explanation of the environment variables required for the `neuron-go
 
 #### Required Environment Variables:
 
-1. **`eth_rpc_url`**:
-   - **Description**: URL of the Ethereum-compatible JSON-RPC endpoint for Hedera.
-   - **Example**: `https://testnet.hashio.io/api`
-   - **Purpose**: Enables the SDK to interact with Hedera's EVM layer for operations such as querying accounts.
+1. **`eth_rpc_url`** *(deprecated — no longer used)*:
+   - **Description**: Formerly the Ethereum-compatible JSON-RPC relay endpoint (hashio).
+   - **Status**: The SDK no longer dials a JSON-RPC relay. Read-only smart-contract
+     calls now go through the Hedera mirror node's `/contracts/call` endpoint
+     (`mirror_api_url`), so this variable is ignored and can be removed.
 
 2. **`private_key`**:
    - **Description**: Your private key in hexadecimal format. Use an secp256k1 (not DER)
@@ -157,7 +157,9 @@ Below is an explanation of the environment variables required for the `neuron-go
 7. **`mirror_api_url`**:
    - **Description**: The API endpoint of the Hedera Mirror Node.
    - **Fixed Value**: `https://testnet.mirrornode.hedera.com/api/v1`
-   - **Purpose**: Enables the SDK to query historical and real-time Hedera network data.
+   - **Purpose**: Enables the SDK to query historical and real-time Hedera network
+     data, and to perform read-only smart-contract calls via `/contracts/call`
+     (replacing the old JSON-RPC relay / hashio dependency).
 
 8. **`neuron_explorer_url`**:
    - **Description**: The API endpoint of the Neuron Explorer.

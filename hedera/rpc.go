@@ -119,7 +119,7 @@ func EnsureTopicsAndNotifyContract(p2pHost host.Host) (hedera.TopicID, hedera.To
 }
 
 func GetPeerArraySize() (*big.Int, error) {
-	contractCaller := GetHRpcClient()
+	contractCaller := getContractCaller()
 
 	size, error := contractCaller.GetPeerArraySize(
 		&bind.CallOpts{},
@@ -206,7 +206,7 @@ func fetchPeerInfoWithRetry(hederaAccEvmAddress string) (PeerInfo, error) {
 	perAttemptTimeout := 2 * time.Second
 
 	for i := 0; i < maxRetries; i++ {
-		contractCaller := GetHRpcClient()
+		contractCaller := getContractCaller()
 		ctx, cancel := context.WithTimeout(context.Background(), perAttemptTimeout)
 		info, callErr := contractCaller.HederaAddressToPeer(
 			&bind.CallOpts{Context: ctx},
@@ -273,7 +273,7 @@ func GetPeerIDFromEvmViaMirror(evmAddress string) (peerID string, err error) {
 	return peerID, nil
 }
 func GetAllPeers() ([]string, error) {
-	contractCaller := GetHRpcClient()
+	contractCaller := getContractCaller()
 
 	peerArraySize, error := GetPeerArraySize()
 	if error != nil {
@@ -299,42 +299,4 @@ func GetAllPeers() ([]string, error) {
 		}
 	}
 	return peerList, nil
-}
-
-func createDummySLA() string {
-
-	client := GetHederaClientUsingEnv()
-	// Create a new file
-	createTx, err := hedera.NewFileCreateTransaction().
-		SetContents([]byte("This is the SLA that binds you to x y z")).
-		Execute(client)
-
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	createReceipt, err := createTx.GetReceipt(client)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	fileId := createReceipt.FileID
-	fmt.Printf("File ID: %v\n", fileId)
-
-	appendTx, err := hedera.NewFileAppendTransaction().
-		SetFileID(*fileId).
-		SetContents([]byte(" Appending more text!")).
-		Execute(client)
-
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	appendReceipt, err := appendTx.GetReceipt(client)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	fmt.Printf("Append Receipt: %v\n", appendReceipt.Status)
-	return fileId.String()
 }

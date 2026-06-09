@@ -18,7 +18,6 @@ import (
 	"github.com/NeuronInnovations/neuron-go-hedera-sdk/hederacontract"
 
 	"github.com/ethereum/go-ethereum/common"
-	"github.com/ethereum/go-ethereum/ethclient"
 	"github.com/google/uuid"
 	"github.com/hashgraph/hedera-sdk-go/v2"
 	"github.com/multiformats/go-multiaddr"
@@ -37,12 +36,11 @@ var (
 	// remote's write path effective so they don't close the stream due to our delay.
 	hederaPriorityWriteLimiter = rate.NewLimiter(rate.Every(250*time.Millisecond), 4)
 	hederaPriorityWriteSem     = make(chan struct{}, 4)
-	hRpcMu             sync.Mutex
-	hRpcClient         *ethclient.Client
-	hRpcCaller         *hederacontract.HederacontractCaller
-	hRpcAddress        string
-	hederaClientMu     sync.Mutex
-	hederaClient       *hedera.Client
+	contractCallerMu           sync.Mutex
+	cachedContractCaller       *hederacontract.HederacontractCaller
+	cachedContractAddress      string
+	hederaClientMu             sync.Mutex
+	hederaClient               *hedera.Client
 )
 
 func acquireHederaWriteSlot(op string) (func(), error) {
@@ -101,7 +99,10 @@ func acquireHederaPriorityWriteSlotWithTimeout(op string, timeout time.Duration)
 	}, nil
 }
 
-func GetHRpcClient() *hederacontract.HederacontractCaller {
+// getContractCaller returns a cached caller for the Rendezvous smart contract.
+// Reads are served by the Hedera mirror node's /contracts/call endpoint (see
+// mirror_contract.go), not a JSON-RPC relay (hashio): no eth_rpc_url / dial.
+func getContractCaller() *hederacontract.HederacontractCaller {
 	const defaultSCAddress = "0x87e2fc64dc1eae07300c2fc50d6700549e1632ca"
 	scAddress := strings.ToLower(strings.TrimSpace(os.Getenv("smart_contract_address")))
 	if scAddress == "" {
@@ -113,38 +114,24 @@ func GetHRpcClient() *hederacontract.HederacontractCaller {
 	}
 	os.Setenv("smart_contract_address", scAddress)
 
-	hRpcMu.Lock()
-	defer hRpcMu.Unlock()
+	contractCallerMu.Lock()
+	defer contractCallerMu.Unlock()
 
-	if hRpcCaller != nil && hRpcClient != nil && hRpcAddress == scAddress {
-		return hRpcCaller
-	}
-
-	if hRpcClient != nil {
-		hRpcClient.Close()
-		hRpcClient = nil
-		hRpcCaller = nil
-		hRpcAddress = ""
-	}
-
-	client, err := ethclient.Dial(os.Getenv("eth_rpc_url"))
-	if err != nil {
-		log.Panicf("failed to dial eth rpc: %v", err)
+	if cachedContractCaller != nil && cachedContractAddress == scAddress {
+		return cachedContractCaller
 	}
 
 	contractCaller, err := hederacontract.NewHederacontractCaller(
 		common.HexToAddress(scAddress),
-		client,
+		newMirrorContractCaller(),
 	)
 	if err != nil {
-		client.Close()
 		log.Panicf("failed to create hedera contract caller: %v", err)
 	}
 
-	hRpcClient = client
-	hRpcCaller = contractCaller
-	hRpcAddress = scAddress
-	return hRpcCaller
+	cachedContractCaller = contractCaller
+	cachedContractAddress = scAddress
+	return cachedContractCaller
 }
 
 func GetHederaClientUsingEnv() *hedera.Client {
@@ -431,9 +418,13 @@ func BuyerPrepareServiceRequestWithSellerInfo(
 		return nil, encErr
 	}
 
+	// Our own peer info (for our StdInTopic). A transient contract-read failure
+	// here must not crash the process: the caller handles a returned error by
+	// marking the connect attempt failed and retrying later. Previously this was
+	// log.Panic, which took the whole buyer down whenever the contract read flapped.
 	peerInfo, err := GetPeerInfo(fromEthAddress)
 	if err != nil {
-		log.Panic(err)
+		return nil, fmt.Errorf("error getting our own peer info for %v from the contract: %v", fromEthAddress, err)
 	}
 
 	m := &commonlib.NeuronServiceRequestMsg{
@@ -683,6 +674,15 @@ func downloadAndListen(topicID hedera.TopicID, callback func(message hedera.Topi
 	// Main loop to keep subscribing
 	lastStdInTimestamp := time.Now().UTC()
 	reconnectDelay := 1 * time.Second
+	// The mirror node sends no heartbeat and never tells us when it has dropped
+	// our subscription, so we must keep this watchdog + resubscribe loop running
+	// indefinitely. Allocate the watchdog timer ONCE here and reuse it across
+	// every resubscription. Previously the timer was created (with a
+	// `defer timeout.Stop()`) inside the goto loop below; because this function
+	// never returns, those defers and their timers accumulated forever — one per
+	// reconnect, ~1/sec — leaking unboundedly.
+	timeout := time.NewTimer(45 * time.Second)
+	defer timeout.Stop()
 mainLoop:
 	// Re-subscribe from last seen timestamp (with small overlap) so we don't
 	// miss messages during subscription churn.
@@ -701,17 +701,14 @@ mainLoop:
 		goto mainLoop
 	}
 	reconnectDelay = 1 * time.Second
-	timeout := time.NewTimer(45 * time.Second)
-	defer timeout.Stop()
+	// Re-arm the shared watchdog for this fresh subscription.
+	resetTimer(timeout, 45*time.Second)
 
 	for {
 		select {
 		case <-messageReceived:
-			// Message received, reset the timer
-			if !timeout.Stop() {
-				<-timeout.C // Drain the channel
-			}
-			timeout.Reset(45 * time.Second)
+			// Message received; re-arm the watchdog.
+			resetTimer(timeout, 45*time.Second)
 		case <-subscriptionDone:
 			// Underlying SDK completed subscription unexpectedly; resubscribe now.
 			handle.Unsubscribe()
@@ -782,6 +779,20 @@ func subscribe(
 	}
 
 	return handle, nil
+}
+
+// resetTimer stops t and re-arms it for duration d. The non-blocking drain
+// keeps it correct on Go versions before 1.23 (where a fired timer leaves a
+// value in the channel) without risking a deadlock on 1.23+ (where Stop
+// returning false no longer guarantees a pending value to drain).
+func resetTimer(t *time.Timer, d time.Duration) {
+	if !t.Stop() {
+		select {
+		case <-t.C:
+		default:
+		}
+	}
+	t.Reset(d)
 }
 
 func minDuration(a time.Duration, b time.Duration) time.Duration {
