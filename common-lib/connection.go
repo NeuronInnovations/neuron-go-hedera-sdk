@@ -28,17 +28,46 @@ func InitialConnect(ctx context.Context, p2pHost host.Host, addrInfo peer.AddrIn
 	info, exists := buyerBuffers.GetBuffer(addrInfo.ID)
 
 	if exists && info.LibP2PState == Connected {
+		// InitialConnect is only ever called in response to a buyer's fresh service
+		// request, and a buyer only re-requests when it believes it is NOT receiving
+		// data. So a cached "Connected" buffer here is suspect: it can be a stale /
+		// half-open connection the seller never noticed (writes into a dead QUIC stream
+		// keep succeeding silently). The old code trusted the flag and returned early,
+		// so the seller short-circuited forever and never re-dialed — observed live as a
+		// buyer locked out ~14h with zero dials and zero errors until the seller process
+		// was restarted, while other buyers were served fine.
 		if p2pHost.Network().Connectedness(addrInfo.ID) == network.Connected {
 			// Check if Writer stream is valid (Writer is set by AddBuffer3, not StreamHandler)
 			if info.Writer != nil {
 				conn := info.Writer.Conn()
 				if conn != nil && !conn.IsClosed() {
-					fmt.Printf("😍😍 Thanks, we're good, connected and pumping %s -> ! 😍😍\n", addrInfo.ID)
-					return nil
+					// Grace window: if we (re)connected only moments ago, this is just an
+					// in-flight duplicate request from the buyer's retry loop — trust it and
+					// avoid needless reconnect churn.
+					if !info.LastSuccessAt.IsZero() && time.Since(info.LastSuccessAt) < 45*time.Second {
+						fmt.Printf("😍😍 Thanks, we're good, connected and pumping %s -> ! 😍😍\n", addrInfo.ID)
+						return nil
+					}
+					// Otherwise the buffer claims Connected but the buyer is asking again:
+					// verify the link is genuinely alive with a real (protocol-negotiated)
+					// stream open. This round-trips multistream-select, so a half-open/dead
+					// connection fails or times out instead of lying.
+					probeCtx, probeCancel := context.WithTimeout(ctx, 8*time.Second)
+					probeStream, probeErr := p2pHost.NewStream(probeCtx, addrInfo.ID, protocol)
+					probeCancel()
+					if probeErr == nil {
+						// Non-mutating probe: keep the existing writer, drop the probe stream.
+						_ = probeStream.Reset()
+						fmt.Printf("😍😍 Thanks, we're good (liveness-verified) %s -> ! 😍😍\n", addrInfo.ID)
+						return nil
+					}
+					log.Printf("[TRACE SELLER CONNECT] stale Connected buffer for %s failed liveness probe (%v); closing and re-dialing", addrInfo.ID, probeErr)
+					p2pHost.Network().ClosePeer(addrInfo.ID)
 				}
 			}
 		}
-		log.Println("the buffer is there but the state is not connected, we will try to reconnect")
+		buyerBuffers.UpdateBufferLibP2PState(addrInfo.ID, Reconnecting)
+		log.Println("the buffer is there but not live, we will try to reconnect")
 	}
 
 	// now there are two cases to test.
