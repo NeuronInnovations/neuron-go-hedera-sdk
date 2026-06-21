@@ -2,12 +2,14 @@ package hedera_helper
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
 
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -123,7 +125,7 @@ func getContractCaller() *hederacontract.HederacontractCaller {
 
 	contractCaller, err := hederacontract.NewHederacontractCaller(
 		common.HexToAddress(scAddress),
-		newMirrorContractCaller(),
+		sharedMirror(),
 	)
 	if err != nil {
 		log.Panicf("failed to create hedera contract caller: %v", err)
@@ -665,62 +667,86 @@ func ListenToTopicAndCallBack(stdInTopic hedera.TopicID, callback func(message h
 	return errors.New("failed to ListenToTopicAndCallBack")
 }
 
+// downloadAndListen tails an HCS topic by POLLING the mirror node's REST
+// /topics/{id}/messages endpoint instead of the SDK's long-lived gRPC stream.
+// The gRPC subscription silently stalls on restrictive networks (school/ISP
+// filters idle-kill long-lived HTTP/2 streams; the mirror also gives no heartbeat
+// when it drops us). Short REST polls don't have that problem and ride the same
+// adaptive (DNS-first + IP-cache) mirror client as contract reads. This function
+// never returns.
 func downloadAndListen(topicID hedera.TopicID, callback func(message hedera.TopicMessage)) {
-	// Create a new client with the operator account ID and key
-	client := GetHederaClientUsingEnv()
-	// Channel to signal message receipt
-	messageReceived := make(chan struct{}, 1)
-	subscriptionDone := make(chan struct{}, 1)
-	// Main loop to keep subscribing
-	lastStdInTimestamp := time.Now().UTC()
-	reconnectDelay := 1 * time.Second
-	// The mirror node sends no heartbeat and never tells us when it has dropped
-	// our subscription, so we must keep this watchdog + resubscribe loop running
-	// indefinitely. Allocate the watchdog timer ONCE here and reuse it across
-	// every resubscription. Previously the timer was created (with a
-	// `defer timeout.Stop()`) inside the goto loop below; because this function
-	// never returns, those defers and their timers accumulated forever — one per
-	// reconnect, ~1/sec — leaking unboundedly.
-	timeout := time.NewTimer(45 * time.Second)
-	defer timeout.Stop()
-mainLoop:
-	// Re-subscribe from last seen timestamp (with small overlap) so we don't
-	// miss messages during subscription churn.
-	startTime := lastStdInTimestamp.Add(-2 * time.Second)
-	handle, err := subscribe(client, topicID, startTime, func(message hedera.TopicMessage) {
-		ts := message.ConsensusTimestamp
-		if !ts.IsZero() && ts.After(lastStdInTimestamp) {
-			lastStdInTimestamp = ts
-		}
-		callback(message)
-	}, messageReceived, subscriptionDone)
-	if err != nil {
-		log.Println("SELFERROR:Error subscribing to topic: ", err) // TODO: send error to error topic
-		time.Sleep(reconnectDelay)
-		reconnectDelay = minDuration(reconnectDelay*2, 30*time.Second)
-		goto mainLoop
-	}
-	reconnectDelay = 1 * time.Second
-	// Re-arm the shared watchdog for this fresh subscription.
-	resetTimer(timeout, 45*time.Second)
-
+	m := sharedMirror()
+	topic := topicID.String()
+	// Start slightly in the past so a request sent right before startup isn't
+	// missed, but not so far back that we replay much history.
+	lastTs := time.Now().UTC().Add(-10 * time.Second)
+	const pollInterval = 2 * time.Second
+	backoff := pollInterval
 	for {
-		select {
-		case <-messageReceived:
-			// Message received; re-arm the watchdog.
-			resetTimer(timeout, 45*time.Second)
-		case <-subscriptionDone:
-			// Underlying SDK completed subscription unexpectedly; resubscribe now.
-			handle.Unsubscribe()
-			time.Sleep(reconnectDelay)
-			reconnectDelay = minDuration(reconnectDelay*2, 30*time.Second)
-			goto mainLoop
-		case <-timeout.C:
-			// Watchdog: no messages for a while could mean dead subscription.
-			handle.Unsubscribe()
-			goto mainLoop // Break out of the outer loop to restart the subscription]
+		ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+		path := fmt.Sprintf("/topics/%s/messages?timestamp=gt:%d.%09d&order=asc&limit=100",
+			topic, lastTs.Unix(), lastTs.Nanosecond())
+		body, err := m.GetJSON(ctx, path)
+		cancel()
+		if err != nil {
+			log.Printf("topic %s: poll failed: %v", topic, err) // SELFERROR
+			time.Sleep(backoff)
+			backoff = minDuration(backoff*2, 30*time.Second)
+			continue
 		}
+		backoff = pollInterval
+
+		var parsed struct {
+			Messages []struct {
+				ConsensusTimestamp string `json:"consensus_timestamp"`
+				Message            string `json:"message"` // base64
+				SequenceNumber     uint64 `json:"sequence_number"`
+			} `json:"messages"`
+		}
+		if err := json.Unmarshal(body, &parsed); err != nil {
+			log.Printf("topic %s: decode messages: %v", topic, err)
+			time.Sleep(pollInterval)
+			continue
+		}
+		for _, msg := range parsed.Messages {
+			raw, derr := base64.StdEncoding.DecodeString(msg.Message)
+			if derr != nil {
+				continue
+			}
+			ts := parseMirrorTimestamp(msg.ConsensusTimestamp)
+			callback(hedera.TopicMessage{
+				ConsensusTimestamp: ts,
+				Contents:           raw,
+				SequenceNumber:     msg.SequenceNumber,
+			})
+			if ts.After(lastTs) {
+				lastTs = ts
+			}
+		}
+		time.Sleep(pollInterval)
 	}
+}
+
+// parseMirrorTimestamp converts a mirror-node "seconds.nanos" consensus timestamp
+// to time.Time; returns the zero time on parse failure (callers tolerate it).
+func parseMirrorTimestamp(s string) time.Time {
+	s = strings.TrimSpace(s)
+	secStr, nanoStr := s, ""
+	if dot := strings.IndexByte(s, '.'); dot >= 0 {
+		secStr, nanoStr = s[:dot], s[dot+1:]
+	}
+	sec, err := strconv.ParseInt(secStr, 10, 64)
+	if err != nil {
+		return time.Time{}
+	}
+	var nano int64
+	if nanoStr != "" {
+		for len(nanoStr) < 9 {
+			nanoStr += "0"
+		}
+		nano, _ = strconv.ParseInt(nanoStr[:9], 10, 64)
+	}
+	return time.Unix(sec, nano).UTC()
 }
 
 func subscribe(

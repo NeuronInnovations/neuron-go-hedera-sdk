@@ -30,6 +30,11 @@ import (
 func HandleSellerCase(ctx context.Context, p2pHost host.Host, protocol protocol.ID, sellerCase func(ctx context.Context, p2pHost host.Host, buffers *neuronbuffers.NodeBuffers), sellerCaseTopicCallBack func(topicMessage hedera.TopicMessage)) {
 	fmt.Println("Acting as a data seller (I'll be waiting on my topic for requests and serve them on the stream)")
 
+	// Self-heal a wedged outbound UDP path: if we dial buyers but stay with zero
+	// connected buyers for 5 min, exit so systemd restarts us on a fresh random
+	// port (see the seller random-port logic in neuron-sdk.go init).
+	commonlib.StartSellerDialWatchdog(5 * time.Minute)
+
 	buyerBuffers := commonlib.NodeBuffersInstance
 	if buyerBuffers == nil {
 		buyerBuffers = commonlib.NewNodeBuffers()
@@ -223,7 +228,8 @@ func HandleSellerCase(ctx context.Context, p2pHost host.Host, protocol protocol.
 				
 				// Register the public key -> peer ID mapping for log correlation
 				commonlib.RegisterPeerPublicKey(addrInfo.ID, otherPublicKey)
-				
+
+				commonlib.NoteSellerDialAttempt() // feed the seller dial watchdog
 				initiationError := commonlib.InitialConnect(ctx, p2pHost, *addrInfo, buyerBuffers, protocol)
 				if initiationError != nil {
 					log.Printf("[TRACE SELLER REQUEST] InitialConnect failed tx=%s buyer_peer=%s elapsed=%v err=%v",

@@ -26,9 +26,11 @@ import (
 	"github.com/hashgraph/hedera-sdk-go/v2"
 	"github.com/libp2p/go-libp2p"
 
+	"net"
 	"os"
 	"os/signal"
 	"sort"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -80,12 +82,43 @@ func init() {
 	if os.Getenv("smart_contract_address") == "" {
 		log.Fatalf("smart_contract_address is not set in the %s file", commonlib.MyEnvFile)
 	}
+	// Sellers are never dialed (the buyer is the public listener), so pinning the
+	// seller to a fixed UDP port is pure liability: go-libp2p's QUIC transport
+	// reuses the listen socket as the SOURCE port for outbound dials, so if the
+	// router/NAT wedges the conntrack mapping for that port (or libp2p's black-hole
+	// detector latches after repeated failures) every dial fails — and a restart on
+	// the SAME port can't escape it (a full device reboot was observed not to
+	// recover). Use a fresh random free port each start so a restart always gets a
+	// clean mapping + reset detector. The buyer keeps its fixed --port (it must be
+	// dialable at a well-known address). See StartSellerDialWatchdog for the
+	// self-heal that turns a wedge into a restart.
+	if flags.BuyerOrSellerFlag != nil && *flags.BuyerOrSellerFlag == "seller" {
+		if p, err := pickFreeUDPPort(); err == nil {
+			log.Printf("seller mode: using random libp2p UDP port %d (ignoring --port=%s to escape wedged NAT mappings)", p, *flags.PortFlag)
+			*flags.PortFlag = strconv.Itoa(p)
+		} else {
+			log.Printf("seller mode: could not allocate a random UDP port (%v); keeping --port=%s", err, *flags.PortFlag)
+		}
+	}
+
 	// check the reachability of the node.
 	if (flags.PortFlag == nil) || (*flags.PortFlag == "" || *flags.PortFlag == "0") {
 		log.Fatal("port is not set")
 	}
 
 	whoami.GetNatInfoAndUpdateGlobals(flags.PortFlag)
+}
+
+// pickFreeUDPPort asks the OS for a currently-free UDP port (bind :0, read the
+// assigned port, release it). There is a tiny TOCTOU window before libp2p rebinds
+// it, but collisions are vanishingly unlikely and a restart simply picks another.
+func pickFreeUDPPort() (int, error) {
+	c, err := net.ListenPacket("udp4", "0.0.0.0:0")
+	if err != nil {
+		return 0, err
+	}
+	defer c.Close()
+	return c.LocalAddr().(*net.UDPAddr).Port, nil
 }
 
 // LaunchSDK serves as the entry point to the Neuron SDK, initializing core components,

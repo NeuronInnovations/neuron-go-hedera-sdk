@@ -1,3 +1,8 @@
+// REPO-MAP: this = the SHARED SDK (libp2p + Hedera glue). Imported by BOTH siblings
+// via a local `replace => ../neuron-go-hedera-sdk`, so the BRANCH checked out here is
+// what they actually compile:
+//   github.com/NeuronInnovations/neuron-4sky-edge-go  ("4dsky edge")  = SELLER
+//   github.com/NeuronInnovations/4dsky-edge-buyer                     = BUYER
 module github.com/NeuronInnovations/neuron-go-hedera-sdk
 
 go 1.25.7
