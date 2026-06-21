@@ -25,6 +25,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/core/protocol"
+	"github.com/multiformats/go-multiaddr"
 )
 
 func HandleSellerCase(ctx context.Context, p2pHost host.Host, protocol protocol.ID, sellerCase func(ctx context.Context, p2pHost host.Host, buffers *neuronbuffers.NodeBuffers), sellerCaseTopicCallBack func(topicMessage hedera.TopicMessage)) {
@@ -205,24 +206,41 @@ func HandleSellerCase(ctx context.Context, p2pHost host.Host, protocol protocol.
 				}
 				fmt.Printf("decrypted multi address, %s\n", decryptedIpAddress)
 
+				// The buyer advertises its whole reachable-address list (quic + tcp).
+				// Collect ALL of them into one AddrInfo and let libp2p's dial ranker
+				// pick: it prefers QUIC (UDP) and falls back to TCP, so a seller whose
+				// UDP path to this buyer is blocked/asymmetric still connects over TCP.
+				// `--force-protocol=tcp` restricts to TCP only (for testing/forcing);
+				// the default ("udp") keeps all addrs with QUIC preferred.
 				trimmed := strings.Trim(string(decryptedIpAddress), "[]")
 				addrStrs := strings.Fields(trimmed)
-				var pidStr string
+				forceTCP := strings.EqualFold(strings.TrimSpace(*flags.ForceProtocolFlag), "tcp")
+				pid, pidErr := peer.Decode(otherPeerID)
+				if pidErr != nil {
+					log.Printf("NACK: cannot decode buyer peer id %s: %v", otherPeerID, pidErr)
+					hedera_helper.PeerSendErrorMessage(otherSideStdIn, commonlib.IpDecryptionError, "I cannot decode your peer id", commonlib.SendFreshHederaRequest)
+					return
+				}
+				var maddrs []multiaddr.Multiaddr
 				for _, str := range addrStrs {
-					if strings.Contains(str, *flags.ForceProtocolFlag) {
-						pidStr = fmt.Sprintf("%s/p2p/%s", str, otherPeerID)
-						break
+					if forceTCP && !strings.Contains(str, "/tcp/") {
+						continue
+					}
+					if m, e := multiaddr.NewMultiaddr(str); e == nil {
+						maddrs = append(maddrs, m)
 					}
 				}
-				addrInfo, decodeErr := peer.AddrInfoFromString(pidStr)
-
-				if decodeErr != nil {
-					log.Panic(decodeErr)
+				if len(maddrs) == 0 {
+					log.Printf("NACK: no dialable address for buyer %s in %q (forceTCP=%v)", otherPeerID, trimmed, forceTCP)
+					hedera_helper.PeerSendErrorMessage(otherSideStdIn, commonlib.IpDecryptionError, "I found no dialable address in your request", commonlib.SendFreshHederaRequest)
+					return
 				}
-				log.Printf("[TRACE SELLER REQUEST] dialing buyer tx=%s buyer_peer=%s addr=%s elapsed=%v",
+				addrInfo := &peer.AddrInfo{ID: pid, Addrs: maddrs}
+
+				log.Printf("[TRACE SELLER REQUEST] dialing buyer tx=%s buyer_peer=%s addrs=%v elapsed=%v",
 					message.TransactionID,
 					addrInfo.ID,
-					pidStr,
+					addrInfo.Addrs,
 					time.Since(reqStart).Round(time.Millisecond),
 				)
 				

@@ -45,6 +45,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/protocol"
 	libp2pconnmgr "github.com/libp2p/go-libp2p/p2p/net/connmgr"
 	quictransprt "github.com/libp2p/go-libp2p/p2p/transport/quic"
+	libp2ptcp "github.com/libp2p/go-libp2p/p2p/transport/tcp"
 	"github.com/multiformats/go-multiaddr"
 	manet "github.com/multiformats/go-multiaddr/net"
 )
@@ -188,18 +189,30 @@ func LaunchSDK(
 	var p2pHost host.Host
 
 	options := []libp2p.Option{
+		// QUIC (UDP) is the primary transport; TCP is added as a fallback so a peer
+		// whose UDP path is blocked/asymmetric (e.g. a seller behind a filtering
+		// router) can still reach the buyer. Both run at once; libp2p's dial ranker
+		// prefers QUIC and only falls back to TCP. TCP uses libp2p's default
+		// security (TLS/Noise) + muxer (yamux) — applied automatically since we
+		// don't override them. Adding TCP does not change the QUIC path.
 		libp2p.Transport(quictransprt.NewTransport),
+		libp2p.Transport(libp2ptcp.NewTCPTransport),
 
 		//libp2p.Security(noise.ID, noise.New),
 		libp2p.AddrsFactory(func(m []multiaddr.Multiaddr) []multiaddr.Multiaddr {
 			// advertise only public addresses for now.  TODO: reintroduce local addresses
 			filtered := multiaddr.FilterAddrs(m, manet.IsPublicAddr)
+			// Advertise BOTH the QUIC (udp) and TCP variants so dialers know they can
+			// fall back to TCP. The seller sends its whole reachable-address list, so
+			// adding the TCP addr here makes it available to dialers.
 			if flags.MyPublicIpFlag != nil && *flags.MyPublicIpFlag != "" && flags.MyPublicPortFlag != nil && *flags.MyPublicPortFlag != "" {
 				externalAddrUDP, _ := multiaddr.NewMultiaddr(fmt.Sprintf("/ip4/%s/udp/%s/quic-v1", *flags.MyPublicIpFlag, *flags.MyPublicPortFlag))
-				filtered = append(filtered, externalAddrUDP)
+				externalAddrTCP, _ := multiaddr.NewMultiaddr(fmt.Sprintf("/ip4/%s/tcp/%s", *flags.MyPublicIpFlag, *flags.MyPublicPortFlag))
+				filtered = append(filtered, externalAddrUDP, externalAddrTCP)
 			} else {
 				discoveredAddrUDP, _ := multiaddr.NewMultiaddr(fmt.Sprintf("/ip4/%s/udp/%d/quic-v1", whoami.NatIPAddress, whoami.NatPort))
-				filtered = append(filtered, discoveredAddrUDP)
+				discoveredAddrTCP, _ := multiaddr.NewMultiaddr(fmt.Sprintf("/ip4/%s/tcp/%d", whoami.NatIPAddress, whoami.NatPort))
+				filtered = append(filtered, discoveredAddrUDP, discoveredAddrTCP)
 			}
 			return filtered
 		}),
@@ -295,7 +308,10 @@ func LaunchSDK(
 		fmt.Println("...starting in peer mode")
 		options = append(options,
 			libp2p.Identity(fixPrivKey_g),
-			libp2p.ListenAddrStrings(fmt.Sprintf("/ip4/0.0.0.0/udp/%s/quic-v1/", *flags.PortFlag)),
+			libp2p.ListenAddrStrings(
+				fmt.Sprintf("/ip4/0.0.0.0/udp/%s/quic-v1", *flags.PortFlag),
+				fmt.Sprintf("/ip4/0.0.0.0/tcp/%s", *flags.PortFlag),
+			),
 			libp2p.EnableHolePunching(),
 		)
 		p2pHost = createHost(options)
