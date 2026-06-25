@@ -459,6 +459,10 @@ func startSellerAutonomousReconnect(ctx context.Context, p2pHost host.Host, prot
 			// (2) Ensure every still-leased buyer has a live stream.
 			servable, err := commonlib.ListServableBuyers()
 			if err != nil {
+				// Loud, not silent: a closed cache (e.g. no writable path for the
+				// service user) disables the whole known-buyers feature, and we must
+				// never let that hide behind a quiet no-op again.
+				log.Printf("[knownbuyers] cache unavailable (%v) — autonomous serve/redial disabled this sweep", err)
 				time.Sleep(sweepInterval)
 				continue
 			}

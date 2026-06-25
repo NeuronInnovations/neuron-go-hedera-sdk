@@ -48,6 +48,14 @@ func OpenSharedAccountDB() error {
 	if d := os.Getenv("NEURON_CACHE_DIR"); d != "" {
 		candidates = append(candidates, filepath.Join(d, dbFileName))
 	}
+	// 2b) systemd StateDirectory ($STATE_DIRECTORY when StateDirectory= is set),
+	// then the conventional service state path. Gives a packaged service a
+	// persistent, writable home for the cache even when HOME is absent
+	// (e.g. a `useradd -r` service user) and the working dir is read-only.
+	if sd := os.Getenv("STATE_DIRECTORY"); sd != "" {
+		candidates = append(candidates, filepath.Join(sd, dbFileName))
+	}
+	candidates = append(candidates, filepath.Join("/var/lib/neuron-sdk", dbFileName))
 	// 3) Home directory
 	if homeDir, err := os.UserHomeDir(); err == nil {
 		candidates = append(candidates, filepath.Join(homeDir, ".neuron", dbFileName))
