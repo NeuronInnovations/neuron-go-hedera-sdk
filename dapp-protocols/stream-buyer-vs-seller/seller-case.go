@@ -63,11 +63,13 @@ func HandleSellerCase(ctx context.Context, p2pHost host.Host, protocol protocol.
 					requestMsgFromOtherSide := commonlib.NeuronServiceRequestMsg{}
 					messageBytes, err := json.Marshal(message)
 					if err != nil {
-						log.Panic("Error marshaling message: ", err)
+						log.Printf("invoice loop: skipping buyer, cannot marshal request message: %v", err)
+						continue
 					}
 					err = json.Unmarshal(messageBytes, &requestMsgFromOtherSide)
 					if err != nil {
-						log.Panic("Error unmarshaling message to NeuronServiceRequestMsg: ", err)
+						log.Printf("invoice loop: skipping buyer, cannot unmarshal request message: %v", err)
+						continue
 					}
 					fmt.Println("Successfully converted map to NeuronServiceRequestMsg:", requestMsgFromOtherSide)
 				default:
@@ -78,17 +80,22 @@ func HandleSellerCase(ctx context.Context, p2pHost host.Host, protocol protocol.
 				sharedAccID, err := hedera.AccountIDFromString(fmt.Sprintf("0.0.%d", requestMsgFromOtherSide.SharedAccID))
 
 				if err != nil {
-					log.Panic(err)
+					log.Printf("invoice loop: skipping buyer %s, bad shared account id %d: %v", peerID, requestMsgFromOtherSide.SharedAccID, err)
+					continue
 				}
 
 				myDeviceAccountID, err := hedera.AccountIDFromEvmAddress(0, 0, os.Getenv("hedera_evm_id"))
 				if err != nil {
-					log.Panic(err)
+					log.Printf("invoice loop: skipping buyer %s, bad device evm id %q: %v", peerID, os.Getenv("hedera_evm_id"), err)
+					continue
 				}
 
+				// GetDeviceParent hits the Hedera mirror REST API; a transient mirror
+				// outage must not crash the seller — skip this buyer and retry next cycle.
 				myParrentAccountID, err := hedera_helper.GetDeviceParent(os.Getenv("hedera_evm_id"))
 				if err != nil {
-					log.Panic(err)
+					log.Printf("invoice loop: skipping buyer %s, mirror lookup of device parent failed: %v", peerID, err)
+					continue
 				}
 
 				buyerStdIn := hedera.TopicID{

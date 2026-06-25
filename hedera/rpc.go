@@ -37,7 +37,11 @@ func EnsureTopicsAndNotifyContract(p2pHost host.Host) (hedera.TopicID, hedera.To
 
 	peerInfo, err := GetPeerInfo(toEthAddress)
 	if err != nil {
-		log.Panic("We must be able to  correctly talk to the smart contract to continue;\n perhaps you are pointing to the wrong contract \n or your address doesn't exist, err:", err)
+		// Transient mirror/Hedera outage (DNS, HTTP 5xx, rate-limit, etc.). Do NOT
+		// crash: return the error so the startup caller keeps retrying until the
+		// service recovers. (A wrong-contract / missing-address config error also
+		// lands here, but retrying is harmless and far better than a crash loop.)
+		return hedera.TopicID{}, hedera.TopicID{}, hedera.TopicID{}, fmt.Errorf("could not read our topics from the smart contract via the mirror (will retry): %w", err)
 	} else {
 		// check if peerInfo has data
 		if peerInfo.StdInTopic != 0 && peerInfo.StdOutTopic != 0 {
@@ -110,12 +114,13 @@ func EnsureTopicsAndNotifyContract(p2pHost host.Host) (hedera.TopicID, hedera.To
 				fmt.Printf("contract call result: %v\n", callResult)
 				return stdOutTopicID, stdInTopicID, stdErrTopicID, nil
 			} else {
-				log.Panic("We could not find your topics in the smart contract")
+				// We reached the contract fine but it has no topics registered for
+				// us yet. Retryable, not fatal: registration may land later, and a
+				// panic here just becomes a systemd crash loop.
+				return hedera.TopicID{}, hedera.TopicID{}, hedera.TopicID{}, fmt.Errorf("our topics are not registered in the smart contract yet (will retry)")
 			}
 		}
 	}
-
-	return hedera.TopicID{}, hedera.TopicID{}, hedera.TopicID{}, err
 }
 
 func GetPeerArraySize() (*big.Int, error) {

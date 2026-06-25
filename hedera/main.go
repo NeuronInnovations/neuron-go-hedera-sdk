@@ -662,9 +662,22 @@ func ListenToTopicAndCallBack(stdInTopic hedera.TopicID, callback func(message h
 	if myEthAddress == "" {
 		return errors.New("myEthAddress is empty")
 	}
-	downloadAndListen(stdInTopic, callback)
-	// the above should never return; reaching the next line is an error.
-	return errors.New("failed to ListenToTopicAndCallBack")
+	// downloadAndListen polls the mirror forever and is the node's ONLY inbound
+	// path. Supervise it: if it ever panics (or returns), restart it so a transient
+	// fault can't leave the node permanently deaf — it keeps polling and picks the
+	// mirror back up as soon as the service returns.
+	for {
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("topic %s: inbound listener panicked, restarting: %v", stdInTopic, r)
+				}
+			}()
+			downloadAndListen(stdInTopic, callback)
+		}()
+		log.Printf("topic %s: inbound listener stopped unexpectedly, restarting in 2s", stdInTopic)
+		time.Sleep(2 * time.Second)
+	}
 }
 
 // downloadAndListen tails an HCS topic by POLLING the mirror node's REST
@@ -714,11 +727,20 @@ func downloadAndListen(topicID hedera.TopicID, callback func(message hedera.Topi
 				continue
 			}
 			ts := parseMirrorTimestamp(msg.ConsensusTimestamp)
-			callback(hedera.TopicMessage{
-				ConsensusTimestamp: ts,
-				Contents:           raw,
-				SequenceNumber:     msg.SequenceNumber,
-			})
+			// Contain a panic from handling one (possibly malformed) message so it
+			// can't unwind and kill the poll loop; log it and keep tailing.
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						log.Printf("topic %s: recovered from panic handling message seq=%d: %v", topic, msg.SequenceNumber, r)
+					}
+				}()
+				callback(hedera.TopicMessage{
+					ConsensusTimestamp: ts,
+					Contents:           raw,
+					SequenceNumber:     msg.SequenceNumber,
+				})
+			}()
 			if ts.After(lastTs) {
 				lastTs = ts
 			}

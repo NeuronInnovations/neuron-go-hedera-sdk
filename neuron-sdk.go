@@ -352,7 +352,11 @@ func LaunchSDK(
 
 		stdOutTopic, stdInTopic, stdErrTopic, err := hederaAnnounceAndHeartBeat(ctx, p2pHost)
 		if err != nil {
-			log.Panic(err)
+			// Topic resolution now retries through mirror/Hedera outages instead of
+			// crashing, so the only way we reach here is a cancelled context
+			// (shutdown). Don't panic — just stop bringing this node up.
+			log.Printf("hedera announce aborted (shutting down): %v", err)
+			return
 		}
 
 		commonlib.MyStdIn = stdInTopic
@@ -386,7 +390,10 @@ func LaunchSDK(
 
 	// keep the node running until a keyboard interrupt
 	keyboardCancelChannel := make(chan os.Signal, 1)
-	signal.Notify(keyboardCancelChannel, syscall.SIGINT, syscall.SIGTERM)
+	// Ignore SIGINT *and* SIGTERM: WSL delivers stray ones to processes when
+	// interactive `wsl` sessions open/close, which would otherwise kill the node.
+	// systemd stops the service via SIGKILL (KillSignal=SIGKILL).
+	signal.Ignore(syscall.SIGINT, syscall.SIGTERM)
 	fmt.Println("Press ctrl+c to kill the libp2p node")
 
 	<-keyboardCancelChannel
@@ -508,10 +515,33 @@ func getAbbreviatedPeerPublicKeys(p2pHost host.Host) []string {
 func hederaAnnounceAndHeartBeat(ctx context.Context, p2pHost host.Host) (hedera.TopicID, hedera.TopicID, hedera.TopicID, error) {
 
 	fmt.Println("connect to hedera and send periodic alive")
-	stdOutTopic, stdInTopic, stdErrTopic, topciCreationError := hedera_helper.EnsureTopicsAndNotifyContract(p2pHost)
 
-	if topciCreationError != nil {
-		log.Fatal("Failed to create hedera topics. Let's end it here. ", topciCreationError)
+	// Resolve our topics from the Rendezvous contract (read through the Hedera
+	// mirror node). The mirror / Hedera testnet are external dependencies that can
+	// be transiently unreachable (DNS, HTTP 5xx, rate-limit). A boot-time outage
+	// must NOT crash the node — those problems fix themselves, so retry with capped
+	// backoff until the read succeeds instead of exiting into a systemd crash loop.
+	var stdOutTopic, stdInTopic, stdErrTopic hedera.TopicID
+	backoff := 2 * time.Second
+	const maxTopicBackoff = 60 * time.Second
+	for attempt := 1; ; attempt++ {
+		var topicErr error
+		stdOutTopic, stdInTopic, stdErrTopic, topicErr = hedera_helper.EnsureTopicsAndNotifyContract(p2pHost)
+		if topicErr == nil {
+			break
+		}
+		log.Printf("⏳  hedera/mirror not reachable yet (attempt %d): %v — retrying in %s, staying up", attempt, topicErr, backoff)
+		select {
+		case <-ctx.Done():
+			return hedera.TopicID{}, hedera.TopicID{}, hedera.TopicID{}, ctx.Err()
+		case <-time.After(backoff):
+		}
+		if backoff < maxTopicBackoff {
+			backoff *= 2
+			if backoff > maxTopicBackoff {
+				backoff = maxTopicBackoff
+			}
+		}
 	}
 
 	go func() {
@@ -549,7 +579,7 @@ func hederaAnnounceAndHeartBeat(ctx context.Context, p2pHost host.Host) (hedera.
 			time.Sleep(time.Second * 40)
 		}
 	}()
-	return stdOutTopic, stdInTopic, stdErrTopic, topciCreationError
+	return stdOutTopic, stdInTopic, stdErrTopic, nil
 }
 
 func hostsPublicAddressesSorted(p2pHost host.Host) []multiaddr.Multiaddr {

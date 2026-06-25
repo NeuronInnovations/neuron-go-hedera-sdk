@@ -723,7 +723,8 @@ func getPeerHeartbeatIfRecent(peerInfo hedera_helper.PeerInfo) (hedera_helper.HC
 
 	stdoutTyped, err := hedera.TopicIDFromString(fmt.Sprintf("0.0.%d", peerInfo.StdOutTopic))
 	if err != nil {
-		log.Fatal(err, peerInfo.StdOutTopic)
+		log.Printf("getPeerHeartbeatIfRecent: bad stdout topic %d: %v", peerInfo.StdOutTopic, err)
+		return hedera_helper.HCSMessage{}, false
 	}
 	m, lastMessageError := hedera_helper.GetLastMessageFromTopic(stdoutTyped)
 	if lastMessageError != nil {
