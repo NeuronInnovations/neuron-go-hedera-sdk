@@ -389,8 +389,12 @@ func persistKnownBuyer(req *commonlib.NeuronServiceRequestMsg, addrInfo *peer.Ad
 		rec.LastBalanceTiny = prev.LastBalanceTiny
 		rec.CreatedAt = prev.CreatedAt
 	}
-	if err := commonlib.SaveKnownBuyer(rec); err != nil && err != commonlib.ErrDatabaseNotOpen {
-		log.Printf("could not persist known buyer %s: %v", req.EthPublicKey, err)
+	if err := commonlib.SaveKnownBuyer(rec); err != nil {
+		if err != commonlib.ErrDatabaseNotOpen {
+			log.Printf("could not persist known buyer %s: %v", req.EthPublicKey, err)
+		}
+	} else {
+		log.Printf("[knownbuyers] cached buyer %s addrs=%v", req.EthPublicKey, maddrs)
 	}
 }
 
@@ -459,6 +463,9 @@ func startSellerAutonomousReconnect(ctx context.Context, p2pHost host.Host, prot
 				continue
 			}
 			now := time.Now()
+			connected := make([]string, 0, len(servable))
+			redialing := make([]string, 0)
+			backingOff := 0
 			for _, kb := range servable {
 				pid, derr := buyerPeerID(kb.BuyerPublicKey)
 				if derr != nil {
@@ -467,11 +474,14 @@ func startSellerAutonomousReconnect(ctx context.Context, p2pHost host.Host, prot
 				if isBuyerConnected(p2pHost, pid, buyerBuffers) {
 					delete(attempts, kb.BuyerEthAddress) // healthy: reset backoff
 					delete(nextAttempt, kb.BuyerEthAddress)
+					connected = append(connected, kb.BuyerEthAddress)
 					continue
 				}
 				if t, ok := nextAttempt[kb.BuyerEthAddress]; ok && now.Before(t) {
+					backingOff++
 					continue // still backing off
 				}
+				redialing = append(redialing, kb.BuyerEthAddress)
 				if rerr := redialCachedBuyer(ctx, p2pHost, protocol, kb, pid, buyerBuffers); rerr != nil {
 					n := attempts[kb.BuyerEthAddress] + 1
 					attempts[kb.BuyerEthAddress] = n
@@ -491,6 +501,10 @@ func startSellerAutonomousReconnect(ctx context.Context, p2pHost host.Host, prot
 					log.Printf("autonomous re-dial of cached buyer %s succeeded", kb.BuyerEthAddress)
 				}
 			}
+			// Heartbeat so the loop's decisions are visible even when it takes no
+			// action (otherwise it is silent and we cannot tell it is alive).
+			log.Printf("[knownbuyers] sweep: servable=%d connected=%d %v redialing=%d %v backingOff=%d",
+				len(servable), len(connected), connected, len(redialing), redialing, backingOff)
 			time.Sleep(sweepInterval)
 		}
 	}()
