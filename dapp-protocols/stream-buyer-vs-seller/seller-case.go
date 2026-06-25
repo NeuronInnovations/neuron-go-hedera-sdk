@@ -23,6 +23,7 @@ import (
 
 	"github.com/hashgraph/hedera-sdk-go/v2"
 	"github.com/libp2p/go-libp2p/core/host"
+	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/core/protocol"
 	"github.com/multiformats/go-multiaddr"
@@ -40,6 +41,12 @@ func HandleSellerCase(ctx context.Context, p2pHost host.Host, protocol protocol.
 	if buyerBuffers == nil {
 		buyerBuffers = commonlib.NewNodeBuffers()
 	}
+
+	// Keep serving buyers from the on-disk known-buyers cache: re-dial any
+	// servable buyer that isn't connected (from its remembered address, no fresh
+	// topic request needed) and drop buyers whose 5-day lease has expired. This is
+	// the seller's Hedera-independent serve loop.
+	startSellerAutonomousReconnect(ctx, p2pHost, protocol, buyerBuffers)
 
 	// for each connected buyer send out invoices
 	go func() {
@@ -109,6 +116,12 @@ func HandleSellerCase(ctx context.Context, p2pHost host.Host, protocol protocol.
 					log.Printf("invoice send failed for %s: %v", peerID, err2)
 					continue
 				}
+				// Lease "real keepalive": the buyer paying invoices / topping up the
+				// shared account moves its balance. Detect that and renew the buyer's
+				// lease. Best-effort + mirror-dependent; during an outage we simply
+				// don't renew (the seller keeps serving regardless; only ~5 days of
+				// total silence gives up).
+				renewLeaseOnBalanceMovement(requestMsgFromOtherSide.EthPublicKey, requestMsgFromOtherSide.SharedAccID)
 				// Avoid blasting Hedera with burst writes when many buyers are connected.
 				time.Sleep(600 * time.Millisecond)
 
@@ -250,7 +263,7 @@ func HandleSellerCase(ctx context.Context, p2pHost host.Host, protocol protocol.
 					addrInfo.Addrs,
 					time.Since(reqStart).Round(time.Millisecond),
 				)
-				
+
 				// Register the public key -> peer ID mapping for log correlation
 				commonlib.RegisterPeerPublicKey(addrInfo.ID, otherPublicKey)
 
@@ -270,6 +283,9 @@ func HandleSellerCase(ctx context.Context, p2pHost host.Host, protocol protocol.
 						addrInfo.ID,
 						time.Since(reqStart).Round(time.Millisecond),
 					)
+					// Persist this buyer so we can keep serving / re-dial it later
+					// without a fresh topic request (survives reboots + Hedera outages).
+					persistKnownBuyer(requestMsgFromOtherSide, addrInfo)
 				}
 
 				envelope := commonlib.TopicPostalEnvelope{
@@ -293,34 +309,34 @@ func HandleSellerCase(ctx context.Context, p2pHost host.Host, protocol protocol.
 						log.Println("ServiceError received but no public key provided")
 						return
 					}
-					
+
 					otherPeerIDStr := keylib.ConvertHederaPublicKeyToPeerID(buyerError.PublicKey)
 					otherPeerID, decodeErr := peer.Decode(otherPeerIDStr)
 					if decodeErr != nil {
 						log.Printf("Could not decode peer ID from public key: %v", decodeErr)
 						return
 					}
-					
+
 					// Register public key for log correlation
 					commonlib.RegisterPeerPublicKey(otherPeerID, buyerError.PublicKey)
-					
+
 					bufferInfo, exists := buyerBuffers.GetBuffer(otherPeerID)
 					if !exists {
 						log.Printf("Received ServiceError from unknown peer %s - they need to send a fresh service request", otherPeerID.ShortString())
 						return
 					}
-					
+
 					// Mark as needing reconnection and attempt it
 					log.Printf("🔄 Buyer %s reports no goods received - checking connection and attempting reconnect", otherPeerID.ShortString())
 					buyerBuffers.UpdateBufferLibP2PState(otherPeerID, commonlib.Reconnecting)
-					
+
 					reconnectErr := commonlib.ReconnectPeersIfNeeded(ctx, p2pHost, otherPeerID, bufferInfo, buyerBuffers, protocol)
 					if reconnectErr != nil {
 						log.Printf("Reconnect attempt for %s after ServiceError: %v", otherPeerID.ShortString(), reconnectErr)
 					} else {
 						log.Printf("✓ Reconnected to %s after ServiceError", otherPeerID.ShortString())
 					}
-					
+
 				case commonlib.DialError:
 				case commonlib.FlushError:
 				case commonlib.DisconnectedError:
@@ -344,4 +360,202 @@ func HandleSellerCase(ctx context.Context, p2pHost host.Host, protocol protocol.
 			}
 
 		})
+}
+
+// persistKnownBuyer records a buyer (its libp2p addresses, topic and shared
+// account) so the seller can keep serving it across reboots and Hedera outages
+// without waiting for a fresh topic serviceRequest. Best-effort; a closed cache
+// just means we fall back to the old in-memory-only behaviour.
+func persistKnownBuyer(req *commonlib.NeuronServiceRequestMsg, addrInfo *peer.AddrInfo) {
+	if req == nil || addrInfo == nil || req.EthPublicKey == "" {
+		return
+	}
+	maddrs := make([]string, 0, len(addrInfo.Addrs))
+	for _, a := range addrInfo.Addrs {
+		maddrs = append(maddrs, a.String())
+	}
+	rec := &commonlib.KnownBuyer{
+		BuyerEthAddress: req.EthPublicKey,
+		BuyerPublicKey:  req.PublicKey,
+		Multiaddrs:      maddrs,
+		BuyerStdInTopic: req.StdInTopic,
+		SharedAccID:     req.SharedAccID,
+		Serve:           true,
+		LastSignOfLife:  time.Now(),
+	}
+	// Carry forward the last observed balance (and CreatedAt) so the lease-renewal
+	// baseline survives a re-request.
+	if prev, err := commonlib.LoadKnownBuyer(req.EthPublicKey); err == nil {
+		rec.LastBalanceTiny = prev.LastBalanceTiny
+		rec.CreatedAt = prev.CreatedAt
+	}
+	if err := commonlib.SaveKnownBuyer(rec); err != nil && err != commonlib.ErrDatabaseNotOpen {
+		log.Printf("could not persist known buyer %s: %v", req.EthPublicKey, err)
+	}
+}
+
+// renewLeaseOnBalanceMovement renews a buyer's lease when its shared-account
+// balance has moved since we last looked — that movement is the buyer paying an
+// invoice or topping up, i.e. the real economic keepalive. Best-effort and
+// mirror-dependent: on any error (incl. a mirror/Hedera outage) we leave the
+// lease as-is and keep serving.
+func renewLeaseOnBalanceMovement(buyerEth string, sharedAccID uint64) {
+	if buyerEth == "" || sharedAccID == 0 {
+		return
+	}
+	known, err := commonlib.LoadKnownBuyer(buyerEth)
+	if err != nil {
+		return // not persisted yet; the connect path will persist it
+	}
+	acc := hedera.AccountID{Shard: 0, Realm: 0, Account: sharedAccID}
+	info, err := hedera_helper.GetAccountInfoFromMirror(acc)
+	if err != nil {
+		return // mirror unreachable: don't renew, keep serving
+	}
+	bal := int64(info.Balance)
+	if known.LastBalanceTiny == bal {
+		return // no movement, nothing to renew
+	}
+	known.LastBalanceTiny = bal
+	known.Serve = true
+	known.LastSignOfLife = time.Now()
+	if err := commonlib.SaveKnownBuyer(known); err != nil && err != commonlib.ErrDatabaseNotOpen {
+		log.Printf("lease renew: could not save buyer %s: %v", buyerEth, err)
+	}
+}
+
+// startSellerAutonomousReconnect launches the seller's Hedera-independent serve
+// loop. Every sweep it: (1) drops buyers whose 5-day lease has expired, and
+// (2) re-dials every still-leased buyer that isn't currently connected, using the
+// buyer's remembered libp2p address from the known-buyers cache — so a buyer
+// keeps getting data across stream breaks and Hedera/mirror outages without
+// having to send a fresh topic serviceRequest. Per-buyer exponential backoff
+// avoids hammering an unreachable buyer.
+func startSellerAutonomousReconnect(ctx context.Context, p2pHost host.Host, protocol protocol.ID, buyerBuffers *commonlib.NodeBuffers) {
+	const sweepInterval = 30 * time.Second
+	const baseBackoff = 30 * time.Second
+	const maxBackoff = 10 * time.Minute
+	nextAttempt := make(map[string]time.Time)
+	attempts := make(map[string]int)
+
+	go func() {
+		for {
+			// (1) GC buyers whose lease expired (5 days with no sign of life).
+			if expired, err := commonlib.GCExpiredKnownBuyers(); err == nil {
+				for _, kb := range expired {
+					if pid, derr := buyerPeerID(kb.BuyerPublicKey); derr == nil {
+						buyerBuffers.RemoveBuffer(pid)
+					}
+					delete(nextAttempt, kb.BuyerEthAddress)
+					delete(attempts, kb.BuyerEthAddress)
+					log.Printf("known buyer %s lease expired (5d silent) — no longer serving", kb.BuyerEthAddress)
+				}
+			}
+
+			// (2) Ensure every still-leased buyer has a live stream.
+			servable, err := commonlib.ListServableBuyers()
+			if err != nil {
+				time.Sleep(sweepInterval)
+				continue
+			}
+			now := time.Now()
+			for _, kb := range servable {
+				pid, derr := buyerPeerID(kb.BuyerPublicKey)
+				if derr != nil {
+					continue
+				}
+				if isBuyerConnected(p2pHost, pid, buyerBuffers) {
+					delete(attempts, kb.BuyerEthAddress) // healthy: reset backoff
+					delete(nextAttempt, kb.BuyerEthAddress)
+					continue
+				}
+				if t, ok := nextAttempt[kb.BuyerEthAddress]; ok && now.Before(t) {
+					continue // still backing off
+				}
+				if rerr := redialCachedBuyer(ctx, p2pHost, protocol, kb, pid, buyerBuffers); rerr != nil {
+					n := attempts[kb.BuyerEthAddress] + 1
+					attempts[kb.BuyerEthAddress] = n
+					shift := uint(n - 1)
+					if shift > 5 {
+						shift = 5
+					}
+					backoff := baseBackoff << shift
+					if backoff > maxBackoff {
+						backoff = maxBackoff
+					}
+					nextAttempt[kb.BuyerEthAddress] = now.Add(backoff)
+					log.Printf("autonomous re-dial of cached buyer %s failed (attempt %d, next in %s): %v", kb.BuyerEthAddress, n, backoff, rerr)
+				} else {
+					delete(attempts, kb.BuyerEthAddress)
+					delete(nextAttempt, kb.BuyerEthAddress)
+					log.Printf("autonomous re-dial of cached buyer %s succeeded", kb.BuyerEthAddress)
+				}
+			}
+			time.Sleep(sweepInterval)
+		}
+	}()
+}
+
+// buyerPeerID derives a buyer's libp2p peer ID from its hedera public key.
+func buyerPeerID(buyerPublicKey string) (peer.ID, error) {
+	if buyerPublicKey == "" {
+		return "", fmt.Errorf("empty buyer public key")
+	}
+	return peer.Decode(keylib.ConvertHederaPublicKeyToPeerID(buyerPublicKey))
+}
+
+// isBuyerConnected reports whether we currently hold a live stream to the buyer.
+func isBuyerConnected(p2pHost host.Host, pid peer.ID, buffers *commonlib.NodeBuffers) bool {
+	if p2pHost.Network().Connectedness(pid) != network.Connected {
+		return false
+	}
+	info, ok := buffers.GetBuffer(pid)
+	if !ok || info.Writer == nil {
+		return false
+	}
+	conn := info.Writer.Conn()
+	return conn != nil && !conn.IsClosed()
+}
+
+// redialCachedBuyer reconstructs the buyer's address and invoice envelope from
+// the known-buyers cache and (re-)establishes the ADS-B stream. Seeding the
+// envelope first (when the buffer has none — e.g. a fresh boot) means AddBuffer3
+// inside InitialConnect preserves it, so the invoice loop keeps billing a
+// re-dialed/boot-restored buyer.
+func redialCachedBuyer(ctx context.Context, p2pHost host.Host, protocol protocol.ID, kb commonlib.KnownBuyer, pid peer.ID, buffers *commonlib.NodeBuffers) error {
+	var maddrs []multiaddr.Multiaddr
+	for _, s := range kb.Multiaddrs {
+		if m, e := multiaddr.NewMultiaddr(s); e == nil {
+			maddrs = append(maddrs, m)
+		}
+	}
+	if len(maddrs) == 0 {
+		return fmt.Errorf("no usable cached addresses for buyer %s", kb.BuyerEthAddress)
+	}
+
+	// Seed the buffer with the reconstructed request envelope if it lacks one, so
+	// the invoice loop can bill this buyer after a cache-driven (re)connect.
+	if info, ok := buffers.GetBuffer(pid); !ok || info.RequestOrResponse.Message == nil {
+		req := &commonlib.NeuronServiceRequestMsg{
+			MessageType:  "serviceRequest",
+			ServiceType:  string(commonlib.MyProtocol),
+			SharedAccID:  kb.SharedAccID,
+			EthPublicKey: kb.BuyerEthAddress,
+			PublicKey:    kb.BuyerPublicKey,
+			StdInTopic:   kb.BuyerStdInTopic,
+			Version:      "0.4",
+		}
+		envelope := commonlib.TopicPostalEnvelope{
+			OtherStdInTopic: hedera.TopicID{Shard: 0, Realm: 0, Topic: kb.BuyerStdInTopic},
+			Message:         req,
+		}
+		buffers.AddBuffer2(pid, envelope, true, commonlib.SendOK, commonlib.Reconnecting)
+		buffers.SetPeerPublicKey(pid, kb.BuyerPublicKey)
+		buffers.SetPeerEvmAddress(pid, kb.BuyerEthAddress)
+	}
+
+	// Make sure libp2p knows the buyer's address before we dial.
+	p2pHost.Peerstore().AddAddrs(pid, maddrs, time.Hour)
+	addrInfo := peer.AddrInfo{ID: pid, Addrs: maddrs}
+	return commonlib.InitialConnect(ctx, p2pHost, addrInfo, buffers, protocol)
 }

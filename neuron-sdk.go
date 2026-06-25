@@ -363,6 +363,12 @@ func LaunchSDK(
 		commonlib.MyStdOut = stdOutTopic
 		commonlib.MyStdErr = stdErrTopic
 
+		// Persist our own topic numbers so a rebooting node can resume
+		// listening/heartbeating from cache without a contract read.
+		if err := commonlib.SaveSelfTopics(stdOutTopic.Topic, stdInTopic.Topic, stdErrTopic.Topic); err != nil && err != commonlib.ErrDatabaseNotOpen {
+			log.Printf("could not persist self topics: %v", err)
+		}
+
 		fmt.Println("Finished announcing to hedera. MyStdIn: ", commonlib.MyStdIn, " MyStdOut: ", commonlib.MyStdOut, " MyStdErr: ", commonlib.MyStdErr)
 
 		// BuyerVsSellerApp is the first style of agent communication pattern; when more modes are added, this will need to be refactored

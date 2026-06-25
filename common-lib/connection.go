@@ -520,14 +520,19 @@ func WriteAndFlushBuffer(
 				return RemoteClosed
 			}
 
-			// For actual connection errors (broken pipe, reset, etc.), reset the stream
+			// For actual connection errors (broken pipe, reset, etc.), reset the
+			// stream but KEEP the buffer (mark Reconnecting, like the graceful-close
+			// paths above) so the seller's autonomous reconnect loop can re-dial this
+			// buyer from its remembered address without a fresh topic request. The
+			// buffer (and its invoice envelope) is preserved for AddBuffer3 on re-dial;
+			// a buyer is only forgotten when its 5-day lease expires (known-buyers
+			// cache), never on a transient write failure.
 			atomic.AddUint64(&globalWritePressure.writeErrors, 1)
-			log.Printf("Write error to %s: %v - resetting stream", peerID, writeErr)
+			log.Printf("Write error to %s: %v - resetting stream, will reconnect", peerID, writeErr)
 			bufferInfo.Writer.Reset()
 			connectedBuffersOfBuyers.RecordDisconnectEvent(peerID)
-			connectedBuffersOfBuyers.UpdateBufferLibP2PState(peerID, ConnectionLost)
+			connectedBuffersOfBuyers.UpdateBufferLibP2PState(peerID, Reconnecting)
 			connectedBuffersOfBuyers.IncrementReconnectAttempts(peerID)
-			connectedBuffersOfBuyers.RemoveBuffer(peerID)
 			globalWriteStats.reset(peerID)
 			return fmt.Errorf("%s:error writing to stream: %w", ConnectionLostWriteError, writeErr)
 		}
