@@ -43,6 +43,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/core/protocol"
+	rcmgr "github.com/libp2p/go-libp2p/p2p/host/resource-manager"
 	libp2pconnmgr "github.com/libp2p/go-libp2p/p2p/net/connmgr"
 	quictransprt "github.com/libp2p/go-libp2p/p2p/transport/quic"
 	libp2ptcp "github.com/libp2p/go-libp2p/p2p/transport/tcp"
@@ -228,6 +229,18 @@ func LaunchSDK(
 		log.Panicf("failed to initialize connection manager: %v", cmErr)
 	}
 	options = append(options, libp2p.ConnectionManager(cm))
+
+	// Resource manager: without this, libp2p installs its DEFAULT rcmgr whose
+	// limits auto-scale to available RAM and, on a small (2 GB) high-fan-in buyer,
+	// silently REJECT inbound seller dial-backs at ~80 connections — a hard ceiling
+	// well below the ConnManager high-water (384) raised above, and invisible
+	// because rejections aren't teardowns. Use InfiniteLimits so the ConnManager is
+	// the sole connection limiter (its 320/384 window still bounds fan-in).
+	rm, rmErr := rcmgr.NewResourceManager(rcmgr.NewFixedLimiter(rcmgr.InfiniteLimits))
+	if rmErr != nil {
+		log.Panicf("failed to initialize resource manager: %v", rmErr)
+	}
+	options = append(options, libp2p.ResourceManager(rm))
 
 	// The node's operating mode (relay or peer) is determined by the value of the "--mode" flag.
 	//
