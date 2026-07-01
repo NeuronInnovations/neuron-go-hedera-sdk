@@ -669,7 +669,18 @@ func processSeller(
 			sellerBuffers.UpdateBufferLibP2PState(peerID, commonlib.Reconnecting)
 			sellerBuffers.IncrementReconnectAttempts(peerID)
 			sendErrCh := make(chan error, 1)
-			envelope := peerBuffer.RequestOrResponse
+			// Rebuild the request fresh instead of replaying the cached envelope.
+			// A seller that missed its very first request never recovers from a
+			// byte-identical resend (stale StdIn topic if it re-registered, stale
+			// addresses, or a request it already discarded). Rebuilding re-resolves
+			// the seller's current StdIn topic + our current p2p addresses + fresh
+			// signatures/shared-account — exactly what the manual/dashboard connect
+			// does — so a long-stuck seller can finally dial back on its own.
+			envelope, rebuildErr := prepareServiceRequestMsg(seller.PublicKey, p2pHost.Addrs())
+			if rebuildErr != nil {
+				log.Printf("retry rebuild service request failed for seller %s: %v", sellerEvnAddress, rebuildErr)
+				return
+			}
 			if submitErr := controlExec.Submit(controlplane.PriorityHigh, 120*time.Millisecond, func(taskCtx context.Context) {
 				err := hedera_helper.SendTransactionEnvelopeBestEffort(envelope)
 				select {
