@@ -221,8 +221,11 @@ func LaunchSDK(
 	// Raise conn-manager limits for high fan-in buyer runs.
 	// This reduces ConnGarbageCollected (0x1005) mass-prune waves under sustained load.
 	cm, cmErr := libp2pconnmgr.NewConnManager(
-		320, // low watermark
-		384, // high watermark
+		1536, // low watermark
+		2048, // high watermark — well above the whole-world seller pool (~1061
+		//       registered) so ConnMgr never trims live global fan-in on a big box.
+		//       Pair with the InfiniteLimits rcmgr below; on small boxes the old
+		//       320/384 is fine (fewer sellers in range).
 		libp2pconnmgr.WithGracePeriod(90*time.Second),
 	)
 	if cmErr != nil {
