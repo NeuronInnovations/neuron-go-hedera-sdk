@@ -274,7 +274,10 @@ func GetPeerIDFromEvmViaMirror(evmAddress string) (peerID string, err error) {
 	if accInfo.PublicKey == "" {
 		return "", errors.New("no public key in mirror account")
 	}
-	peerID = keylib.ConvertHederaPublicKeyToPeerID(accInfo.PublicKey)
+	peerID, err = keylib.PeerIDFromHederaPublicKey(accInfo.PublicKey)
+	if err != nil {
+		return "", fmt.Errorf("mirror account public key: %w", err)
+	}
 	return peerID, nil
 }
 func GetAllPeers() ([]string, error) {

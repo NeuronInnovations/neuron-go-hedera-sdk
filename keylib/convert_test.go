@@ -2,6 +2,8 @@ package keylib
 
 import (
 	"testing"
+
+	"github.com/hashgraph/hedera-sdk-go/v2"
 )
 
 func TestConvertHederaPublicKeyToPeerID(t *testing.T) {
@@ -49,5 +51,26 @@ func TestConverHederaPublicKeyToEthereunAddress(t *testing.T) {
 				t.Errorf("ConverHederaPublicKeyToEthereunAddress() = %v, want %v", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestPeerIDFromHederaPublicKey(t *testing.T) {
+	got, err := PeerIDFromHederaPublicKey("02759b048e7ccf6ba68f9658105a4a139b5f9f5dfd451857c600cc28f33a1a99ae")
+	if err != nil || got != "16Uiu2HAm3Lkn9NRieuh3UUTWMNthSDumQL9ctTBKxQqdCC79WUSq" {
+		t.Fatalf("secp256k1 key: got %q, %v", got, err)
+	}
+
+	ed, err := hedera.PrivateKeyGenerateEd25519()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, key := range map[string]string{
+		"ed25519": ed.PublicKey().StringRaw(),
+		"garbage": "not-a-key",
+		"empty":   "",
+	} {
+		if pid, err := PeerIDFromHederaPublicKey(key); err == nil {
+			t.Errorf("%s: expected an error, got peer ID %q", name, pid)
+		}
 	}
 }

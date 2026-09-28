@@ -542,8 +542,16 @@ func processSeller(
 	controlExec *controlplane.Executor,
 	onGiveUpReconnect func(evm string),
 ) {
-	sellerEvnAddress := keylib.ConverHederaPublicKeyToEthereunAddress(seller.PublicKey)
-	peerIDStr := keylib.ConvertHederaPublicKeyToPeerID(seller.PublicKey)
+	sellerEvnAddress, evmErr := keylib.EthereumAddressFromPublicKeyHex(seller.PublicKey)
+	if evmErr != nil {
+		log.Printf("skipping seller with unusable public key %q: %v", seller.PublicKey, evmErr)
+		return
+	}
+	peerIDStr, pidErr := keylib.PeerIDFromHederaPublicKey(seller.PublicKey)
+	if pidErr != nil {
+		log.Printf("skipping seller %s: cannot derive peer ID: %v", sellerEvnAddress, pidErr)
+		return
+	}
 	peerID, _ := peer.Decode(peerIDStr)
 
 	peerBuffer, peerHasBuffer := sellerBuffers.GetBuffer(peerID)

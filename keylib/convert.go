@@ -13,24 +13,35 @@ import (
 )
 
 func ConvertHederaPublicKeyToPeerID(hederaPublicKey string) string {
-	hpub, err := hedera.PublicKeyFromString(hederaPublicKey)
-
+	peerID, err := PeerIDFromHederaPublicKey(hederaPublicKey)
 	if err != nil {
 		log.Fatal(err)
+	}
+	return peerID
+}
+
+// PeerIDFromHederaPublicKey is the non-fatal form of
+// ConvertHederaPublicKeyToPeerID, for keys that come from outside our own
+// config (the smart contract, the mirror node, topic messages, the seller
+// list). It returns an error instead of exiting when the key cannot be parsed
+// or is not a secp256k1 key, so one bad registration can't take the node down.
+func PeerIDFromHederaPublicKey(hederaPublicKey string) (string, error) {
+	hpub, err := hedera.PublicKeyFromString(hederaPublicKey)
+	if err != nil {
+		return "", err
 	}
 
 	libp2pPubKey, err := libp2pcrypto.UnmarshalSecp256k1PublicKey(hpub.BytesRaw())
 	if err != nil {
-		panic(err)
+		return "", err
 	}
 
 	peerID, err := peer.IDFromPublicKey(libp2pPubKey)
 	if err != nil {
-		panic(err)
+		return "", err
 	}
 
-	return peerID.String()
-
+	return peerID.String(), nil
 }
 
 func ConverHederaPublicKeyToEthereunAddress(hederaPublicKey string) string {

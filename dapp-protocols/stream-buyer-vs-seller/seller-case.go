@@ -217,7 +217,11 @@ func HandleSellerCase(ctx context.Context, p2pHost host.Host, protocol protocol.
 				}
 
 				otherPublicKey := requestMsgFromOtherSide.PublicKey
-				otherPeerID := keylib.ConvertHederaPublicKeyToPeerID(otherPublicKey)
+				otherPeerID, pidErr := keylib.PeerIDFromHederaPublicKey(otherPublicKey)
+				if pidErr != nil {
+					log.Println("NACK: cannot derive peer ID from request public key", pidErr)
+					return
+				}
 				decryptedIpAddress, decodeErr := keylib.DecryptFromOtherside(requestMsgFromOtherSide.EncryptedIpAddress, os.Getenv("private_key"), otherPublicKey)
 				if decodeErr != nil {
 					log.Println("NACK: error decrypting address", decodeErr) // TODO: send to the other side
@@ -310,7 +314,11 @@ func HandleSellerCase(ctx context.Context, p2pHost host.Host, protocol protocol.
 						return
 					}
 
-					otherPeerIDStr := keylib.ConvertHederaPublicKeyToPeerID(buyerError.PublicKey)
+					otherPeerIDStr, pidErr := keylib.PeerIDFromHederaPublicKey(buyerError.PublicKey)
+					if pidErr != nil {
+						log.Printf("ServiceError: cannot derive peer ID from public key: %v", pidErr)
+						return
+					}
 					otherPeerID, decodeErr := peer.Decode(otherPeerIDStr)
 					if decodeErr != nil {
 						log.Printf("Could not decode peer ID from public key: %v", decodeErr)
@@ -519,7 +527,11 @@ func buyerPeerID(buyerPublicKey string) (peer.ID, error) {
 	if buyerPublicKey == "" {
 		return "", fmt.Errorf("empty buyer public key")
 	}
-	return peer.Decode(keylib.ConvertHederaPublicKeyToPeerID(buyerPublicKey))
+	pid, err := keylib.PeerIDFromHederaPublicKey(buyerPublicKey)
+	if err != nil {
+		return "", err
+	}
+	return peer.Decode(pid)
 }
 
 // isBuyerConnected reports whether we currently hold a live stream to the buyer.
