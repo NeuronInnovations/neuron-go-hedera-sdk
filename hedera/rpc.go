@@ -2,13 +2,16 @@ package hedera_helper
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"fmt"
 	"log"
 	"math/big"
 	"os"
+	"strings"
+	"sync"
 	"time"
 
-	commonlib "github.com/NeuronInnovations/neuron-go-hedera-sdk/common-lib"
 	"github.com/NeuronInnovations/neuron-go-hedera-sdk/keylib"
 
 	"github.com/ethereum/go-ethereum/accounts/abi/bind"
@@ -34,7 +37,11 @@ func EnsureTopicsAndNotifyContract(p2pHost host.Host) (hedera.TopicID, hedera.To
 
 	peerInfo, err := GetPeerInfo(toEthAddress)
 	if err != nil {
-		log.Panic("We must be able to  correctly talk to the smart contract to continue;\n perhaps you are pointing to the wrong contract \n or your address doesn't exist, err:", err)
+		// Transient mirror/Hedera outage (DNS, HTTP 5xx, rate-limit, etc.). Do NOT
+		// crash: return the error so the startup caller keeps retrying until the
+		// service recovers. (A wrong-contract / missing-address config error also
+		// lands here, but retrying is harmless and far better than a crash loop.)
+		return hedera.TopicID{}, hedera.TopicID{}, hedera.TopicID{}, fmt.Errorf("could not read our topics from the smart contract via the mirror (will retry): %w", err)
 	} else {
 		// check if peerInfo has data
 		if peerInfo.StdInTopic != 0 && peerInfo.StdOutTopic != 0 {
@@ -49,7 +56,6 @@ func EnsureTopicsAndNotifyContract(p2pHost host.Host) (hedera.TopicID, hedera.To
 				freshTopicNum := func(topicName string) (hedera.TopicID, error) {
 					var emptyTopicID hedera.TopicID
 					c := GetHederaClientUsingEnv()
-					defer c.Close()
 					transactionResponse, err := hedera.NewTopicCreateTransaction().
 						SetTransactionMemo(topicName).
 						SetAdminKey(c.GetOperatorPublicKey()).
@@ -92,11 +98,6 @@ func EnsureTopicsAndNotifyContract(p2pHost host.Host) (hedera.TopicID, hedera.To
 				fmt.Println("newContractID: ", newContractID.EvmAddress)
 
 				c := GetHederaClientUsingEnv()
-				defer c.Close()
-				peerIDStr, err := keylib.ConvertHederaPublicKeyToPeerID(string(hostPubKeyStr))
-				if err != nil {
-					log.Panic("Error converting host public key to peer ID: ", err)
-				}
 				callResult, err := hedera.NewContractExecuteTransaction().
 					SetContractID(newContractID).
 					SetTransactionMemo("broadcast liveness topic for self").
@@ -105,7 +106,7 @@ func EnsureTopicsAndNotifyContract(p2pHost host.Host) (hedera.TopicID, hedera.To
 						AddUint64(stdOutTopicID.Topic).
 						AddUint64(stdInTopicID.Topic).
 						AddUint64(stdErrTopicID.Topic).
-						AddString(peerIDStr)).
+						AddString(keylib.ConvertHederaPublicKeyToPeerID(string(hostPubKeyStr)))).
 					Execute(c)
 				if err != nil {
 					log.Panic(err, ": error calling the smart contract function")
@@ -113,31 +114,21 @@ func EnsureTopicsAndNotifyContract(p2pHost host.Host) (hedera.TopicID, hedera.To
 				fmt.Printf("contract call result: %v\n", callResult)
 				return stdOutTopicID, stdInTopicID, stdErrTopicID, nil
 			} else {
-				log.Panic("We could not find your topics in the smart contract")
+				// We reached the contract fine but it has no topics registered for
+				// us yet. Retryable, not fatal: registration may land later, and a
+				// panic here just becomes a systemd crash loop.
+				return hedera.TopicID{}, hedera.TopicID{}, hedera.TopicID{}, fmt.Errorf("our topics are not registered in the smart contract yet (will retry)")
 			}
 		}
 	}
-
-	return hedera.TopicID{}, hedera.TopicID{}, hedera.TopicID{}, err
 }
 
 func GetPeerArraySize() (*big.Int, error) {
-	contractCaller := GetHRpcClient()
-
-	// Get the smart contract address for error reporting
-	var scAddress string
-	if commonlib.SmartContractAddressFlag != nil && *commonlib.SmartContractAddressFlag != "" {
-		scAddress = *commonlib.SmartContractAddressFlag
-	} else {
-		scAddress = os.Getenv("smart_contract_address")
-	}
+	contractCaller := getContractCaller()
 
 	size, error := contractCaller.GetPeerArraySize(
 		&bind.CallOpts{},
 	)
-	if error != nil {
-		return nil, fmt.Errorf("failed to get peer array size [contract: %s]: %v", scAddress, error)
-	}
 	return size, error
 }
 
@@ -149,52 +140,145 @@ type PeerInfo struct {
 	StdErrTopic uint64
 }
 
+type cachedPeerInfo struct {
+	info      PeerInfo
+	expiresAt time.Time
+}
+
+type peerInfoResult struct {
+	info PeerInfo
+	err  error
+}
+
+var (
+	peerInfoMu       sync.Mutex
+	peerInfoCache    = make(map[string]cachedPeerInfo)
+	peerInfoInFlight = make(map[string][]chan peerInfoResult)
+)
+
 // TODO: retry on failure. This one likes to return 502 bad gateway and eth rate limit exceeded.
 // however, currently we stop the world on failure but should keep retrying.
 func GetPeerInfo(hederaAccEvmAddress string) (PeerInfo, error) {
-	log.Println("getting contract info for ", hederaAccEvmAddress)
+	key := normalizeEvmAddress(hederaAccEvmAddress)
+	now := time.Now()
+
+	peerInfoMu.Lock()
+	if cached, ok := peerInfoCache[key]; ok && now.Before(cached.expiresAt) {
+		info := cached.info
+		peerInfoMu.Unlock()
+		return info, nil
+	}
+	if waiters, ok := peerInfoInFlight[key]; ok {
+		ch := make(chan peerInfoResult, 1)
+		peerInfoInFlight[key] = append(waiters, ch)
+		peerInfoMu.Unlock()
+		res := <-ch
+		return res.info, res.err
+	}
+	peerInfoInFlight[key] = nil
+	peerInfoMu.Unlock()
+
+	log.Println("getting contract info for ", key)
+	info, err := fetchPeerInfoWithRetry(key)
+
+	peerInfoMu.Lock()
+	if err == nil {
+		peerInfoCache[key] = cachedPeerInfo{
+			info:      info,
+			expiresAt: time.Now().Add(30 * time.Second),
+		}
+	}
+	waiters := peerInfoInFlight[key]
+	delete(peerInfoInFlight, key)
+	peerInfoMu.Unlock()
+
+	result := peerInfoResult{info: info, err: err}
+	for _, ch := range waiters {
+		ch <- result
+		close(ch)
+	}
+	return info, err
+}
+
+func fetchPeerInfoWithRetry(hederaAccEvmAddress string) (PeerInfo, error) {
 	var peerInfo PeerInfo
 	var err error
-	maxRetries := 25
-	baseDelay := time.Second
-
-	// Get the smart contract address for error reporting
-	var scAddress string
-	if commonlib.SmartContractAddressFlag != nil && *commonlib.SmartContractAddressFlag != "" {
-		scAddress = *commonlib.SmartContractAddressFlag
-	} else {
-		scAddress = os.Getenv("smart_contract_address")
-	}
+	// Keep this bounded and responsive: this path is called by UI/API-triggered
+	// connect/reconnect flows. Excessive exponential retries can stall the buyer.
+	maxRetries := 3
+	baseDelay := 200 * time.Millisecond
+	maxDelay := 1 * time.Second
+	perAttemptTimeout := 2 * time.Second
 
 	for i := 0; i < maxRetries; i++ {
-		contractCaller := GetHRpcClient()
-		peerInfo, err = contractCaller.HederaAddressToPeer(
-			&bind.CallOpts{},
+		contractCaller := getContractCaller()
+		ctx, cancel := context.WithTimeout(context.Background(), perAttemptTimeout)
+		info, callErr := contractCaller.HederaAddressToPeer(
+			&bind.CallOpts{Context: ctx},
 			common.HexToAddress(hederaAccEvmAddress),
 		)
-		if err == nil {
-			// Check if returned peerInfo is empty/default struct
-			if peerInfo == (PeerInfo{}) {
-				return peerInfo, fmt.Errorf("peer not found in the hedera contract for address; peer must be a registered neuron node: %s (contract: %s)", hederaAccEvmAddress, scAddress)
+		cancel()
+		if callErr == nil {
+			peerInfo = PeerInfo{
+				Available:   info.Available,
+				PeerID:      info.PeerID,
+				StdOutTopic: info.StdOutTopic,
+				StdInTopic:  info.StdInTopic,
+				StdErrTopic: info.StdErrTopic,
 			}
 			return peerInfo, nil
 		}
-		fmt.Printf("Error getting rpc peer info, retrying: %d th time [contract: %s] - %v\n", i, scAddress, err)
-		time.Sleep(baseDelay * (1 << i)) // Exponential backoff
+		err = callErr
+		fmt.Println("Error getting rpc peer info, retrying:", i, "th time", err)
+		delay := baseDelay * time.Duration(1<<i) // Exponential backoff
+		if delay > maxDelay {
+			delay = maxDelay
+		}
+		time.Sleep(delay)
 	}
+	return peerInfo, err
+}
 
-	return peerInfo, fmt.Errorf("max retries exceeded getting peer info [contract: %s]: %v", scAddress, err)
+func normalizeEvmAddress(evm string) string {
+	s := strings.TrimSpace(strings.ToLower(evm))
+	s = strings.TrimPrefix(s, "0x")
+	if s == "" {
+		return ""
+	}
+	return "0x" + s
+}
+
+// GetPeerIDFromEvmViaMirror derives the libp2p peer ID for an EVM address by
+// looking up the Hedera account via the mirror and converting its public key
+// to a peer ID (same key the libp2p host uses for that identity).
+// Use when the contract returns a nickname or invalid peer ID.
+func GetPeerIDFromEvmViaMirror(evmAddress string) (peerID string, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("derive peer ID from public key: %v", r)
+			peerID = ""
+		}
+	}()
+	key := normalizeEvmAddress(evmAddress)
+	if key == "" {
+		return "", fmt.Errorf("invalid evm address")
+	}
+	accountID, err := hedera.AccountIDFromEvmAddress(0, 0, key)
+	if err != nil {
+		return "", fmt.Errorf("account from evm: %w", err)
+	}
+	accInfo, err := GetAccountInfoFromMirror(accountID)
+	if err != nil {
+		return "", fmt.Errorf("mirror account info: %w", err)
+	}
+	if accInfo.PublicKey == "" {
+		return "", errors.New("no public key in mirror account")
+	}
+	peerID = keylib.ConvertHederaPublicKeyToPeerID(accInfo.PublicKey)
+	return peerID, nil
 }
 func GetAllPeers() ([]string, error) {
-	contractCaller := GetHRpcClient()
-
-	// Get the smart contract address for error reporting
-	var scAddress string
-	if commonlib.SmartContractAddressFlag != nil && *commonlib.SmartContractAddressFlag != "" {
-		scAddress = *commonlib.SmartContractAddressFlag
-	} else {
-		scAddress = os.Getenv("smart_contract_address")
-	}
+	contractCaller := getContractCaller()
 
 	peerArraySize, error := GetPeerArraySize()
 	if error != nil {
@@ -207,7 +291,7 @@ func GetAllPeers() ([]string, error) {
 
 		perrInfo, err2 := GetPeerInfo(address.String())
 		if err1 != nil || err2 != nil {
-			return nil, fmt.Errorf("failed to get peer list at index %d [contract: %s]: %v", i, scAddress, err1)
+			return nil, err1
 		}
 		// check if the address bytes start with 0x0000000, that is a lot of zeros
 		// then it's not an address that has been derived by a private key
@@ -220,42 +304,4 @@ func GetAllPeers() ([]string, error) {
 		}
 	}
 	return peerList, nil
-}
-
-func createDummySLA() string {
-
-	client := GetHederaClientUsingEnv()
-	// Create a new file
-	createTx, err := hedera.NewFileCreateTransaction().
-		SetContents([]byte("This is the SLA that binds you to x y z")).
-		Execute(client)
-
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	createReceipt, err := createTx.GetReceipt(client)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	fileId := createReceipt.FileID
-	fmt.Printf("File ID: %v\n", fileId)
-
-	appendTx, err := hedera.NewFileAppendTransaction().
-		SetFileID(*fileId).
-		SetContents([]byte(" Appending more text!")).
-		Execute(client)
-
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	appendReceipt, err := appendTx.GetReceipt(client)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	fmt.Printf("Append Receipt: %v\n", appendReceipt.Status)
-	return fileId.String()
 }

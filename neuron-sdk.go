@@ -6,9 +6,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"sync"
 
 	neuronbuffers "github.com/NeuronInnovations/neuron-go-hedera-sdk/common-lib"
-	"github.com/NeuronInnovations/neuron-go-hedera-sdk/types"
 
 	flags "github.com/NeuronInnovations/neuron-go-hedera-sdk/common-lib"
 
@@ -26,9 +26,11 @@ import (
 	"github.com/hashgraph/hedera-sdk-go/v2"
 	"github.com/libp2p/go-libp2p"
 
+	"net"
 	"os"
 	"os/signal"
 	"sort"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -41,7 +43,10 @@ import (
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/core/protocol"
+	rcmgr "github.com/libp2p/go-libp2p/p2p/host/resource-manager"
+	libp2pconnmgr "github.com/libp2p/go-libp2p/p2p/net/connmgr"
 	quictransprt "github.com/libp2p/go-libp2p/p2p/transport/quic"
+	libp2ptcp "github.com/libp2p/go-libp2p/p2p/transport/tcp"
 	"github.com/multiformats/go-multiaddr"
 	manet "github.com/multiformats/go-multiaddr/net"
 )
@@ -49,9 +54,22 @@ import (
 var fixPrivKey_g crypto.PrivKey
 
 var Version string
+var (
+	buyerSellerProviderMu sync.RWMutex
+	buyerSellerProvider   func() []string
+)
 
-// Seller represents a seller node with public key and location information
-type Seller = streambuyervsseller.Seller
+func SetBuyerSellerProvider(provider func() []string) {
+	buyerSellerProviderMu.Lock()
+	defer buyerSellerProviderMu.Unlock()
+	buyerSellerProvider = provider
+}
+
+func getBuyerSellerProvider() func() []string {
+	buyerSellerProviderMu.RLock()
+	defer buyerSellerProviderMu.RUnlock()
+	return buyerSellerProvider
+}
 
 func init() {
 
@@ -59,34 +77,50 @@ func init() {
 
 	commonlib.InitEnv()
 
-	// check if the smart contract address is available (flag or environment variable)
-	var scAddress string
-	if commonlib.SmartContractAddressFlag != nil && *commonlib.SmartContractAddressFlag != "" {
-		scAddress = *commonlib.SmartContractAddressFlag
-	} else {
-		scAddress = os.Getenv("smart_contract_address")
+	myFigure := figure.NewFigure("NEURON NODE ", "doom", true)
+	myFigure.Print()
+
+	// check if the smart contract was loaded in the environment.
+	if os.Getenv("smart_contract_address") == "" {
+		log.Fatalf("smart_contract_address is not set in the %s file", commonlib.MyEnvFile)
+	}
+	// Sellers are never dialed (the buyer is the public listener), so pinning the
+	// seller to a fixed UDP port is pure liability: go-libp2p's QUIC transport
+	// reuses the listen socket as the SOURCE port for outbound dials, so if the
+	// router/NAT wedges the conntrack mapping for that port (or libp2p's black-hole
+	// detector latches after repeated failures) every dial fails — and a restart on
+	// the SAME port can't escape it (a full device reboot was observed not to
+	// recover). Use a fresh random free port each start so a restart always gets a
+	// clean mapping + reset detector. The buyer keeps its fixed --port (it must be
+	// dialable at a well-known address). See StartSellerDialWatchdog for the
+	// self-heal that turns a wedge into a restart.
+	if flags.BuyerOrSellerFlag != nil && *flags.BuyerOrSellerFlag == "seller" {
+		if p, err := pickFreeUDPPort(); err == nil {
+			log.Printf("seller mode: using random libp2p UDP port %d (ignoring --port=%s to escape wedged NAT mappings)", p, *flags.PortFlag)
+			*flags.PortFlag = strconv.Itoa(p)
+		} else {
+			log.Printf("seller mode: could not allocate a random UDP port (%v); keeping --port=%s", err, *flags.PortFlag)
+		}
 	}
 
-	if scAddress == "" {
-		log.Printf("smart_contract_address is not set. Please provide it via --smart-contract-address flag or set it in the %s file", commonlib.MyEnvFile)
-		os.Exit(1)
-	}
-
-	// Validate smart contract address format
-	if !keylib.IsValidEthereumAddress(scAddress) {
-		log.Printf("invalid smart_contract_address format: %s. Must be a valid Ethereum address (0x + 40 hex characters)", scAddress)
-		os.Exit(1)
-	}
 	// check the reachability of the node.
 	if (flags.PortFlag == nil) || (*flags.PortFlag == "" || *flags.PortFlag == "0") {
-		log.Printf("port is not set")
-		os.Exit(1)
+		log.Fatal("port is not set")
 	}
 
-	// Only get NAT info if we're not using local addresses
-	if !*flags.UseLocalAddressFlag {
-		whoami.GetNatInfoAndUpdateGlobals(flags.PortFlag)
+	whoami.GetNatInfoAndUpdateGlobals(flags.PortFlag)
+}
+
+// pickFreeUDPPort asks the OS for a currently-free UDP port (bind :0, read the
+// assigned port, release it). There is a tiny TOCTOU window before libp2p rebinds
+// it, but collisions are vanishingly unlikely and a restart simply picks another.
+func pickFreeUDPPort() (int, error) {
+	c, err := net.ListenPacket("udp4", "0.0.0.0:0")
+	if err != nil {
+		return 0, err
 	}
+	defer c.Close()
+	return c.LocalAddr().(*net.UDPAddr).Port, nil
 }
 
 // LaunchSDK serves as the entry point to the Neuron SDK, initializing core components,
@@ -119,17 +153,16 @@ func init() {
 // eventually be required to handle application-specific validation and logic at the dApp level.
 func LaunchSDK(
 	version string,
-	protocol protocol.ID, // eg. "/adsb/v1", or "/radiation/v1"
+	protocol protocol.ID,
 	keyAndLocationConfigurator func(envIsReady chan bool, envFile string) error,
 	buyerCase func(ctx context.Context, p2pHost host.Host, buffers *neuronbuffers.NodeBuffers),
 	buyerCaseTopicListener func(topicMessage hedera.TopicMessage),
 	sellerCase func(ctx context.Context, p2pHost host.Host, buffers *neuronbuffers.NodeBuffers),
 	sellerCaseTopicListener func(topicMessage hedera.TopicMessage),
 	// validatorCase func(ctx context.Context, p2pHost host.Host, buffers *neuronbuffers.NodeBuffers),
+	onGiveUpReconnect ...func(evm string),
 ) {
 	ctx := context.Background()
-
-	whoami.GetNatInfoAndUpdateGlobals(flags.PortFlag)
 	Version = version
 	commonlib.MyProtocol = protocol
 
@@ -157,37 +190,60 @@ func LaunchSDK(
 	var p2pHost host.Host
 
 	options := []libp2p.Option{
+		// QUIC (UDP) is the primary transport; TCP is added as a fallback so a peer
+		// whose UDP path is blocked/asymmetric (e.g. a seller behind a filtering
+		// router) can still reach the buyer. Both run at once; libp2p's dial ranker
+		// prefers QUIC and only falls back to TCP. TCP uses libp2p's default
+		// security (TLS/Noise) + muxer (yamux) — applied automatically since we
+		// don't override them. Adding TCP does not change the QUIC path.
 		libp2p.Transport(quictransprt.NewTransport),
+		libp2p.Transport(libp2ptcp.NewTCPTransport),
 
 		//libp2p.Security(noise.ID, noise.New),
 		libp2p.AddrsFactory(func(m []multiaddr.Multiaddr) []multiaddr.Multiaddr {
-			var filtered []multiaddr.Multiaddr
-
-			if *flags.UseLocalAddressFlag {
-				// When using local addresses, filter for local addresses only
-				filtered = multiaddr.FilterAddrs(m, func(addr multiaddr.Multiaddr) bool {
-					return !manet.IsPublicAddr(addr)
-				})
-
-				// Add localhost address if we have port flag
-				if flags.PortFlag != nil && *flags.PortFlag != "" { // we know the port flag is set and defaults to 0, is the check needed?
-					localAddr, _ := multiaddr.NewMultiaddr(fmt.Sprintf("/ip4/127.0.0.1/udp/%s/quic-v1", *flags.PortFlag))
-					filtered = append(filtered, localAddr)
-				}
+			// advertise only public addresses for now.  TODO: reintroduce local addresses
+			filtered := multiaddr.FilterAddrs(m, manet.IsPublicAddr)
+			// Advertise BOTH the QUIC (udp) and TCP variants so dialers know they can
+			// fall back to TCP. The seller sends its whole reachable-address list, so
+			// adding the TCP addr here makes it available to dialers.
+			if flags.MyPublicIpFlag != nil && *flags.MyPublicIpFlag != "" && flags.MyPublicPortFlag != nil && *flags.MyPublicPortFlag != "" {
+				externalAddrUDP, _ := multiaddr.NewMultiaddr(fmt.Sprintf("/ip4/%s/udp/%s/quic-v1", *flags.MyPublicIpFlag, *flags.MyPublicPortFlag))
+				externalAddrTCP, _ := multiaddr.NewMultiaddr(fmt.Sprintf("/ip4/%s/tcp/%s", *flags.MyPublicIpFlag, *flags.MyPublicPortFlag))
+				filtered = append(filtered, externalAddrUDP, externalAddrTCP)
 			} else {
-				// Default behavior: use public addresses
-				filtered = multiaddr.FilterAddrs(m, manet.IsPublicAddr)
-				if flags.MyPublicIpFlag != nil && *flags.MyPublicIpFlag != "" && flags.MyPublicPortFlag != nil && *flags.MyPublicPortFlag != "" {
-					externalAddrUDP, _ := multiaddr.NewMultiaddr(fmt.Sprintf("/ip4/%s/udp/%s/quic-v1", *flags.MyPublicIpFlag, *flags.MyPublicPortFlag))
-					filtered = append(filtered, externalAddrUDP)
-				} else {
-					discoveredAddrUDP, _ := multiaddr.NewMultiaddr(fmt.Sprintf("/ip4/%s/udp/%d/quic-v1", whoami.NatIPAddress, whoami.NatPort))
-					filtered = append(filtered, discoveredAddrUDP)
-				}
+				discoveredAddrUDP, _ := multiaddr.NewMultiaddr(fmt.Sprintf("/ip4/%s/udp/%d/quic-v1", whoami.NatIPAddress, whoami.NatPort))
+				discoveredAddrTCP, _ := multiaddr.NewMultiaddr(fmt.Sprintf("/ip4/%s/tcp/%d", whoami.NatIPAddress, whoami.NatPort))
+				filtered = append(filtered, discoveredAddrUDP, discoveredAddrTCP)
 			}
 			return filtered
 		}),
 	}
+	// Raise conn-manager limits for high fan-in buyer runs.
+	// This reduces ConnGarbageCollected (0x1005) mass-prune waves under sustained load.
+	cm, cmErr := libp2pconnmgr.NewConnManager(
+		1536, // low watermark
+		2048, // high watermark — well above the whole-world seller pool (~1061
+		//       registered) so ConnMgr never trims live global fan-in on a big box.
+		//       Pair with the InfiniteLimits rcmgr below; on small boxes the old
+		//       320/384 is fine (fewer sellers in range).
+		libp2pconnmgr.WithGracePeriod(90*time.Second),
+	)
+	if cmErr != nil {
+		log.Panicf("failed to initialize connection manager: %v", cmErr)
+	}
+	options = append(options, libp2p.ConnectionManager(cm))
+
+	// Resource manager: without this, libp2p installs its DEFAULT rcmgr whose
+	// limits auto-scale to available RAM and, on a small (2 GB) high-fan-in buyer,
+	// silently REJECT inbound seller dial-backs at ~80 connections — a hard ceiling
+	// well below the ConnManager high-water (384) raised above, and invisible
+	// because rejections aren't teardowns. Use InfiniteLimits so the ConnManager is
+	// the sole connection limiter (its 320/384 window still bounds fan-in).
+	rm, rmErr := rcmgr.NewResourceManager(rcmgr.NewFixedLimiter(rcmgr.InfiniteLimits))
+	if rmErr != nil {
+		log.Panicf("failed to initialize resource manager: %v", rmErr)
+	}
+	options = append(options, libp2p.ResourceManager(rm))
 
 	// The node's operating mode (relay or peer) is determined by the value of the "--mode" flag.
 	//
@@ -204,10 +260,6 @@ func LaunchSDK(
 	// The selected mode depends on the value of the flag, and the appropriate configuration
 	// and behavior for relay or peer mode is applied accordingly.
 	// The following sections explain the buyer and seller cases in detail.
-
-	myFigure := figure.NewFigure("NEURON  ", "doom", true)
-	myFigure.Print()
-
 	switch *flags.PeerOrRelayFlag {
 	case "relay": // ================================== RELAY MODE
 		// A relay node is intended to assist peers that are behind strict NATs (Network Address Translators)
@@ -272,8 +324,13 @@ func LaunchSDK(
 		fmt.Println("...starting in peer mode")
 		options = append(options,
 			libp2p.Identity(fixPrivKey_g),
-			libp2p.ListenAddrStrings(fmt.Sprintf("/ip4/0.0.0.0/udp/%s/quic-v1/", *flags.PortFlag)),
+			libp2p.ListenAddrStrings(
+				fmt.Sprintf("/ip4/0.0.0.0/udp/%s/quic-v1", *flags.PortFlag),
+				fmt.Sprintf("/ip4/0.0.0.0/tcp/%s", *flags.PortFlag),
+			),
 			libp2p.EnableHolePunching(),
+			// Only Neuron (secp256k1) identities may connect; see common-lib/peer_gater.go.
+			libp2p.ConnectionGater(commonlib.Secp256k1OnlyGater{}),
 		)
 		p2pHost = createHost(options)
 		defer p2pHost.Close()
@@ -285,40 +342,59 @@ func LaunchSDK(
 				getOne := <-evbus.Out()
 				switch e := getOne.(type) {
 				case event.EvtLocalReachabilityChanged:
-					log.Println("🚌 local reachability changed", e.Reachability.String())
+					log.Println("local reachability changed", e.Reachability.String())
 				case event.EvtNATDeviceTypeChanged:
-					log.Println("🚌 nat device type changed", e.TransportProtocol.String(), e.NatDeviceType.String())
+					log.Println("nat device type changed", e.TransportProtocol.String(), e.NatDeviceType.String())
 				case event.EvtPeerConnectednessChanged:
-					log.Println("🚌 peer connectedness changed", e.Peer, e.Connectedness.String())
+					log.Println("peer connectednes", e.Connectedness.String())
 				case event.EvtPeerIdentificationCompleted:
-					log.Println("🚌 peer identification completed", e.Peer, e.Protocols, e.ObservedAddr, e.ListenAddrs)
-				case event.EvtLocalAddressesUpdated:
-					log.Println("🚌 local addresses updated", e.Removed, e.Current)
-				case event.EvtLocalProtocolsUpdated:
-					log.Println("🚌 local protocols updated", e.Removed, e.Added)
-				case event.EvtPeerProtocolsUpdated:
-					log.Println("🚌 peer protocols updated", e.Peer, e.Removed, e.Added)
-				case event.EvtPeerIdentificationFailed:
-					log.Println("🚌 peer identification failed", e.Peer, e.Reason)
+					evmStr := ""
+					if pk := p2pHost.Peerstore().PubKey(e.Peer); pk != nil {
+						if raw, err := pk.Raw(); err == nil && len(raw) > 0 {
+							evmStr, _ = keylib.EthereumAddressFromPublicKeyHex(hex.EncodeToString(raw))
+							if evmStr != "" {
+								evmStr = " (evm 0x" + evmStr + ")"
+							}
+						}
+					}
+					if evmStr == "" {
+						evmStr = " (evm unknown)"
+					}
+					log.Println("peer identification completed", e.Peer, evmStr)
+
 				default:
-					log.Println("🚌 unknown event", e)
+					log.Println("unknown event", e)
 				}
 			}
 		}()
 
 		stdOutTopic, stdInTopic, stdErrTopic, err := hederaAnnounceAndHeartBeat(ctx, p2pHost)
 		if err != nil {
-			log.Panic(err)
+			// Topic resolution now retries through mirror/Hedera outages instead of
+			// crashing, so the only way we reach here is a cancelled context
+			// (shutdown). Don't panic — just stop bringing this node up.
+			log.Printf("hedera announce aborted (shutting down): %v", err)
+			return
 		}
 
 		commonlib.MyStdIn = stdInTopic
 		commonlib.MyStdOut = stdOutTopic
 		commonlib.MyStdErr = stdErrTopic
 
+		// Persist our own topic numbers so a rebooting node can resume
+		// listening/heartbeating from cache without a contract read.
+		if err := commonlib.SaveSelfTopics(stdOutTopic.Topic, stdInTopic.Topic, stdErrTopic.Topic); err != nil && err != commonlib.ErrDatabaseNotOpen {
+			log.Printf("could not persist self topics: %v", err)
+		}
+
 		fmt.Println("Finished announcing to hedera. MyStdIn: ", commonlib.MyStdIn, " MyStdOut: ", commonlib.MyStdOut, " MyStdErr: ", commonlib.MyStdErr)
 
 		// BuyerVsSellerApp is the first style of agent communication pattern; when more modes are added, this will need to be refactored
-		go launchBuyerVersusSellerApp(ctx, p2pHost, protocol, buyerCase, buyerCaseTopicListener, sellerCase, sellerCaseTopicListener)
+		var giveUpCB func(evm string)
+		if len(onGiveUpReconnect) > 0 {
+			giveUpCB = onGiveUpReconnect[0]
+		}
+		go launchBuyerVersusSellerApp(ctx, p2pHost, protocol, buyerCase, buyerCaseTopicListener, sellerCase, sellerCaseTopicListener, giveUpCB)
 
 	default:
 		log.Panic("Unknown mode: ", *flags.PeerOrRelayFlag)
@@ -338,13 +414,22 @@ func LaunchSDK(
 
 	// keep the node running until a keyboard interrupt
 	keyboardCancelChannel := make(chan os.Signal, 1)
-	signal.Notify(keyboardCancelChannel, syscall.SIGINT, syscall.SIGTERM)
+	// Ignore SIGINT *and* SIGTERM: some hosts deliver stray ones to long-running
+	// processes, which would otherwise kill the node.
+	// systemd stops the service via SIGKILL (KillSignal=SIGKILL).
+	signal.Ignore(syscall.SIGINT, syscall.SIGTERM)
 	fmt.Println("Press ctrl+c to kill the libp2p node")
 
 	<-keyboardCancelChannel
 
-	fmt.Println("Received keyboard signal, shutting  down the libp2p node ...")
-	// shut the node down
+	fmt.Println("Received keyboard signal, shutting down the node...")
+
+	// Close the shared account cache database
+	if err := commonlib.CloseSharedAccountDB(); err != nil {
+		log.Printf("Warning: Error closing shared account cache: %v", err)
+	}
+
+	// Shut down the libp2p node
 	if err := p2pHost.Close(); err != nil {
 		panic(err)
 	}
@@ -359,11 +444,11 @@ func launchBuyerVersusSellerApp(
 	sellerCase func(ctx context.Context, p2pHost host.Host, buffers *neuronbuffers.NodeBuffers),
 	sellerCaseTopicCallBack func(topicMessage hedera.TopicMessage),
 	// validatorCase func(ctx context.Context, p2pHost host.Host, buffers *neuronbuffers.NodeBuffers),
-
+	onGiveUpReconnect func(evm string),
 ) {
 	switch *flags.BuyerOrSellerFlag {
 	case "buyer":
-		streambuyervsseller.HandleBuyerCase(ctx, p2pHost, protocol, buyerCase, buyerCaseTopicCallBack)
+		streambuyervsseller.HandleBuyerCase(ctx, p2pHost, buyerCase, buyerCaseTopicCallBack, onGiveUpReconnect, getBuyerSellerProvider())
 	case "seller":
 		streambuyervsseller.HandleSellerCase(ctx, p2pHost, protocol, sellerCase, sellerCaseTopicCallBack)
 	case "validator":
@@ -454,10 +539,33 @@ func getAbbreviatedPeerPublicKeys(p2pHost host.Host) []string {
 func hederaAnnounceAndHeartBeat(ctx context.Context, p2pHost host.Host) (hedera.TopicID, hedera.TopicID, hedera.TopicID, error) {
 
 	fmt.Println("connect to hedera and send periodic alive")
-	stdOutTopic, stdInTopic, stdErrTopic, topciCreationError := hedera_helper.EnsureTopicsAndNotifyContract(p2pHost)
 
-	if topciCreationError != nil {
-		log.Fatal("Failed to create hedera topics. Let's end it here. ", topciCreationError)
+	// Resolve our topics from the Rendezvous contract (read through the Hedera
+	// mirror node). The mirror / Hedera testnet are external dependencies that can
+	// be transiently unreachable (DNS, HTTP 5xx, rate-limit). A boot-time outage
+	// must NOT crash the node — those problems fix themselves, so retry with capped
+	// backoff until the read succeeds instead of exiting into a systemd crash loop.
+	var stdOutTopic, stdInTopic, stdErrTopic hedera.TopicID
+	backoff := 2 * time.Second
+	const maxTopicBackoff = 60 * time.Second
+	for attempt := 1; ; attempt++ {
+		var topicErr error
+		stdOutTopic, stdInTopic, stdErrTopic, topicErr = hedera_helper.EnsureTopicsAndNotifyContract(p2pHost)
+		if topicErr == nil {
+			break
+		}
+		log.Printf("⏳  hedera/mirror not reachable yet (attempt %d): %v — retrying in %s, staying up", attempt, topicErr, backoff)
+		select {
+		case <-ctx.Done():
+			return hedera.TopicID{}, hedera.TopicID{}, hedera.TopicID{}, ctx.Err()
+		case <-time.After(backoff):
+		}
+		if backoff < maxTopicBackoff {
+			backoff *= 2
+			if backoff > maxTopicBackoff {
+				backoff = maxTopicBackoff
+			}
+		}
 	}
 
 	go func() {
@@ -466,7 +574,7 @@ func hederaAnnounceAndHeartBeat(ctx context.Context, p2pHost host.Host) (hedera.
 			myPublicAddressesEverything := hostsPublicAddressesSorted(p2pHost)
 			if len(myPublicAddressesEverything) > 0 {
 				//json.Unmarshal([]byte(os.Getenv("location")), &commonlib.MyLocation)
-				heartbeatMessage := types.NeuronHeartBeatMsg{
+				heartbeatMessage := commonlib.NeuronHeartBeatMsg{
 					MessageType:        "NeuronHeartBeat",
 					Location:           commonlib.MyLocation,
 					NatDeviceType:      "", //natDeviceType_g,
@@ -495,7 +603,7 @@ func hederaAnnounceAndHeartBeat(ctx context.Context, p2pHost host.Host) (hedera.
 			time.Sleep(time.Second * 40)
 		}
 	}()
-	return stdOutTopic, stdInTopic, stdErrTopic, topciCreationError
+	return stdOutTopic, stdInTopic, stdErrTopic, nil
 }
 
 func hostsPublicAddressesSorted(p2pHost host.Host) []multiaddr.Multiaddr {
@@ -541,7 +649,7 @@ func SetupKeysAndLocation(envFile string, forceLocationFlag *string, configurato
 }
 
 // LoadLocation tries to load the location JSON into the provided object.
-func LoadLocation(forceLocationFlag *string, location *types.EnvironmentVarLocation) error {
+func LoadLocation(forceLocationFlag *string, location *commonlib.EnvironmentVarLocation) error {
 	if *forceLocationFlag != "" {
 		return json.Unmarshal([]byte(*forceLocationFlag), location)
 	}
@@ -588,33 +696,3 @@ func HandleFallbackConfigurator(envFile string, configurator func(envIsReady cha
 	}
 	return LoadPrivateKey(os.Getenv("private_key"))
 }
-
-// ReplaceSellers updates the connected sellers list with the provided list of seller public keys.
-// It handles three scenarios:
-// - When a seller was there already: keep him, do nothing
-// - When a seller wasn't there before: add him and processSeller
-// - When a seller was there but is not in the update list: remove him from the buffer, disconnect him
-// Returns the updated seller list and any error that occurred
-// If currentSellers is nil, it will automatically determine current sellers from the buffers
-func ReplaceSellers(sellerPublicKeys []string, currentSellers map[streambuyervsseller.Seller]bool, p2pHost host.Host, sellerBuffers *commonlib.NodeBuffers, myReachableAddresses []multiaddr.Multiaddr, protocolID protocol.ID) (map[streambuyervsseller.Seller]bool, error) {
-	return streambuyervsseller.ReplaceSellers(sellerPublicKeys, currentSellers, p2pHost, sellerBuffers, myReachableAddresses, protocolID)
-}
-
-// ReplaceSellersAuto automatically determines current sellers from buffers and updates them
-// with the provided list of seller public keys. This is the most convenient version to use.
-func ReplaceSellersAuto(sellerPublicKeys []string, p2pHost host.Host, sellerBuffers *commonlib.NodeBuffers, myReachableAddresses []multiaddr.Multiaddr, protocolID protocol.ID) error {
-	return streambuyervsseller.ReplaceSellersAuto(sellerPublicKeys, p2pHost, sellerBuffers, myReachableAddresses, protocolID)
-}
-
-// ShowCurrentPeerStatus extracts the current sellers from the seller buffers
-func ShowCurrentPeerStatus(b *commonlib.NodeBuffers) map[streambuyervsseller.Seller]bool {
-	return streambuyervsseller.ShowCurrentPeerStatus(b)
-}
-
-// ShowDetailedPeerStatus extracts detailed status information for all peers
-func ShowDetailedPeerStatus(b *commonlib.NodeBuffers, h host.Host) []types.PeerStatusInfo {
-	return b.ShowDetailedPeerStatus(h)
-}
-
-// PeerStatusInfo contains detailed information about a peer's connection status
-type PeerStatusInfo = types.PeerStatusInfo

@@ -1,12 +1,17 @@
 package hedera_helper
 
 import (
+	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
 
 	"os"
+	"strconv"
+	"strings"
+	"sync"
 	"time"
 
 	commonlib "github.com/NeuronInnovations/neuron-go-hedera-sdk/common-lib"
@@ -15,44 +20,130 @@ import (
 	"github.com/NeuronInnovations/neuron-go-hedera-sdk/hederacontract"
 
 	"github.com/ethereum/go-ethereum/common"
-	"github.com/ethereum/go-ethereum/ethclient"
 	"github.com/google/uuid"
 	"github.com/hashgraph/hedera-sdk-go/v2"
 	"github.com/multiformats/go-multiaddr"
+	"golang.org/x/time/rate"
 	"google.golang.org/grpc/status"
-
-	"github.com/NeuronInnovations/neuron-go-hedera-sdk/types"
 )
 
-func GetHRpcClient() *hederacontract.HederacontractCaller {
+var (
+	// Normal lane: heartbeats, shared-account creation, deposits, best-effort retries.
+	// Kept larger than 2 so background Hedera work does not create a long queue that
+	// starves the stream read path (remote writes to us); we never do Hedera in the
+	// stream read path, but many goroutines blocked on this sem can still hurt.
+	hederaWriteLimiter = rate.NewLimiter(rate.Every(200*time.Millisecond), 4)
+	hederaWriteSem     = make(chan struct{}, 4)
+	// Priority lane: connect/reconnect envelopes and schedule signing. Keeps the
+	// remote's write path effective so they don't close the stream due to our delay.
+	hederaPriorityWriteLimiter = rate.NewLimiter(rate.Every(250*time.Millisecond), 4)
+	hederaPriorityWriteSem     = make(chan struct{}, 4)
+	contractCallerMu           sync.Mutex
+	cachedContractCaller       *hederacontract.HederacontractCaller
+	cachedContractAddress      string
+	hederaClientMu             sync.Mutex
+	hederaClient               *hedera.Client
+)
 
-	// Check command-line flag first (highest priority), then environment variable
-	var scAddress string
-	if commonlib.SmartContractAddressFlag != nil && *commonlib.SmartContractAddressFlag != "" {
-		scAddress = *commonlib.SmartContractAddressFlag
-	} else {
-		scAddress = os.Getenv("smart_contract_address")
+func acquireHederaWriteSlot(op string) (func(), error) {
+	return acquireHederaWriteSlotWithTimeout(op, 10*time.Second)
+}
+
+func acquireHederaPriorityWriteSlot(op string) (func(), error) {
+	return acquireHederaPriorityWriteSlotWithTimeout(op, 1500*time.Millisecond)
+}
+
+func acquireHederaWriteSlotWithTimeout(op string, timeout time.Duration) (func(), error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	select {
+	case hederaWriteSem <- struct{}{}:
+	case <-ctx.Done():
+		return nil, fmt.Errorf("hedera write queue timeout (%s): %w", op, ctx.Err())
 	}
 
-	// Validate smart contract address format
+	if err := hederaWriteLimiter.Wait(ctx); err != nil {
+		<-hederaWriteSem
+		return nil, fmt.Errorf("hedera write limiter wait failed (%s): %w", op, err)
+	}
+
+	released := false
+	return func() {
+		if !released {
+			released = true
+			<-hederaWriteSem
+		}
+	}, nil
+}
+
+func acquireHederaPriorityWriteSlotWithTimeout(op string, timeout time.Duration) (func(), error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	select {
+	case hederaPriorityWriteSem <- struct{}{}:
+	case <-ctx.Done():
+		return nil, fmt.Errorf("hedera priority write queue timeout (%s): %w", op, ctx.Err())
+	}
+
+	if err := hederaPriorityWriteLimiter.Wait(ctx); err != nil {
+		<-hederaPriorityWriteSem
+		return nil, fmt.Errorf("hedera priority write limiter wait failed (%s): %w", op, err)
+	}
+
+	released := false
+	return func() {
+		if !released {
+			released = true
+			<-hederaPriorityWriteSem
+		}
+	}, nil
+}
+
+// getContractCaller returns a cached caller for the Rendezvous smart contract.
+// Reads are served by the Hedera mirror node's /contracts/call endpoint (see
+// mirror_contract.go), not a JSON-RPC relay (hashio): no eth_rpc_url / dial.
+func getContractCaller() *hederacontract.HederacontractCaller {
+	const defaultSCAddress = "0x87e2fc64dc1eae07300c2fc50d6700549e1632ca"
+	scAddress := strings.ToLower(strings.TrimSpace(os.Getenv("smart_contract_address")))
 	if scAddress == "" {
-		log.Fatal("smart_contract_address is not set. Please provide it via --smart-contract-address flag or smart_contract_address environment variable")
+		scAddress = defaultSCAddress
+	}
+	// Keep this aligned in process without rewriting env file on every call.
+	if scAddress != defaultSCAddress {
+		scAddress = defaultSCAddress
+	}
+	os.Setenv("smart_contract_address", scAddress)
+
+	contractCallerMu.Lock()
+	defer contractCallerMu.Unlock()
+
+	if cachedContractCaller != nil && cachedContractAddress == scAddress {
+		return cachedContractCaller
 	}
 
-	if !keylib.IsValidEthereumAddress(scAddress) {
-		log.Fatalf("invalid smart contract address format: %s. Must be a valid Ethereum address (0x + 40 hex characters)", scAddress)
-	}
-
-	client, _ := ethclient.Dial(os.Getenv("eth_rpc_url"))
-
-	contractCaller, _ := hederacontract.NewHederacontractCaller(
+	contractCaller, err := hederacontract.NewHederacontractCaller(
 		common.HexToAddress(scAddress),
-		client,
+		sharedMirror(),
 	)
-	return contractCaller
+	if err != nil {
+		log.Panicf("failed to create hedera contract caller: %v", err)
+	}
+
+	cachedContractCaller = contractCaller
+	cachedContractAddress = scAddress
+	return cachedContractCaller
 }
 
 func GetHederaClientUsingEnv() *hedera.Client {
+	hederaClientMu.Lock()
+	defer hederaClientMu.Unlock()
+
+	if hederaClient != nil {
+		return hederaClient
+	}
+
 	c, err1 := hedera.ClientForName(hedera.NetworkNameTestnet.String())
 	op, err2 := hedera.AccountIDFromString(os.Getenv("hedera_id"))
 
@@ -61,17 +152,28 @@ func GetHederaClientUsingEnv() *hedera.Client {
 	}
 
 	pkString := os.Getenv("private_key")
-
 	if len(pkString) == 64 {
 		pk, _ := hedera.PrivateKeyFromStringECDSA(pkString)
 		c.SetOperator(op, pk)
-		return c
 	} else { // it's an ed25519
 		pk, _ := hedera.PrivateKeyFromStringEd25519(pkString)
 		c.SetOperator(op, pk)
-		return c
 	}
 
+	hederaClient = c
+	return hederaClient
+
+}
+
+// CloseHederaClient closes the shared Hedera client.
+// Only call this on process shutdown.
+func CloseHederaClient() {
+	hederaClientMu.Lock()
+	defer hederaClientMu.Unlock()
+	if hederaClient != nil {
+		hederaClient.Close()
+		hederaClient = nil
+	}
 }
 
 // dead function, not used.
@@ -128,7 +230,6 @@ func CreateAccountFromParent() {
 
 func CreateTopic() (string, error) {
 	c := GetHederaClientUsingEnv()
-	defer c.Close()
 	transactionResponse, err := hedera.NewTopicCreateTransaction().
 		SetTransactionMemo("liveness topic").
 		SetAdminKey(c.GetOperatorPublicKey()).
@@ -154,9 +255,14 @@ func CreateTopic() (string, error) {
 
 func SendToTopic(topicID hedera.TopicID, content string) error {
 	client := GetHederaClientUsingEnv()
-	defer client.Close()
 
-	_, err := hedera.NewTopicMessageSubmitTransaction().
+	release, err := acquireHederaWriteSlot("SendToTopic")
+	if err != nil {
+		return err
+	}
+	defer release()
+
+	_, err = hedera.NewTopicMessageSubmitTransaction().
 		SetMessage([]byte(content)).
 		SetTopicID(topicID).
 		Execute(client)
@@ -171,17 +277,37 @@ func BuyerPrepareServiceRequest(
 	toEthAddress string,
 	arbiterEthAddress string,
 	amount int64, // TODO: needs to match what is in the sla
-) (*types.TopicPostalEnvelope, error) {
-	client := GetHederaClientUsingEnv()
-	defer client.Close()
+) (*commonlib.TopicPostalEnvelope, error) {
+	return BuyerPrepareServiceRequestWithSellerInfo(
+		fromP2pPublicAddresses,
+		fromEthAddress,
+		toEthAddress,
+		arbiterEthAddress,
+		amount,
+		nil,
+	)
+}
 
+// BuyerPrepareServiceRequestWithSellerInfo builds a service request envelope and
+// can reuse pre-fetched seller contract info to avoid duplicate contract reads
+// on latency-sensitive manual connect paths.
+func BuyerPrepareServiceRequestWithSellerInfo(
+	fromP2pPublicAddresses []multiaddr.Multiaddr,
+	fromEthAddress string,
+	toEthAddress string,
+	arbiterEthAddress string,
+	amount int64, // TODO: needs to match what is in the sla
+	sellerInfo *PeerInfo,
+) (*commonlib.TopicPostalEnvelope, error) {
 	// check if all keys are valid
+
 	fromHederaraID, err1 := hedera.AccountIDFromEvmAddress(0, 0, fromEthAddress)
 	toHederaraID, err2 := hedera.AccountIDFromEvmAddress(0, 0, toEthAddress)
 	arbiterHederaId, err3 := hedera.AccountIDFromEvmAddress(0, 0, arbiterEthAddress)
 
 	if err1 != nil || err2 != nil || err3 != nil {
 		return nil, errors.New("error:one of your keys cannot construct an account from a evm address")
+
 	}
 
 	// check if the accounts are valid by making account info queries
@@ -203,10 +329,16 @@ func BuyerPrepareServiceRequest(
 	}
 
 	// get the topic that the otherside wants the requests to be sent to: stdIn
-	perrInfo, err := GetPeerInfo(toEthAddress)
-	if err != nil {
-		// add more text to err
-		return nil, fmt.Errorf("error getting the topic for eth peer %v when looking into the contract: %v", toEthAddress, err)
+	var perrInfo PeerInfo
+	if sellerInfo != nil && sellerInfo.StdInTopic != 0 {
+		perrInfo = *sellerInfo
+	} else {
+		fetchedPeerInfo, fetchErr := GetPeerInfo(toEthAddress)
+		if fetchErr != nil {
+			// add more text to err
+			return nil, fmt.Errorf("error getting the topic for eth peer %v when looking into the contract: %v", toEthAddress, fetchErr)
+		}
+		perrInfo = fetchedPeerInfo
 	}
 
 	toStdInTopic, err := hedera.TopicIDFromString(fmt.Sprintf("0.0.%d", perrInfo.StdInTopic))
@@ -214,24 +346,72 @@ func BuyerPrepareServiceRequest(
 		return nil, err
 	}
 
-	// create a shared account and deposit the payment the sensor wants.
-
-	sharedAccTx, err := createSharedAccount(fromHederaPupblicKeyEnc, toHederaPublicKeyEnc, arbiterHederaKeyEnc, amount)
-	if err != nil {
-		return nil, fmt.Errorf("error preparing a shared account: %v", err)
+	// Check cache for existing shared account before creating a new one
+	var sharedAccID hedera.AccountID
+	cachedAccount, cacheErr := commonlib.LoadSharedAccount(fromEthAddress, toEthAddress, arbiterEthAddress)
+	if cacheErr == nil && cachedAccount.SharedAccID != 0 {
+		// Validate the cached account still exists on Hedera (free mirror query)
+		cachedAccID := hedera.AccountID{Shard: 0, Realm: 0, Account: cachedAccount.SharedAccID}
+		if _, validationErr := GetAccountInfoFromMirror(cachedAccID); validationErr == nil {
+			// Cached account is valid, reuse it
+			sharedAccID = cachedAccID
+			log.Printf("Reusing cached shared account %d for seller %s (saved HBAR!)", sharedAccID.Account, toEthAddress)
+		} else {
+			log.Printf("Cached shared account %d no longer valid, creating new one", cachedAccount.SharedAccID)
+			cachedAccount = nil // Force new account creation
+		}
 	}
-	sharedAccTxResponse, err :=
-		sharedAccTx.SetMaxBackoff(time.Second * 5).SetMaxRetry(10).Execute(client)
 
-	if err != nil {
-		return nil, fmt.Errorf("error creating a shared account: %v", err)
+	// Create new shared account if no valid cached one exists.
+	// Run the Hedera I/O in a separate goroutine so the connect path doesn't
+	// block other work (dial/listen, other peers) while the create completes.
+	if sharedAccID.Account == 0 {
+		sharedAccTx, err := createSharedAccount(fromHederaPupblicKeyEnc, toHederaPublicKeyEnc, arbiterHederaKeyEnc, amount)
+		if err != nil {
+			return nil, fmt.Errorf("error preparing a shared account: %v", err)
+		}
+		type createResult struct {
+			id  hedera.AccountID
+			err error
+		}
+		resCh := make(chan createResult, 1)
+		go func() {
+			createClient := GetHederaClientUsingEnv()
+			release, slotErr := acquireHederaWriteSlot("CreateSharedAccount")
+			if slotErr != nil {
+				resCh <- createResult{err: slotErr}
+				return
+			}
+			sharedAccTxResponse, err := sharedAccTx.SetMaxBackoff(time.Second * 5).SetMaxRetry(10).Execute(createClient)
+			release()
+			if err != nil {
+				resCh <- createResult{err: fmt.Errorf("error creating a shared account: %v", err)}
+				return
+			}
+			sharedAccTxReceipt, err := sharedAccTxResponse.GetReceipt(createClient)
+			if err != nil {
+				resCh <- createResult{err: err}
+				return
+			}
+			accID := *sharedAccTxReceipt.AccountID
+			log.Printf("Created new shared account %d for seller %s", accID.Account, toEthAddress)
+			saveErr := commonlib.SaveSharedAccount(&commonlib.SharedAccountRecord{
+				BuyerEthAddress:   fromEthAddress,
+				SellerEthAddress:  toEthAddress,
+				ArbiterEthAddress: arbiterEthAddress,
+				SharedAccID:       accID.Account,
+			})
+			if saveErr != nil {
+				log.Printf("Warning: Failed to cache shared account: %v", saveErr)
+			}
+			resCh <- createResult{id: accID}
+		}()
+		res := <-resCh
+		if res.err != nil {
+			return nil, res.err
+		}
+		sharedAccID = res.id
 	}
-	sharedAccTxReceipt, err := sharedAccTxResponse.GetReceipt(client)
-	if err != nil {
-		return nil, err
-
-	}
-	sharedAccID := *sharedAccTxReceipt.AccountID
 	fmt.Printf("shared account id: %v\n", sharedAccID)
 	serialized := fmt.Sprintf("%s", fromP2pPublicAddresses)
 	fmt.Printf("Sending serialized multiaddr: %s to seller %s \n", serialized, toEthAddress)
@@ -240,12 +420,16 @@ func BuyerPrepareServiceRequest(
 		return nil, encErr
 	}
 
+	// Our own peer info (for our StdInTopic). A transient contract-read failure
+	// here must not crash the process: the caller handles a returned error by
+	// marking the connect attempt failed and retrying later. Previously this was
+	// log.Panic, which took the whole buyer down whenever the contract read flapped.
 	peerInfo, err := GetPeerInfo(fromEthAddress)
 	if err != nil {
-		log.Panic(err)
+		return nil, fmt.Errorf("error getting our own peer info for %v from the contract: %v", fromEthAddress, err)
 	}
 
-	m := &types.NeuronServiceRequestMsg{
+	m := &commonlib.NeuronServiceRequestMsg{
 		MessageType:        "serviceRequest",
 		SlaAgreed:          1,
 		ServiceType:        string(commonlib.MyProtocol),
@@ -257,7 +441,7 @@ func BuyerPrepareServiceRequest(
 		Version:            "0.4",
 	}
 
-	ret := types.TopicPostalEnvelope{
+	ret := commonlib.TopicPostalEnvelope{
 		Message:         m,
 		OtherStdInTopic: toStdInTopic,
 	}
@@ -273,25 +457,14 @@ func SellerSendScheduledTransferRequest(
 	buyerStdIn hedera.TopicID, // inform buyer that a schedule is up for counter signing
 ) error {
 	client := GetHederaClientUsingEnv()
-	defer client.Close()
 
-	// Get the current balance of the shared account
-	accountInfo, err := GetAccountInfoFromNetwork(sharedAccID)
-	if err != nil {
-		return fmt.Errorf("failed to get account balance: %v", err)
-	}
-
-	totalAmount := accountInfo.Balance.As(hedera.HbarUnits.Millibar)
-	log.Printf("Shared account balance: %f millibar", totalAmount)
-
-	// Move the entire amount out of the shared account with 60/40 split
-	sixtyPercent := float64(totalAmount) * 0.6
-	fortyPercent := float64(totalAmount) * 0.4
-
+	// Payment split: Device gets 90%, Parent gets 10%
+	// Total: 0.1 HBAR (10,000,000 tinybars)
 	transferTx, err := hedera.NewTransferTransaction().
-		AddHbarTransfer(sharedAccID, hedera.HbarFrom(-float64(totalAmount), hedera.HbarUnits.Millibar)).
-		AddHbarTransfer(toHederaParentID, hedera.HbarFrom(sixtyPercent, hedera.HbarUnits.Millibar)). // 60% of total
-		AddHbarTransfer(toHederaDeviceID, hedera.HbarFrom(fortyPercent, hedera.HbarUnits.Millibar)). // 40% of total
+		AddHbarTransfer(sharedAccID, hedera.HbarFrom(-0.1, hedera.HbarUnits.Hbar)).
+		AddHbarTransfer(toHederaParentID, hedera.HbarFrom(0.01, hedera.HbarUnits.Hbar)).
+		AddHbarTransfer(toHederaDeviceID, hedera.HbarFrom(0.09, hedera.HbarUnits.Hbar)).
+		// TODO: AddTokenTransfer() transfer tokens to  other fee and reward accounts.
 		SetTransactionMemo(uuid.New().String()).
 		FreezeWith(client)
 
@@ -305,7 +478,12 @@ func SellerSendScheduledTransferRequest(
 		return err
 	}
 
+	release, slotErr := acquireHederaWriteSlot("SellerSendScheduledTransferRequest.schedule")
+	if slotErr != nil {
+		return slotErr
+	}
 	scheduledTxResponse, err := scheduledTransferTx.Execute(client)
+	release()
 
 	if err != nil {
 		return err
@@ -321,7 +499,7 @@ func SellerSendScheduledTransferRequest(
 
 	// prepare message and send to the buyer's topic.
 
-	m := &types.NeuronScheduleSignRequestMsg{
+	m := &commonlib.NeuronScheduleSignRequestMsg{
 		MessageType: "scheduleSignRequest",
 		ScheduleID:  scheduleId.Schedule,
 		SharedAccID: sharedAccID.Account,
@@ -329,10 +507,15 @@ func SellerSendScheduledTransferRequest(
 	}
 	jsonBytes, _ := json.Marshal(m)
 
+	release, slotErr = acquireHederaWriteSlot("SellerSendScheduledTransferRequest.notifyBuyer")
+	if slotErr != nil {
+		return slotErr
+	}
 	txResponse, err := hedera.NewTopicMessageSubmitTransaction().
 		SetMessage(jsonBytes).
 		SetTopicID(buyerStdIn).
 		Execute(client)
+	release()
 
 	if err != nil {
 		return err
@@ -344,9 +527,6 @@ func SellerSendScheduledTransferRequest(
 }
 
 func BuyerCounterSignSchedule(scheduleID hedera.ScheduleID) error {
-	client := GetHederaClientUsingEnv()
-	defer client.Close()
-
 	fmt.Println("signing scheduleID: ", scheduleID)
 
 	sigerr := SignSchedule(scheduleID, os.Getenv("private_key"))
@@ -356,11 +536,10 @@ func BuyerCounterSignSchedule(scheduleID hedera.ScheduleID) error {
 	return sigerr
 }
 
-func PeerSendErrorMessage(otherSideStdIn hedera.TopicID, errorType types.ErrorType, errorMessage string, recoverAction types.RecoverAction) {
+func PeerSendErrorMessage(otherSideStdIn hedera.TopicID, errorType commonlib.ErrorType, errorMessage string, recoverAction commonlib.RecoverAction) {
 	go func() {
 		client := GetHederaClientUsingEnv()
-		defer client.Close()
-		m := &types.NeuronPeerErrorMsg{
+		m := &commonlib.NeuronPeerErrorMsg{
 			MessageType:   "peerError",
 			StdInTopic:    commonlib.MyStdIn.Topic,
 			PublicKey:     commonlib.MyPublicKey.StringRaw(),
@@ -372,20 +551,26 @@ func PeerSendErrorMessage(otherSideStdIn hedera.TopicID, errorType types.ErrorTy
 
 		jsonBytes, _ := json.Marshal(m)
 
+		release, slotErr := acquireHederaWriteSlot("PeerSendErrorMessage")
+		if slotErr != nil {
+			log.Println(slotErr)
+			return
+		}
 		_, err := hedera.NewTopicMessageSubmitTransaction().
 			SetMessage(jsonBytes).
 			SetTopicID(otherSideStdIn).
 			Execute(client)
+		release()
 		if err != nil {
 			log.Println(err)
 		}
 	}()
 }
 
-func SendSelfErrorMessage(errorType types.ErrorType, errorMessage string, recoverAction types.RecoverAction) error {
+func SendSelfErrorMessage(errorType commonlib.ErrorType, errorMessage string, recoverAction commonlib.RecoverAction) error {
+
 	client := GetHederaClientUsingEnv()
-	defer client.Close()
-	m := &types.NeuronSelfErrorMsg{
+	m := &commonlib.NeuronSelfErrorMsg{
 		MessageType:   "selfError",
 		StdInTopic:    commonlib.MyStdIn.Topic,
 		ErrorType:     errorType,
@@ -396,25 +581,78 @@ func SendSelfErrorMessage(errorType types.ErrorType, errorMessage string, recove
 
 	jsonBytes, _ := json.Marshal(m)
 
+	release, slotErr := acquireHederaWriteSlot("SendSelfErrorMessage")
+	if slotErr != nil {
+		return slotErr
+	}
 	_, err := hedera.NewTopicMessageSubmitTransaction().
 		SetMessage(jsonBytes).
 		SetTopicID(commonlib.MyStdErr).
 		Execute(client)
+	release()
 	return err
 }
 
-func SendTransactionEnvelope(tx types.TopicPostalEnvelope) error {
+func SendTransactionEnvelope(tx commonlib.TopicPostalEnvelope) error {
 	client := GetHederaClientUsingEnv()
-	defer client.Close()
 	jsonBytes, marshallingError := json.Marshal(tx.Message)
 	if marshallingError != nil {
 		return marshallingError
 	}
 
+	release, slotErr := acquireHederaWriteSlot("SendTransactionEnvelope")
+	if slotErr != nil {
+		return slotErr
+	}
 	_, err := hedera.NewTopicMessageSubmitTransaction().
 		SetMessage(jsonBytes).
 		SetTopicID(tx.OtherStdInTopic).
 		Execute(client)
+	release()
+	return err
+}
+
+// SendTransactionEnvelopePriority is reserved for user-triggered connect/reconnect
+// requests. It bypasses the shared background write queue to keep manual actions
+// responsive under heavy Hedera maintenance traffic.
+func SendTransactionEnvelopePriority(tx commonlib.TopicPostalEnvelope) error {
+	client := GetHederaClientUsingEnv()
+	jsonBytes, marshallingError := json.Marshal(tx.Message)
+	if marshallingError != nil {
+		return marshallingError
+	}
+
+	release, slotErr := acquireHederaPriorityWriteSlot("SendTransactionEnvelopePriority")
+	if slotErr != nil {
+		return slotErr
+	}
+	_, err := hedera.NewTopicMessageSubmitTransaction().
+		SetMessage(jsonBytes).
+		SetTopicID(tx.OtherStdInTopic).
+		Execute(client)
+	release()
+	return err
+}
+
+// SendTransactionEnvelopeBestEffort submits a topic message but returns quickly
+// if Hedera is currently busy. Intended for periodic/background retries so they
+// don't block manual connect flows.
+func SendTransactionEnvelopeBestEffort(tx commonlib.TopicPostalEnvelope) error {
+	client := GetHederaClientUsingEnv()
+	jsonBytes, marshallingError := json.Marshal(tx.Message)
+	if marshallingError != nil {
+		return marshallingError
+	}
+
+	release, slotErr := acquireHederaWriteSlotWithTimeout("SendTransactionEnvelopeBestEffort", 1200*time.Millisecond)
+	if slotErr != nil {
+		return slotErr
+	}
+	_, err := hedera.NewTopicMessageSubmitTransaction().
+		SetMessage(jsonBytes).
+		SetTopicID(tx.OtherStdInTopic).
+		Execute(client)
+	release()
 	return err
 }
 
@@ -424,57 +662,123 @@ func ListenToTopicAndCallBack(stdInTopic hedera.TopicID, callback func(message h
 	if myEthAddress == "" {
 		return errors.New("myEthAddress is empty")
 	}
-	downloadAndListen(stdInTopic, callback)
-	// the above should never return; reaching the next line is an error.
-	return errors.New("failed to ListenToTopicAndCallBack")
-}
-
-func downloadAndListen(topicID hedera.TopicID, callback func(message hedera.TopicMessage)) {
-	// Create a new client with the operator account ID and key
-	client := GetHederaClientUsingEnv()
-	defer client.Close()
-	// Channel to signal message receipt
-	messageReceived := make(chan struct{}, 1)
-	// Main loop to keep subscribing
-mainLoop:
-	// Get the last time you received a message from the environment variable called "last_stdin_timestamp"
-	var lastStdInTimestamp time.Time
-	/* TODO: re-introdce timestamps
-	lastStdInTimestampEnv := os.Getenv("last_stdin_timestamp")
-	if lastStdInTimestampEnv != "" {
-		lastStdInTimestamp, _ = time.Parse(time.RFC3339Nano, lastStdInTimestampEnv)
-	} else {
-		lastStdInTimestamp = time.Now().UTC()
-		commonlib.UpdateEnvVariable("last_stdin_timestamp", lastStdInTimestamp.Format(time.RFC3339Nano), commonlib.MyEnvFile)
-		log.Default().Println("last_stdin_timestamp not set, defaulting to now")
-	}
-	*/
-	lastStdInTimestamp = time.Now().UTC()
-
-	handle, err := subscribe(client, topicID, lastStdInTimestamp, callback, messageReceived)
-	if err != nil {
-		log.Println("SELFERROR:Error subscribing to topic: ", err) // TODO: send error to error topic
-	}
-	timeout := time.NewTimer(3 * time.Minute)
-	defer timeout.Stop()
-
+	// downloadAndListen polls the mirror forever and is the node's ONLY inbound
+	// path. Supervise it: if it ever panics (or returns), restart it so a transient
+	// fault can't leave the node permanently deaf — it keeps polling and picks the
+	// mirror back up as soon as the service returns.
 	for {
-		select {
-		case <-messageReceived:
-			// Message received, reset the timer
-			if !timeout.Stop() {
-				<-timeout.C // Drain the channel
-			}
-			timeout.Reset(3 * time.Minute)
-		case <-timeout.C:
-			// Timeout, no messages received for 3 minutes (could be because subsription didn't work too)
-			handle.Unsubscribe()
-			goto mainLoop // Break out of the outer loop to restart the subscription]
-		}
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("topic %s: inbound listener panicked, restarting: %v", stdInTopic, r)
+				}
+			}()
+			downloadAndListen(stdInTopic, callback)
+		}()
+		log.Printf("topic %s: inbound listener stopped unexpectedly, restarting in 2s", stdInTopic)
+		time.Sleep(2 * time.Second)
 	}
 }
 
-func subscribe(client *hedera.Client, topicID hedera.TopicID, startTime time.Time, callback func(message hedera.TopicMessage), messageReceived chan struct{}) (hedera.SubscriptionHandle, error) {
+// downloadAndListen tails an HCS topic by POLLING the mirror node's REST
+// /topics/{id}/messages endpoint instead of the SDK's long-lived gRPC stream.
+// The gRPC subscription silently stalls on restrictive networks (content
+// filters idle-kill long-lived HTTP/2 streams; the mirror also gives no heartbeat
+// when it drops us). Short REST polls don't have that problem and ride the same
+// adaptive (DNS-first + IP-cache) mirror client as contract reads. This function
+// never returns.
+func downloadAndListen(topicID hedera.TopicID, callback func(message hedera.TopicMessage)) {
+	m := sharedMirror()
+	topic := topicID.String()
+	// Start slightly in the past so a request sent right before startup isn't
+	// missed, but not so far back that we replay much history.
+	lastTs := time.Now().UTC().Add(-10 * time.Second)
+	const pollInterval = 2 * time.Second
+	backoff := pollInterval
+	for {
+		ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+		path := fmt.Sprintf("/topics/%s/messages?timestamp=gt:%d.%09d&order=asc&limit=100",
+			topic, lastTs.Unix(), lastTs.Nanosecond())
+		body, err := m.GetJSON(ctx, path)
+		cancel()
+		if err != nil {
+			log.Printf("topic %s: poll failed: %v", topic, err) // SELFERROR
+			time.Sleep(backoff)
+			backoff = minDuration(backoff*2, 30*time.Second)
+			continue
+		}
+		backoff = pollInterval
+
+		var parsed struct {
+			Messages []struct {
+				ConsensusTimestamp string `json:"consensus_timestamp"`
+				Message            string `json:"message"` // base64
+				SequenceNumber     uint64 `json:"sequence_number"`
+			} `json:"messages"`
+		}
+		if err := json.Unmarshal(body, &parsed); err != nil {
+			log.Printf("topic %s: decode messages: %v", topic, err)
+			time.Sleep(pollInterval)
+			continue
+		}
+		for _, msg := range parsed.Messages {
+			raw, derr := base64.StdEncoding.DecodeString(msg.Message)
+			if derr != nil {
+				continue
+			}
+			ts := parseMirrorTimestamp(msg.ConsensusTimestamp)
+			// Contain a panic from handling one (possibly malformed) message so it
+			// can't unwind and kill the poll loop; log it and keep tailing.
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						log.Printf("topic %s: recovered from panic handling message seq=%d: %v", topic, msg.SequenceNumber, r)
+					}
+				}()
+				callback(hedera.TopicMessage{
+					ConsensusTimestamp: ts,
+					Contents:           raw,
+					SequenceNumber:     msg.SequenceNumber,
+				})
+			}()
+			if ts.After(lastTs) {
+				lastTs = ts
+			}
+		}
+		time.Sleep(pollInterval)
+	}
+}
+
+// parseMirrorTimestamp converts a mirror-node "seconds.nanos" consensus timestamp
+// to time.Time; returns the zero time on parse failure (callers tolerate it).
+func parseMirrorTimestamp(s string) time.Time {
+	s = strings.TrimSpace(s)
+	secStr, nanoStr := s, ""
+	if dot := strings.IndexByte(s, '.'); dot >= 0 {
+		secStr, nanoStr = s[:dot], s[dot+1:]
+	}
+	sec, err := strconv.ParseInt(secStr, 10, 64)
+	if err != nil {
+		return time.Time{}
+	}
+	var nano int64
+	if nanoStr != "" {
+		for len(nanoStr) < 9 {
+			nanoStr += "0"
+		}
+		nano, _ = strconv.ParseInt(nanoStr[:9], 10, 64)
+	}
+	return time.Unix(sec, nano).UTC()
+}
+
+func subscribe(
+	client *hedera.Client,
+	topicID hedera.TopicID,
+	startTime time.Time,
+	callback func(message hedera.TopicMessage),
+	messageReceived chan struct{},
+	subscriptionDone chan struct{},
+) (hedera.SubscriptionHandle, error) {
 
 	handle, err := hedera.NewTopicMessageQuery().
 		SetTopicID(topicID).
@@ -489,12 +793,19 @@ func subscribe(client *hedera.Client, topicID hedera.TopicID, startTime time.Tim
 		SetErrorHandler(
 			func(stat status.Status) {
 				//log.Printf("Subs Query error: %v...\n", stat)
-
+				select {
+				case subscriptionDone <- struct{}{}:
+				default:
+				}
 			},
 		).
 		SetCompletionHandler(
 			func() {
 				log.Printf("Subscription completed unexpectedly\n")
+				select {
+				case subscriptionDone <- struct{}{}:
+				default:
+				}
 			},
 		).
 		Subscribe(
@@ -518,9 +829,29 @@ func subscribe(client *hedera.Client, topicID hedera.TopicID, startTime time.Tim
 	return handle, nil
 }
 
+// resetTimer stops t and re-arms it for duration d. The non-blocking drain
+// keeps it correct on Go versions before 1.23 (where a fired timer leaves a
+// value in the channel) without risking a deadlock on 1.23+ (where Stop
+// returning false no longer guarantees a pending value to drain).
+func resetTimer(t *time.Timer, d time.Duration) {
+	if !t.Stop() {
+		select {
+		case <-t.C:
+		default:
+		}
+	}
+	t.Reset(d)
+}
+
+func minDuration(a time.Duration, b time.Duration) time.Duration {
+	if a < b {
+		return a
+	}
+	return b
+}
+
 func SignSchedule(scheduleId hedera.ScheduleID, privateKey string) error {
 	client := GetHederaClientUsingEnv()
-	defer client.Close()
 	hederaPrivateKey, err := hedera.PrivateKeyFromStringECDSA(privateKey)
 	if err != nil {
 		return err
@@ -534,7 +865,12 @@ func SignSchedule(scheduleId hedera.ScheduleID, privateKey string) error {
 	if err != nil {
 		return err
 	}
+	release, slotErr := acquireHederaWriteSlot("SignSchedule")
+	if slotErr != nil {
+		return slotErr
+	}
 	scheduleSignTxResponse, err := scheduleSignTx.Sign(hederaPrivateKey).Execute(client)
+	release()
 	if err != nil {
 		return err
 	}
@@ -559,6 +895,37 @@ func SignSchedule(scheduleId hedera.ScheduleID, privateKey string) error {
 	return nil
 }
 
+// SignScheduleBestEffort attempts schedule signing using the priority lane so
+// we don't delay payment and cause the remote to close the stream. Must not
+// compete with background Hedera traffic on the normal lane.
+func SignScheduleBestEffort(scheduleId hedera.ScheduleID, privateKey string) error {
+	client := GetHederaClientUsingEnv()
+	hederaPrivateKey, err := hedera.PrivateKeyFromStringECDSA(privateKey)
+	if err != nil {
+		return err
+	}
+
+	scheduleSignTx, err := hedera.NewScheduleSignTransaction().
+		SetScheduleID(scheduleId).
+		FreezeWith(client)
+	if err != nil {
+		return err
+	}
+
+	release, slotErr := acquireHederaPriorityWriteSlotWithTimeout("SignScheduleBestEffort", 1200*time.Millisecond)
+	if slotErr != nil {
+		return slotErr
+	}
+	scheduleSignTxResponse, err := scheduleSignTx.Sign(hederaPrivateKey).Execute(client)
+	release()
+	if err != nil {
+		return err
+	}
+
+	_, err = scheduleSignTxResponse.GetReceipt(client)
+	return err
+}
+
 func createSharedAccount(buyer, seller, arbiter hedera.PublicKey, initialPayment int64) (*hedera.AccountCreateTransaction, error) {
 
 	kl := hedera.KeyListWithThreshold(3).AddAllPublicKeys(
@@ -578,7 +945,6 @@ func createSharedAccount(buyer, seller, arbiter hedera.PublicKey, initialPayment
 
 func GetAccountInfoFromNetwork(accountID hedera.AccountID) (hedera.AccountInfo, error) {
 	client := GetHederaClientUsingEnv()
-	defer client.Close()
 
 	accountInfo, err := hedera.NewAccountInfoQuery().
 		SetAccountID(accountID).
@@ -591,10 +957,30 @@ func GetAccountInfoFromNetwork(accountID hedera.AccountID) (hedera.AccountInfo, 
 }
 func DepositToSharedAccount(sharedAccountID hedera.AccountID, amount float64) error {
 	client := GetHederaClientUsingEnv()
-	defer client.Close()
+	release, slotErr := acquireHederaWriteSlot("DepositToSharedAccount")
+	if slotErr != nil {
+		return slotErr
+	}
 	_, err := hedera.NewTransferTransaction().
-		AddHbarTransfer(client.GetOperatorAccountID(), hedera.HbarFrom(-amount, hedera.HbarUnits.Millibar)). // Send 3 HBAR
-		AddHbarTransfer(sharedAccountID, hedera.HbarFrom(amount, hedera.HbarUnits.Millibar)).                // Receive 3 HBAR
+		AddHbarTransfer(client.GetOperatorAccountID(), hedera.HbarFrom(-amount, hedera.HbarUnits.Hbar)). // Send 3 HBAR
+		AddHbarTransfer(sharedAccountID, hedera.HbarFrom(amount, hedera.HbarUnits.Hbar)).                // Receive 3 HBAR
 		Execute(client)
+	release()
+	return err
+}
+
+// DepositToSharedAccountBestEffort attempts to top up shared account with a
+// short queue wait; skipped deposits can be retried on later schedule cycles.
+func DepositToSharedAccountBestEffort(sharedAccountID hedera.AccountID, amount float64) error {
+	client := GetHederaClientUsingEnv()
+	release, slotErr := acquireHederaWriteSlotWithTimeout("DepositToSharedAccountBestEffort", 1200*time.Millisecond)
+	if slotErr != nil {
+		return slotErr
+	}
+	_, err := hedera.NewTransferTransaction().
+		AddHbarTransfer(client.GetOperatorAccountID(), hedera.HbarFrom(-amount, hedera.HbarUnits.Hbar)).
+		AddHbarTransfer(sharedAccountID, hedera.HbarFrom(amount, hedera.HbarUnits.Hbar)).
+		Execute(client)
+	release()
 	return err
 }
