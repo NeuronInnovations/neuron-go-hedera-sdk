@@ -646,7 +646,8 @@ func WriteToAllPeersParallel(buffers *NodeBuffers, data []byte) []PeerWriteResul
 			case q.ch <- data:
 				atomic.AddUint64(&globalWritePressure.enqueuedFrames, 1)
 				atomic.AddUint64(&globalWritePressure.droppedFrames, 1)
-				// enqueued after dropping one
+				// enqueued after dropping one; the evicted frame is lost to this peer
+				globalWriteStats.recordDrop(peerID)
 			default:
 				// Still full - drop newest to keep latency low
 				atomic.AddUint64(&globalWritePressure.droppedFrames, 1)
