@@ -198,6 +198,13 @@ func LaunchSDK(
 		// don't override them. Adding TCP does not change the QUIC path.
 		libp2p.Transport(quictransprt.NewTransport),
 		libp2p.Transport(libp2ptcp.NewTCPTransport),
+		// Never let libp2p's UDP black-hole filter refuse QUIC dials. It blocks once
+		// fewer than 5 of the last 100 UDP dials succeeded; a seller makes few UDP
+		// dials and the known-buyers loop keeps redialling dead cached buyers, so
+		// the filter sat Blocked and a QUIC-only buyer (e.g. behind a router that
+		// forwards UDP only) could not be re-reached after any link break. TCP is dialled
+		// alongside, so on a truly UDP-blocked network this only costs a timeout.
+		libp2p.UDPBlackHoleSuccessCounter(nil),
 
 		//libp2p.Security(noise.ID, noise.New),
 		libp2p.AddrsFactory(func(m []multiaddr.Multiaddr) []multiaddr.Multiaddr {
