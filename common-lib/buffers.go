@@ -403,6 +403,31 @@ func (bb *NodeBuffers) GetBufferMap() map[peer.ID]*NodeBufferInfo {
 	return bufferMapCopy
 }
 
+// appendConnectedPeerIDs appends the IDs of Connected peers to dst. The per-frame
+// write path uses it instead of GetBufferMap, which allocates a full map copy.
+func (bb *NodeBuffers) appendConnectedPeerIDs(dst []peer.ID) []peer.ID {
+	bb.mu.Lock()
+	defer bb.mu.Unlock()
+	for id, info := range bb.Buffers {
+		if info.LibP2PState == Connected {
+			dst = append(dst, id)
+		}
+	}
+	return dst
+}
+
+// streamFor returns a peer's stream and state without copying the whole
+// NodeBufferInfo (~300 B), for the per-peer writer.
+func (bb *NodeBuffers) streamFor(buyerID peer.ID) (network.Stream, LibP2PState, bool) {
+	bb.mu.Lock()
+	defer bb.mu.Unlock()
+	info, exists := bb.Buffers[buyerID]
+	if !exists {
+		return nil, "", false
+	}
+	return info.Writer, info.LibP2PState, true
+}
+
 func (bb *NodeBuffers) SetLastGoodsReceivedTime(buyerID peer.ID) {
 	bb.mu.Lock()
 	defer bb.mu.Unlock()

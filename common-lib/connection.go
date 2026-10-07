@@ -297,6 +297,19 @@ var globalWritePressure = struct {
 // Bounded queues drop frames instead of adding latency.
 const peerWriteQueueSize = 300
 
+// Each per-peer writer coalesces queued frames into one stream write: it takes
+// what is already queued, waits up to writeCoalesceWindow for the rest of the
+// burst (the receiver hands frames over in bursts, ~4 per second), then writes
+// once. Writing every ~60-byte frame separately made quic-go wake its send loop
+// and build a packet per frame, which dominated seller CPU on ARMv7 sensors.
+const (
+	// maxWriteBatchBytes keeps a write under quic-go's 1452-byte limit for
+	// copying straight into the next STREAM frame (canBufferStreamFrame), so on
+	// a healthy stream a write never blocks or lands partially.
+	maxWriteBatchBytes  = 1024
+	writeCoalesceWindow = 2 * time.Millisecond
+)
+
 type peerWriteQueue struct {
 	ch   chan []byte
 	done chan struct{}
@@ -318,17 +331,34 @@ func ensurePeerWriteQueue(peerID peer.ID, buffers *NodeBuffers) *peerWriteQueue 
 	q := &peerWriteQueue{ch: make(chan []byte, peerWriteQueueSize), done: make(chan struct{})}
 	peerWriteQueues.m[peerID] = q
 	go func() {
+		batch := make([]byte, 0, maxWriteBatchBytes+256)
+		window := time.NewTimer(writeCoalesceWindow)
+		window.Stop()
 		for {
 			select {
 			case data := <-q.ch:
-				info, exists := buffers.GetBuffer(peerID)
-				if !exists {
+				batch = append(batch[:0], data...)
+				frames := 1
+				window.Reset(writeCoalesceWindow)
+			collect:
+				for len(batch) < maxWriteBatchBytes {
+					select {
+					case more := <-q.ch:
+						batch = append(batch, more...)
+						frames++
+					case <-window.C:
+						break collect
+					case <-q.done:
+						window.Stop()
+						return
+					}
+				}
+				window.Stop()
+				w, state, exists := buffers.streamFor(peerID)
+				if !exists || state != Connected {
 					continue
 				}
-				if info.LibP2PState != Connected {
-					continue
-				}
-				_ = WriteAndFlushBuffer(info, peerID, buffers, data)
+				_ = writeFrames(w, peerID, buffers, batch, frames)
 			case <-q.done:
 				return
 			}
@@ -434,16 +464,20 @@ func (ws *WriteStats) logStats(peerID peer.ID) {
 }
 
 func (ws *WriteStats) recordDrop(peerID peer.ID) {
+	ws.recordDropN(peerID, 1)
+}
+
+func (ws *WriteStats) recordDropN(peerID peer.ID, frames int) {
 	ws.mu.Lock()
 	defer ws.mu.Unlock()
-	ws.droppedFrames[peerID]++
+	ws.droppedFrames[peerID] += uint64(frames)
 	ws.logStats(peerID)
 }
 
-func (ws *WriteStats) recordSuccess(peerID peer.ID) {
+func (ws *WriteStats) recordSuccessN(peerID peer.ID, frames int) {
 	ws.mu.Lock()
 	defer ws.mu.Unlock()
-	ws.successfulWrites[peerID]++
+	ws.successfulWrites[peerID] += uint64(frames)
 	ws.logStats(peerID)
 }
 
@@ -468,78 +502,96 @@ func WriteAndFlushBuffer(
 		return fmt.Errorf("%s:stream handler is nil", ConnectionLostWriteError)
 	}
 
-	if bufferInfo.LibP2PState == Connected {
-		// Use a reasonable deadline that allows for some network jitter
-		// but doesn't block forever. With QUIC, the protocol handles
-		// congestion control - a timeout means the send buffer is full.
-		bufferInfo.Writer.SetWriteDeadline(time.Now().Add(100 * time.Millisecond))
+	if bufferInfo.LibP2PState != Connected {
+		return fmt.Errorf("%s:buffer is not Connected %v", bufferInfo.LibP2PState, peerID)
+	}
+	return writeFrames(bufferInfo.Writer, peerID, connectedBuffersOfBuyers, data, 1)
+}
 
-		_, writeErr := bufferInfo.Writer.Write(data)
+// writeFrames writes data, which holds `frames` whole length-prefixed records,
+// to a peer's stream in one write and handles the outcome. Stats count frames.
+func writeFrames(
+	w network.Stream,
+	peerID peer.ID,
+	connectedBuffersOfBuyers *NodeBuffers,
+	data []byte,
+	frames int,
+) error {
+	// Use a reasonable deadline that allows for some network jitter
+	// but doesn't block forever. With QUIC, the protocol handles
+	// congestion control - a timeout means the send buffer is full.
+	w.SetWriteDeadline(time.Now().Add(100 * time.Millisecond))
 
-		// Clear the deadline for future writes
-		bufferInfo.Writer.SetWriteDeadline(time.Time{})
+	n, writeErr := w.Write(data)
 
-		if writeErr != nil {
-			errStr := writeErr.Error()
+	// Clear the deadline for future writes
+	w.SetWriteDeadline(time.Time{})
 
-			// If we timed out, just drop this frame - don't reset the stream.
-			// QUIC is handling congestion control; the buffer will drain.
-			if netErr, ok := writeErr.(net.Error); ok && netErr.Timeout() {
-				atomic.AddUint64(&globalWritePressure.writeTimeouts, 1)
-				atomic.AddUint64(&globalWritePressure.droppedFrames, 1)
-				globalWriteStats.recordDrop(peerID)
+	if writeErr != nil {
+		errStr := writeErr.Error()
+
+		// If we timed out before any byte went out, just drop these frames -
+		// don't reset the stream. QUIC is handling congestion control; the
+		// buffer will drain. If part of a record went out, the buyer's
+		// length-prefixed parser would read garbage from here on, so fall
+		// through to the reset below instead.
+		if netErr, ok := writeErr.(net.Error); ok && netErr.Timeout() {
+			atomic.AddUint64(&globalWritePressure.writeTimeouts, 1)
+			if n == 0 {
+				atomic.AddUint64(&globalWritePressure.droppedFrames, uint64(frames))
+				globalWriteStats.recordDropN(peerID, frames)
 				return FrameDropped
 			}
-
-			// Check for graceful remote close (QUIC Application error 0x0)
-			// This means the remote peer closed the connection intentionally.
-			// Keep the buffer so we can try to reconnect - don't remove it.
-			if strings.Contains(errStr, "Application error 0x0") {
-				atomic.AddUint64(&globalWritePressure.remoteClosedWrites, 1)
-				log.Printf("Remote peer %s closed connection gracefully - will attempt reconnection", peerID.ShortString())
-				bufferInfo.Writer.Reset()
-				connectedBuffersOfBuyers.RecordDisconnectEvent(peerID)
-				connectedBuffersOfBuyers.UpdateBufferLibP2PState(peerID, Reconnecting)
-				// Don't remove buffer - keep it for reconnection attempts
-				globalWriteStats.reset(peerID)
-				return RemoteClosed
-			}
-
-			// Check for Application error 0x1 (remote rejection - often means duplicate stream)
-			// The remote peer rejected our stream, possibly because one already exists.
-			// Keep the buffer so we can try to reconnect later.
-			if strings.Contains(errStr, "Application error 0x1") {
-				atomic.AddUint64(&globalWritePressure.remoteClosedWrites, 1)
-				log.Printf("Remote peer %s rejected stream (0x1) - possibly duplicate, will retry later", peerID.ShortString())
-				bufferInfo.Writer.Reset()
-				connectedBuffersOfBuyers.RecordDisconnectEvent(peerID)
-				connectedBuffersOfBuyers.UpdateBufferLibP2PState(peerID, Reconnecting)
-				globalWriteStats.reset(peerID)
-				return RemoteClosed
-			}
-
-			// For actual connection errors (broken pipe, reset, etc.), reset the
-			// stream but KEEP the buffer (mark Reconnecting, like the graceful-close
-			// paths above) so the seller's autonomous reconnect loop can re-dial this
-			// buyer from its remembered address without a fresh topic request. The
-			// buffer (and its invoice envelope) is preserved for AddBuffer3 on re-dial;
-			// a buyer is only forgotten when its 5-day lease expires (known-buyers
-			// cache), never on a transient write failure.
-			atomic.AddUint64(&globalWritePressure.writeErrors, 1)
-			log.Printf("Write error to %s: %v - resetting stream, will reconnect", peerID, writeErr)
-			bufferInfo.Writer.Reset()
-			connectedBuffersOfBuyers.RecordDisconnectEvent(peerID)
-			connectedBuffersOfBuyers.UpdateBufferLibP2PState(peerID, Reconnecting)
-			connectedBuffersOfBuyers.IncrementReconnectAttempts(peerID)
-			globalWriteStats.reset(peerID)
-			return fmt.Errorf("%s:error writing to stream: %w", ConnectionLostWriteError, writeErr)
+			log.Printf("Write to %s timed out after %d of %d bytes - resetting stream to keep framing intact", peerID.ShortString(), n, len(data))
 		}
 
-		globalWriteStats.recordSuccess(peerID)
-		atomic.AddUint64(&globalWritePressure.successfulWrites, 1)
-		return nil
+		// Check for graceful remote close (QUIC Application error 0x0)
+		// This means the remote peer closed the connection intentionally.
+		// Keep the buffer so we can try to reconnect - don't remove it.
+		if strings.Contains(errStr, "Application error 0x0") {
+			atomic.AddUint64(&globalWritePressure.remoteClosedWrites, 1)
+			log.Printf("Remote peer %s closed connection gracefully - will attempt reconnection", peerID.ShortString())
+			w.Reset()
+			connectedBuffersOfBuyers.RecordDisconnectEvent(peerID)
+			connectedBuffersOfBuyers.UpdateBufferLibP2PState(peerID, Reconnecting)
+			// Don't remove buffer - keep it for reconnection attempts
+			globalWriteStats.reset(peerID)
+			return RemoteClosed
+		}
+
+		// Check for Application error 0x1 (remote rejection - often means duplicate stream)
+		// The remote peer rejected our stream, possibly because one already exists.
+		// Keep the buffer so we can try to reconnect later.
+		if strings.Contains(errStr, "Application error 0x1") {
+			atomic.AddUint64(&globalWritePressure.remoteClosedWrites, 1)
+			log.Printf("Remote peer %s rejected stream (0x1) - possibly duplicate, will retry later", peerID.ShortString())
+			w.Reset()
+			connectedBuffersOfBuyers.RecordDisconnectEvent(peerID)
+			connectedBuffersOfBuyers.UpdateBufferLibP2PState(peerID, Reconnecting)
+			globalWriteStats.reset(peerID)
+			return RemoteClosed
+		}
+
+		// For actual connection errors (broken pipe, reset, etc.), reset the
+		// stream but KEEP the buffer (mark Reconnecting, like the graceful-close
+		// paths above) so the seller's autonomous reconnect loop can re-dial this
+		// buyer from its remembered address without a fresh topic request. The
+		// buffer (and its invoice envelope) is preserved for AddBuffer3 on re-dial;
+		// a buyer is only forgotten when its 5-day lease expires (known-buyers
+		// cache), never on a transient write failure.
+		atomic.AddUint64(&globalWritePressure.writeErrors, 1)
+		log.Printf("Write error to %s: %v - resetting stream, will reconnect", peerID, writeErr)
+		w.Reset()
+		connectedBuffersOfBuyers.RecordDisconnectEvent(peerID)
+		connectedBuffersOfBuyers.UpdateBufferLibP2PState(peerID, Reconnecting)
+		connectedBuffersOfBuyers.IncrementReconnectAttempts(peerID)
+		globalWriteStats.reset(peerID)
+		return fmt.Errorf("%s:error writing to stream: %w", ConnectionLostWriteError, writeErr)
 	}
-	return fmt.Errorf("%s:buffer is not Connected %v", bufferInfo.LibP2PState, peerID)
+
+	globalWriteStats.recordSuccessN(peerID, frames)
+	atomic.AddUint64(&globalWritePressure.successfulWrites, uint64(frames))
+	return nil
 }
 
 func HolePunchConnectIfNotConnected(ctx context.Context, p2pHost host.Host, pi peer.AddrInfo, isClient bool) error {
@@ -570,17 +622,15 @@ type PeerWriteResult struct {
 // Only writes to peers in Connected state - peers in Reconnecting or other states are skipped.
 // Returns a slice of PeerWriteResult for any failures (successful writes are not included).
 func WriteToAllPeersParallel(buffers *NodeBuffers, data []byte) []PeerWriteResult {
-	bufferMap := buffers.GetBufferMap()
-	if len(bufferMap) == 0 {
+	var idBuf [8]peer.ID
+	peerIDs := buffers.appendConnectedPeerIDs(idBuf[:0])
+	if len(peerIDs) == 0 {
 		return nil
 	}
 
 	// Enqueue writes per peer to avoid goroutine explosion; drop if queue full.
 	var errors []PeerWriteResult
-	for peerID, bufferInfo := range bufferMap {
-		if bufferInfo.LibP2PState != Connected {
-			continue
-		}
+	for _, peerID := range peerIDs {
 		q := ensurePeerWriteQueue(peerID, buffers)
 		select {
 		case q.ch <- data:
