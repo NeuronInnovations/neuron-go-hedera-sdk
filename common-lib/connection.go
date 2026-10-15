@@ -4,80 +4,84 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"math"
 	"net"
+	"strings"
+	"sync"
+	"sync/atomic"
 
 	_ "net/http/pprof"
 
-	//commonlib "neuron/sdk/common-lib"
-	//commonlib "neuron/sdk/common-lib"
-
 	"time"
 
-	"github.com/NeuronInnovations/neuron-go-hedera-sdk/types"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/core/protocol"
 )
 
-// GetStreamHandler finds and returns the stream for a given peer and protocol ID
-func GetStreamHandler(p2pHost host.Host, peerID peer.ID, protocolID protocol.ID) (*network.Stream, error) {
-	// Get all connections to the peer
-	conns := p2pHost.Network().ConnsToPeer(peerID)
-	if len(conns) == 0 {
-		return nil, fmt.Errorf("no connections found for peer %s", peerID)
-	}
-
-	// Check each connection for a matching stream
-	for _, conn := range conns {
-		for _, stream := range conn.GetStreams() {
-			if stream.Protocol() == protocolID {
-				log.Println("found stream for protocol", protocolID, "with peer", peerID, "stream id", stream.ID())
-				return &stream, nil
-			}
-		}
-	}
-
-	return nil, fmt.Errorf("no stream found for protocol %s with peer %s", protocolID, peerID)
-}
-
-// Note: Only the seller can perform the initial connection. The buyer initiates the request
-// but the seller must establish the actual connection and stream.
 func InitialConnect(ctx context.Context, p2pHost host.Host, addrInfo peer.AddrInfo, buyerBuffers *NodeBuffers, protocol protocol.ID) error {
+	start := time.Now()
 
 	// show address info
 	fmt.Println("address info of initial connect", addrInfo)
 
 	info, exists := buyerBuffers.GetBuffer(addrInfo.ID)
 
-	if exists && info.LibP2PState == types.Connected {
+	if exists && info.LibP2PState == Connected {
+		// InitialConnect is only ever called in response to a buyer's fresh service
+		// request, and a buyer only re-requests when it believes it is NOT receiving
+		// data. So a cached "Connected" buffer here is suspect: it can be a stale /
+		// half-open connection the seller never noticed (writes into a dead QUIC stream
+		// keep succeeding silently). The old code trusted the flag and returned early,
+		// so the seller short-circuited forever and never re-dialed that buyer until
+		// the seller process was restarted.
 		if p2pHost.Network().Connectedness(addrInfo.ID) == network.Connected {
-
-			stream, err := GetStreamHandler(p2pHost, addrInfo.ID, protocol)
-			if err != nil {
-				log.Println("error getting stream", err)
-				return fmt.Errorf("%s:error getting stream: %w", types.CanNotConnectStreamError, err)
-			}
-
-			if stream != nil && !network.Stream.Conn(*stream).IsClosed() {
-				fmt.Printf("😍😍 Thanks, we're good, connected and pumping %s -> ! 😍😍\n", addrInfo.ID)
-				return nil
+			// Check if Writer stream is valid (Writer is set by AddBuffer3, not StreamHandler)
+			if info.Writer != nil {
+				conn := info.Writer.Conn()
+				if conn != nil && !conn.IsClosed() {
+					// Grace window: if we (re)connected only moments ago, this is just an
+					// in-flight duplicate request from the buyer's retry loop — trust it and
+					// avoid needless reconnect churn.
+					if !info.LastSuccessAt.IsZero() && time.Since(info.LastSuccessAt) < 45*time.Second {
+						fmt.Printf("😍😍 Thanks, we're good, connected and pumping %s -> ! 😍😍\n", addrInfo.ID)
+						return nil
+					}
+					// Otherwise the buffer claims Connected but the buyer is asking again:
+					// verify the link is genuinely alive with a real (protocol-negotiated)
+					// stream open. This round-trips multistream-select, so a half-open/dead
+					// connection fails or times out instead of lying.
+					probeCtx, probeCancel := context.WithTimeout(ctx, 8*time.Second)
+					probeStream, probeErr := p2pHost.NewStream(probeCtx, addrInfo.ID, protocol)
+					probeCancel()
+					if probeErr == nil {
+						// Non-mutating probe: keep the existing writer, drop the probe stream.
+						_ = probeStream.Reset()
+						fmt.Printf("😍😍 Thanks, we're good (liveness-verified) %s -> ! 😍😍\n", addrInfo.ID)
+						return nil
+					}
+					log.Printf("[TRACE SELLER CONNECT] stale Connected buffer for %s failed liveness probe (%v); closing and re-dialing", addrInfo.ID, probeErr)
+					p2pHost.Network().ClosePeer(addrInfo.ID)
+				}
 			}
 		}
-		log.Println("the buffer is there but the state is not connected, we will try to reconnect")
+		buyerBuffers.UpdateBufferLibP2PState(addrInfo.ID, Reconnecting)
+		log.Println("the buffer is there but not live, we will try to reconnect")
 	}
 
 	// now there are two cases to test.
 	// a buffer is there but state is not connected, or it is not there.
 
+	log.Printf("[TRACE SELLER CONNECT] start peer=%s addrs=%v connectedness=%s", addrInfo.ID, addrInfo.Addrs, p2pHost.Network().Connectedness(addrInfo.ID))
 	conErr := HolePunchConnectIfNotConnected(ctx, p2pHost, addrInfo, true)
 	//conErr := p2pHost.Connect(ctx, *pid)
 	if conErr != nil {
 		log.Println(conErr)
-		return fmt.Errorf("%s:error connecting: %w", types.CanNotConnectUnknownReason, conErr)
+		log.Printf("[TRACE SELLER CONNECT] connect failed peer=%s elapsed=%v err=%v", addrInfo.ID, time.Since(start).Round(time.Millisecond), conErr)
+		return fmt.Errorf("%s:error connecting: %w", CanNotConnectUnknownReason, conErr)
 		//continue
 	}
+	log.Printf("[TRACE SELLER CONNECT] connect ok peer=%s elapsed=%v conn_count=%d", addrInfo.ID, time.Since(start).Round(time.Millisecond), len(p2pHost.Network().ConnsToPeer(addrInfo.ID)))
 
 	fmt.Println("connected, create a stream ", addrInfo.ID)
 
@@ -85,123 +89,509 @@ func InitialConnect(ctx context.Context, p2pHost host.Host, addrInfo peer.AddrIn
 	// --------  stuck here
 
 	// Create a context with a timeout for the NewStream operation
-	//streamCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	//defer cancel()
+	streamCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
 
 	for _, conn := range p2pHost.Network().ConnsToPeer(addrInfo.ID) {
 		log.Printf("Connection to %s open with muxer: %v", addrInfo.ID, conn.ConnState())
 	}
 
-	newStream, strErr := p2pHost.NewStream(ctx, addrInfo.ID, protocol)
+	log.Printf("[TRACE SELLER CONNECT] NewStream first attempt peer=%s elapsed=%v", addrInfo.ID, time.Since(start).Round(time.Millisecond))
+	s, strErr := p2pHost.NewStream(streamCtx, addrInfo.ID, protocol)
 	if strErr != nil {
 		log.Printf("First attempt failed, resetting connection and retrying: %v", strErr)
+		log.Printf("[TRACE SELLER CONNECT] NewStream first attempt failed peer=%s elapsed=%v err=%v", addrInfo.ID, time.Since(start).Round(time.Millisecond), strErr)
 		p2pHost.Network().ClosePeer(addrInfo.ID)
 		time.Sleep(1 * time.Second) // Brief delay before retry
-		newStream, strErr = p2pHost.NewStream(ctx, addrInfo.ID, protocol)
+		log.Printf("[TRACE SELLER CONNECT] NewStream retry peer=%s elapsed=%v", addrInfo.ID, time.Since(start).Round(time.Millisecond))
+		s, strErr = p2pHost.NewStream(ctx, addrInfo.ID, protocol)
 		if strErr != nil {
 			log.Println("failed to create a new stream in InitialConnect. ", strErr)
 			log.Println("this is what we know about the buffer:  exists:", exists, " bufferrInfo", info)
-			return fmt.Errorf("%s:error connecting: %w", types.CanNotConnectStreamError, strErr)
+			log.Printf("[TRACE SELLER CONNECT] NewStream retry failed peer=%s elapsed=%v err=%v", addrInfo.ID, time.Since(start).Round(time.Millisecond), strErr)
+			return fmt.Errorf("%s:error connecting: %w", CanNotConnectStreamError, strErr)
 		}
 		//continue
 	}
-	fmt.Printf("😍😍 Stream connected and pumping %s -> %s ! 😍😍 %v\n", addrInfo, p2pHost.ID(), newStream)
+	log.Printf("[TRACE SELLER CONNECT] NewStream ok peer=%s elapsed=%v stream_id=%s", addrInfo.ID, time.Since(start).Round(time.Millisecond), s.ID())
+	fmt.Printf("😍😍 Stream connected and pumping %s -> %s ! 😍😍\n", addrInfo, p2pHost.ID())
 	//streamWriter := bufio.NewWriterSize(s, 100)
 	//streamWriter := bufio.NewWriter(s)
 
-	newStream.Write(nil)
-	buyerBuffers.AddBuffer3(addrInfo.ID, types.SendOK, types.Connected)
+	buyerBuffers.AddBuffer3(addrInfo.ID, s, SendOK, Connected)
 
 	return nil
 
 }
 
+// ReconnectPeersIfNeeded attempts to re-establish a connection to a peer if its current state
+// indicates it is not connected. This function is specifically utilized by the SELLER role.
+//
+// **Interaction with InitialConnect**:
+// While `InitialConnect` is responsible for establishing a connection with a peer, including setting
+// up a stream and writing data, `ReconnectPeersIfNeeded` focuses on recovering connections that were
+// previously active but have transitioned to a disconnected state. This function assumes that the peer's
+// address is already in the address book, making it effective for scenarios where the peer has restarted
+// or temporarily gone offline.
+//
+// **Behavior**:
+//   - If the peer's state is explicitly marked as `ConnectionLost`, it will not attempt reconnection, as
+//     the system expects the peer to initiate a new request. In such cases, the buffer is removed, and an
+//     error is returned.
+//   - If sufficient backoff time has not passed since the last reconnect attempt, the function will skip
+//     the reconnection to prevent excessive retries, as determined by `IsRequestTooEarly`.
+//   - If the peer is already connected and its stream is valid, the state is updated to `Connected`.
+//   - If reconnection is deemed necessary and viable, the function attempts to create a new stream to
+//     the peer using the `NewStream` method of the LibP2P host.
+//
+// **Outcome**:
+//   - Upon successful reconnection, the function updates the buffers with a new stream writer and sets
+//     the peer's state to `Connected`.
+//   - If reconnection fails, it increments the retry attempt counter and respects the backoff logic
+//     defined in `IsRequestTooEarly`.
+//
+// This function complements the `InitialConnect` logic by ensuring resiliency in maintaining peer
+// connections, particularly for long-lived seller nodes communicating with buyers.
+func ReconnectPeersIfNeeded(ctx context.Context, p2pHost host.Host, peerID peer.ID, bufferInfo NodeBufferInfo, connectedBuffersOfBuyers *NodeBuffers, protocol protocol.ID) error {
+	if bufferInfo.LibP2PState == Connected {
+		// check if the adress book truly has a connection otherwise the state is not valid.
+		if p2pHost.Network().Connectedness(peerID) == network.Connected {
+			return nil
+		} else {
+			connectedBuffersOfBuyers.UpdateBufferLibP2PState(peerID, Reconnecting)
+
+		}
+	}
+	if bufferInfo.LibP2PState == ConnectionLost {
+		// remove the buffer, even if this means you loose the shared account id or last IP address.
+		connectedBuffersOfBuyers.RemoveBuffer(peerID)
+		return fmt.Errorf("%s:we will not try to connect to %s, he is explicitly disconnected and expect him to issue a new request", bufferInfo.LibP2PState, peerID)
+	}
+
+	tooEarly, tooEarlyError := IsRequestTooEarly(connectedBuffersOfBuyers, peerID)
+	if tooEarly {
+		return tooEarlyError
+	}
+
+	// check if we're connected in the meantime
+	if p2pHost.Network().Connectedness(peerID) == network.Connected {
+		fmt.Println("Peer is already connected:", peerID)
+		// check if the stream we have is valid (use Writer, not StreamHandler)
+		if bufferInfo.Writer != nil {
+			conn := bufferInfo.Writer.Conn()
+			if conn != nil && !conn.IsClosed() {
+				fmt.Println("Stream is already connected:", peerID)
+				// Mark the buffer as connected
+				connectedBuffersOfBuyers.UpdateBufferLibP2PState(peerID, Connected)
+				return nil
+			}
+		}
+	}
+
+	// Attempt to reconnect. TODO: there's a case where we don't have an address after reboot. Remember last address and merge from bufferstate.
+	fmt.Println("Attempting to reconnect to peer:", peerID)
+	s, err := p2pHost.NewStream(ctx, peerID, protocol)
+	if err != nil {
+		log.Println("Stream creation failed to", peerID, ":", err)
+		connectedBuffersOfBuyers.RecordDisconnectEvent(peerID)
+		connectedBuffersOfBuyers.IncrementReconnectAttempts(peerID)
+
+		if bufferInfo.NoOfConnectionAttempts > 20 {
+			connectedBuffersOfBuyers.RemoveBuffer(peerID)
+		}
+		return fmt.Errorf("%s:stream creation failed: %w", CanNotConnectStreamError, err)
+	}
+
+	// Successfully reconnected
+	fmt.Printf("😍 -> Stream reconnected to %s\n", peerID)
+	//streamWriter := bufio.NewWriterSize(s, 100)
+	//streamWriter := bufio.NewWriter(s)
+
+	connectedBuffersOfBuyers.AddBuffer3(peerID, s, ReceivedOK, Connected)
+	return nil
+}
+
+// ErrGiveUpReconnect is returned by IsRequestTooEarly when we've been retrying for over 5 days and should stop.
+var ErrGiveUpReconnect = fmt.Errorf("give up reconnect after 5 days")
+
+// IsRequestTooEarly decides if we should wait before re-sending a service request.
+// New peers get aggressive early retries; unstable peers back off until they normalize.
 func IsRequestTooEarly(connectedBuffersOfBuyers *NodeBuffers, peerID peer.ID) (bool, error) {
-	reconnectAttempts, lastAttemptTime, exists := connectedBuffersOfBuyers.GetReconnectInfo(peerID)
+	attemptsSinceSuccess, disconnectScore, hasEverConnected, lastAttemptTime, firstAttemptTime, exists := connectedBuffersOfBuyers.RetryPolicySnapshot(peerID)
 	if !exists {
-		return true, fmt.Errorf("%s:could not find the record for the peer %s in the state map. Make an initial connection", types.WeDoNotKnowPeer, peerID)
+		return true, fmt.Errorf("%s:could not find the record for the peer %s in the state map. Make an initial connection", WeDoNotKnowPeer, peerID)
+	}
+	if firstAttemptTime.IsZero() {
+		// Legacy buffer without FirstConnectionAttempt; treat as "just started".
+		firstAttemptTime = lastAttemptTime
 	}
 
-	// Start with an initial backoff of 30 seconds
-	initialBackoff := time.Second * 30
-	backoffDuration := initialBackoff * time.Duration(math.Pow(2, float64(reconnectAttempts)))
+	elapsed := time.Since(firstAttemptTime)
 
-	// Cap the backoff duration at 12 hours
-	maxBackoff := time.Hour * 12
-	if backoffDuration > maxBackoff {
-		backoffDuration = maxBackoff
+	// Give up after 5 days
+	if elapsed > 5*24*time.Hour {
+		return true, ErrGiveUpReconnect
 	}
+
+	interval := computeRetryDelay(attemptsSinceSuccess, hasEverConnected, disconnectScore)
 
 	timeSinceLastAttempt := time.Since(lastAttemptTime)
-
-	if timeSinceLastAttempt < backoffDuration {
-		return true, fmt.Errorf("%s:time since last attempt %v is less than backoff duration %v", types.HoldYourHorses, timeSinceLastAttempt, backoffDuration)
+	if timeSinceLastAttempt < interval {
+		return true, fmt.Errorf("%s:time since last attempt %v is less than interval %v (attempts=%d ever_connected=%v disconnect_score=%d)", HoldYourHorses, timeSinceLastAttempt, interval, attemptsSinceSuccess, hasEverConnected, disconnectScore)
 	}
-
 	return false, nil
 }
 
 // connection.go (commonlib)
-// TODO: reate limiter needs to come from a parameter so hat it belongs to the seller thread
+// TODO: rate limiter needs to come from a parameter so that it belongs to the seller thread
 //var writeLimiter = rate.NewLimiter(rate.Limit(1000), 200) // 1000 writes/sec, burst=200
+
+// FrameDropped is a sentinel error indicating the frame was dropped due to backpressure.
+// This is not a connection error - the stream remains valid.
+var FrameDropped = fmt.Errorf("frame dropped due to backpressure")
+
+// RemoteClosed is a sentinel error indicating the remote peer closed the connection gracefully.
+// This is expected behavior and not a critical error.
+var RemoteClosed = fmt.Errorf("remote peer closed connection")
+
+// WriteStats tracks write statistics per peer for debugging
+type WriteStats struct {
+	mu               sync.Mutex
+	droppedFrames    map[peer.ID]uint64
+	successfulWrites map[peer.ID]uint64
+	lastLogTime      map[peer.ID]time.Time
+	lastSuccessful   map[peer.ID]uint64 // Track last logged successful count for rate calculation
+	peerPublicKeys   map[peer.ID]string // Short public key for log correlation
+}
+
+var globalWriteStats = &WriteStats{
+	droppedFrames:    make(map[peer.ID]uint64),
+	successfulWrites: make(map[peer.ID]uint64),
+	lastLogTime:      make(map[peer.ID]time.Time),
+	lastSuccessful:   make(map[peer.ID]uint64),
+	peerPublicKeys:   make(map[peer.ID]string),
+}
+
+type WriteQueuePressure struct {
+	ActiveQueues       int
+	QueuedFrames       int
+	MaxQueueDepth      int
+	EnqueuedFrames     uint64
+	DroppedFrames      uint64
+	WriteTimeouts      uint64
+	RemoteClosedWrites uint64
+	WriteErrors        uint64
+	SuccessfulWrites   uint64
+}
+
+var globalWritePressure = struct {
+	enqueuedFrames     uint64
+	droppedFrames      uint64
+	writeTimeouts      uint64
+	remoteClosedWrites uint64
+	writeErrors        uint64
+	successfulWrites   uint64
+}{}
+
+// Per-peer write queues to avoid goroutine explosion under high frame rates.
+// Bounded queues drop frames instead of adding latency.
+const peerWriteQueueSize = 300
+
+// Each per-peer writer coalesces queued frames into one stream write: it takes
+// what is already queued, waits up to writeCoalesceWindow for the rest of the
+// burst (the receiver hands frames over in bursts, ~4 per second), then writes
+// once. Writing every ~60-byte frame separately made quic-go wake its send loop
+// and build a packet per frame, which dominated seller CPU on ARMv7 sensors.
+const (
+	// maxWriteBatchBytes keeps a write under quic-go's 1452-byte limit for
+	// copying straight into the next STREAM frame (canBufferStreamFrame), so on
+	// a healthy stream a write never blocks or lands partially.
+	maxWriteBatchBytes  = 1024
+	writeCoalesceWindow = 2 * time.Millisecond
+)
+
+type peerWriteQueue struct {
+	ch   chan []byte
+	done chan struct{}
+}
+
+var peerWriteQueues = struct {
+	mu sync.Mutex
+	m  map[peer.ID]*peerWriteQueue
+}{
+	m: make(map[peer.ID]*peerWriteQueue),
+}
+
+func ensurePeerWriteQueue(peerID peer.ID, buffers *NodeBuffers) *peerWriteQueue {
+	peerWriteQueues.mu.Lock()
+	defer peerWriteQueues.mu.Unlock()
+	if q, ok := peerWriteQueues.m[peerID]; ok {
+		return q
+	}
+	q := &peerWriteQueue{ch: make(chan []byte, peerWriteQueueSize), done: make(chan struct{})}
+	peerWriteQueues.m[peerID] = q
+	go func() {
+		batch := make([]byte, 0, maxWriteBatchBytes+256)
+		window := time.NewTimer(writeCoalesceWindow)
+		window.Stop()
+		for {
+			select {
+			case data := <-q.ch:
+				batch = append(batch[:0], data...)
+				frames := 1
+				window.Reset(writeCoalesceWindow)
+			collect:
+				for len(batch) < maxWriteBatchBytes {
+					select {
+					case more := <-q.ch:
+						batch = append(batch, more...)
+						frames++
+					case <-window.C:
+						break collect
+					case <-q.done:
+						window.Stop()
+						return
+					}
+				}
+				window.Stop()
+				w, state, exists := buffers.streamFor(peerID)
+				if !exists || state != Connected {
+					continue
+				}
+				_ = writeFrames(w, peerID, buffers, batch, frames)
+			case <-q.done:
+				return
+			}
+		}
+	}()
+	return q
+}
+
+func stopPeerWriteQueue(peerID peer.ID) {
+	peerWriteQueues.mu.Lock()
+	q, ok := peerWriteQueues.m[peerID]
+	if ok {
+		delete(peerWriteQueues.m, peerID)
+	}
+	peerWriteQueues.mu.Unlock()
+	if ok {
+		close(q.done)
+	}
+}
+
+func GetWriteQueuePressure() WriteQueuePressure {
+	peerWriteQueues.mu.Lock()
+	activeQueues := len(peerWriteQueues.m)
+	queuedFrames := 0
+	maxQueueDepth := 0
+	for _, q := range peerWriteQueues.m {
+		depth := len(q.ch)
+		queuedFrames += depth
+		if depth > maxQueueDepth {
+			maxQueueDepth = depth
+		}
+	}
+	peerWriteQueues.mu.Unlock()
+
+	return WriteQueuePressure{
+		ActiveQueues:       activeQueues,
+		QueuedFrames:       queuedFrames,
+		MaxQueueDepth:      maxQueueDepth,
+		EnqueuedFrames:     atomic.LoadUint64(&globalWritePressure.enqueuedFrames),
+		DroppedFrames:      atomic.LoadUint64(&globalWritePressure.droppedFrames),
+		WriteTimeouts:      atomic.LoadUint64(&globalWritePressure.writeTimeouts),
+		RemoteClosedWrites: atomic.LoadUint64(&globalWritePressure.remoteClosedWrites),
+		WriteErrors:        atomic.LoadUint64(&globalWritePressure.writeErrors),
+		SuccessfulWrites:   atomic.LoadUint64(&globalWritePressure.successfulWrites),
+	}
+}
+
+// SetPeerPublicKey stores the short public key for a peer (for log correlation)
+func (ws *WriteStats) SetPeerPublicKey(peerID peer.ID, publicKey string) {
+	ws.mu.Lock()
+	defer ws.mu.Unlock()
+	// Store last 8 chars of public key
+	if len(publicKey) >= 8 {
+		ws.peerPublicKeys[peerID] = publicKey[len(publicKey)-8:]
+	} else {
+		ws.peerPublicKeys[peerID] = publicKey
+	}
+}
+
+// RegisterPeerPublicKey is the public API to associate a public key with a peer ID
+// Call this when processing a service request to enable log correlation
+func RegisterPeerPublicKey(peerID peer.ID, publicKey string) {
+	globalWriteStats.SetPeerPublicKey(peerID, publicKey)
+}
+
+// peerLabel returns a string combining peer ID and public key for logging
+func (ws *WriteStats) peerLabel(peerID peer.ID) string {
+	shortPK := ws.peerPublicKeys[peerID]
+	if shortPK != "" {
+		return fmt.Sprintf("%s (pk:...%s)", peerID.ShortString(), shortPK)
+	}
+	return peerID.ShortString()
+}
+
+// logStats logs statistics if enough time has passed (call with lock held)
+func (ws *WriteStats) logStats(peerID peer.ID) {
+	if time.Since(ws.lastLogTime[peerID]) > 30*time.Second {
+		dropped := ws.droppedFrames[peerID]
+		successful := ws.successfulWrites[peerID]
+		lastSuccessful := ws.lastSuccessful[peerID]
+
+		// Calculate frames per second since last log
+		elapsed := time.Since(ws.lastLogTime[peerID]).Seconds()
+		fps := float64(successful-lastSuccessful) / elapsed
+
+		var dropRate float64
+		if dropped+successful > 0 {
+			dropRate = float64(dropped) / float64(dropped+successful) * 100
+		}
+
+		label := ws.peerLabel(peerID)
+		if dropped > 0 {
+			log.Printf("📊 %s: %d sent, %d dropped (%.1f%% drop), %.0f fps",
+				label, successful, dropped, dropRate, fps)
+		} else {
+			log.Printf("📊 %s: %d sent, 0 dropped, %.0f fps ✓",
+				label, successful, fps)
+		}
+
+		ws.lastLogTime[peerID] = time.Now()
+		ws.lastSuccessful[peerID] = successful
+	}
+}
+
+func (ws *WriteStats) recordDrop(peerID peer.ID) {
+	ws.recordDropN(peerID, 1)
+}
+
+func (ws *WriteStats) recordDropN(peerID peer.ID, frames int) {
+	ws.mu.Lock()
+	defer ws.mu.Unlock()
+	ws.droppedFrames[peerID] += uint64(frames)
+	ws.logStats(peerID)
+}
+
+func (ws *WriteStats) recordSuccessN(peerID peer.ID, frames int) {
+	ws.mu.Lock()
+	defer ws.mu.Unlock()
+	ws.successfulWrites[peerID] += uint64(frames)
+	ws.logStats(peerID)
+}
+
+func (ws *WriteStats) reset(peerID peer.ID) {
+	ws.mu.Lock()
+	defer ws.mu.Unlock()
+	delete(ws.droppedFrames, peerID)
+	delete(ws.successfulWrites, peerID)
+	delete(ws.lastLogTime, peerID)
+	delete(ws.lastSuccessful, peerID)
+	delete(ws.peerPublicKeys, peerID)
+}
 
 func WriteAndFlushBuffer(
 	bufferInfo NodeBufferInfo,
 	peerID peer.ID,
 	connectedBuffersOfBuyers *NodeBuffers,
 	data []byte,
-	p2pHost host.Host,
-	protocol protocol.ID,
 ) error {
-
-	// Check if peer is connected
-	activeConns := p2pHost.Network().ConnsToPeer(peerID)
-	if len(activeConns) > 0 {
-		bufferInfo.LibP2PState = types.Connected
-	} else {
-		bufferInfo.LibP2PState = types.ConnectionLost
-		return fmt.Errorf("%s:peer is not connected", types.ConnectionLostWriteError)
-	}
-	stream, err := GetStreamHandler(p2pHost, peerID, protocol)
-	if err != nil {
-		log.Println("error getting stream", err)
-		return fmt.Errorf("%s:error getting stream: %w", types.CanNotConnectStreamError, err)
-	}
-	if stream == nil {
-		bufferInfo.LibP2PState = types.ConnectionLost
-		return fmt.Errorf("%s:stream handler is nil", types.ConnectionLostWriteError)
-
+	if bufferInfo.Writer == nil {
+		bufferInfo.LibP2PState = ConnectionLost
+		return fmt.Errorf("%s:stream handler is nil", ConnectionLostWriteError)
 	}
 
-	// Short write deadline to avoid blocking too long
-	//stream.SetWriteDeadline(time.Now().Add(20 * time.Millisecond))
+	if bufferInfo.LibP2PState != Connected {
+		return fmt.Errorf("%s:buffer is not Connected %v", bufferInfo.LibP2PState, peerID)
+	}
+	return writeFrames(bufferInfo.Writer, peerID, connectedBuffersOfBuyers, data, 1)
+}
 
-	//writeStart := time.Now()
-	writer := *stream
-	bytesWritten, writeErr := writer.Write(data)
-	log.Println("bytes written", bytesWritten)
+// writeFrames writes data, which holds `frames` whole length-prefixed records,
+// to a peer's stream in one write and handles the outcome. Stats count frames.
+func writeFrames(
+	w network.Stream,
+	peerID peer.ID,
+	connectedBuffersOfBuyers *NodeBuffers,
+	data []byte,
+	frames int,
+) error {
+	// Use a reasonable deadline that allows for some network jitter
+	// but doesn't block forever. With QUIC, the protocol handles
+	// congestion control - a timeout means the send buffer is full.
+	w.SetWriteDeadline(time.Now().Add(100 * time.Millisecond))
+
+	n, writeErr := w.Write(data)
+
+	// Clear the deadline for future writes
+	w.SetWriteDeadline(time.Time{})
 
 	if writeErr != nil {
-		// If we timed out, treat that as "not ready yet"
+		errStr := writeErr.Error()
+
+		// If we timed out before any byte went out, just drop these frames -
+		// don't reset the stream. QUIC is handling congestion control; the
+		// buffer will drain. If part of a record went out, the buyer's
+		// length-prefixed parser would read garbage from here on, so fall
+		// through to the reset below instead.
 		if netErr, ok := writeErr.(net.Error); ok && netErr.Timeout() {
-			log.Printf("Write skipped: Receiver not ready (timeout). Resseting stream.")
-			// reset stream
-			//stream.Reset()
-			connectedBuffersOfBuyers.RemoveBuffer(peerID)
-			return fmt.Errorf("%s:error writing to stream - 1:  %w", types.ConnectionLostWriteError, writeErr)
-
+			atomic.AddUint64(&globalWritePressure.writeTimeouts, 1)
+			if n == 0 {
+				atomic.AddUint64(&globalWritePressure.droppedFrames, uint64(frames))
+				globalWriteStats.recordDropN(peerID, frames)
+				return FrameDropped
+			}
+			log.Printf("Write to %s timed out after %d of %d bytes - resetting stream to keep framing intact", peerID.ShortString(), n, len(data))
 		}
-		// Otherwise, update state & increment reconnect attempts
-		//stream.Reset()
 
-		connectedBuffersOfBuyers.UpdateBufferLibP2PState(peerID, types.ConnectionLost)
+		// Check for graceful remote close (QUIC Application error 0x0)
+		// This means the remote peer closed the connection intentionally.
+		// Keep the buffer so we can try to reconnect - don't remove it.
+		if strings.Contains(errStr, "Application error 0x0") {
+			atomic.AddUint64(&globalWritePressure.remoteClosedWrites, 1)
+			log.Printf("Remote peer %s closed connection gracefully - will attempt reconnection", peerID.ShortString())
+			w.Reset()
+			connectedBuffersOfBuyers.RecordDisconnectEvent(peerID)
+			connectedBuffersOfBuyers.UpdateBufferLibP2PState(peerID, Reconnecting)
+			// Don't remove buffer - keep it for reconnection attempts
+			globalWriteStats.reset(peerID)
+			return RemoteClosed
+		}
+
+		// Check for Application error 0x1 (remote rejection - often means duplicate stream)
+		// The remote peer rejected our stream, possibly because one already exists.
+		// Keep the buffer so we can try to reconnect later.
+		if strings.Contains(errStr, "Application error 0x1") {
+			atomic.AddUint64(&globalWritePressure.remoteClosedWrites, 1)
+			log.Printf("Remote peer %s rejected stream (0x1) - possibly duplicate, will retry later", peerID.ShortString())
+			w.Reset()
+			connectedBuffersOfBuyers.RecordDisconnectEvent(peerID)
+			connectedBuffersOfBuyers.UpdateBufferLibP2PState(peerID, Reconnecting)
+			globalWriteStats.reset(peerID)
+			return RemoteClosed
+		}
+
+		// For actual connection errors (broken pipe, reset, etc.), reset the
+		// stream but KEEP the buffer (mark Reconnecting, like the graceful-close
+		// paths above) so the seller's autonomous reconnect loop can re-dial this
+		// buyer from its remembered address without a fresh topic request. The
+		// buffer (and its invoice envelope) is preserved for AddBuffer3 on re-dial;
+		// a buyer is only forgotten when its 5-day lease expires (known-buyers
+		// cache), never on a transient write failure.
+		atomic.AddUint64(&globalWritePressure.writeErrors, 1)
+		log.Printf("Write error to %s: %v - resetting stream, will reconnect", peerID, writeErr)
+		w.Reset()
+		connectedBuffersOfBuyers.RecordDisconnectEvent(peerID)
+		connectedBuffersOfBuyers.UpdateBufferLibP2PState(peerID, Reconnecting)
 		connectedBuffersOfBuyers.IncrementReconnectAttempts(peerID)
-		connectedBuffersOfBuyers.RemoveBuffer(peerID)
-		return fmt.Errorf("%s:error writing to stream - 2:  %w", types.ConnectionLostWriteError, writeErr)
+		globalWriteStats.reset(peerID)
+		return fmt.Errorf("%s:error writing to stream: %w", ConnectionLostWriteError, writeErr)
 	}
 
+	globalWriteStats.recordSuccessN(peerID, frames)
+	atomic.AddUint64(&globalWritePressure.successfulWrites, uint64(frames))
 	return nil
-
 }
 
 func HolePunchConnectIfNotConnected(ctx context.Context, p2pHost host.Host, pi peer.AddrInfo, isClient bool) error {
@@ -216,4 +606,56 @@ func HolePunchConnectIfNotConnected(ctx context.Context, p2pHost host.Host, pi p
 	}
 	log.Println("hole punch connected to ", pi.ID)
 	return nil
+}
+
+// PeerWriteResult holds the result of a write operation to a single peer
+type PeerWriteResult struct {
+	PeerID peer.ID
+	Error  error
+}
+
+// WriteToAllPeersParallel writes data to all connected peers concurrently.
+// This avoids the latency issue where a slow peer blocks writes to other peers.
+// With QUIC, each write goes into the protocol's send buffer, so parallel writes
+// are safe and efficient.
+//
+// Only writes to peers in Connected state - peers in Reconnecting or other states are skipped.
+// Returns a slice of PeerWriteResult for any failures (successful writes are not included).
+func WriteToAllPeersParallel(buffers *NodeBuffers, data []byte) []PeerWriteResult {
+	var idBuf [8]peer.ID
+	peerIDs := buffers.appendConnectedPeerIDs(idBuf[:0])
+	if len(peerIDs) == 0 {
+		return nil
+	}
+
+	// Enqueue writes per peer to avoid goroutine explosion; drop if queue full.
+	var errors []PeerWriteResult
+	for _, peerID := range peerIDs {
+		q := ensurePeerWriteQueue(peerID, buffers)
+		select {
+		case q.ch <- data:
+			atomic.AddUint64(&globalWritePressure.enqueuedFrames, 1)
+			// enqueued
+		default:
+			// Queue full: drop one old frame and try to enqueue the newest.
+			select {
+			case <-q.ch:
+			default:
+			}
+			select {
+			case q.ch <- data:
+				atomic.AddUint64(&globalWritePressure.enqueuedFrames, 1)
+				atomic.AddUint64(&globalWritePressure.droppedFrames, 1)
+				// enqueued after dropping one; the evicted frame is lost to this peer
+				globalWriteStats.recordDrop(peerID)
+			default:
+				// Still full - drop newest to keep latency low
+				atomic.AddUint64(&globalWritePressure.droppedFrames, 1)
+				globalWriteStats.recordDrop(peerID)
+				errors = append(errors, PeerWriteResult{PeerID: peerID, Error: FrameDropped})
+			}
+		}
+	}
+
+	return errors
 }

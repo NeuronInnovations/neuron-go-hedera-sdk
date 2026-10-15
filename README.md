@@ -114,7 +114,6 @@ hedera_evm_id=
 hedera_id=
 location=
 list_of_sellers=
-eth_rpc_url=https://testnet.hashio.io/api
 mirror_api_url=https://testnet.mirrornode.hedera.com/api/v1
 neuron_explorer_url=https://explorer.neuron.world/api/v1/device/wip-all
 smart_contract_address=0x87e2fc64dc1eae07300c2fc50d6700549e1632ca
@@ -124,10 +123,11 @@ Below is an explanation of the environment variables required for the `neuron-go
 
 #### Required Environment Variables:
 
-1. **`eth_rpc_url`**:
-   - **Description**: URL of the Ethereum-compatible JSON-RPC endpoint for Hedera.
-   - **Example**: `https://testnet.hashio.io/api`
-   - **Purpose**: Enables the SDK to interact with Hedera's EVM layer for operations such as querying accounts.
+1. **`eth_rpc_url`** *(deprecated — no longer used)*:
+   - **Description**: Formerly the Ethereum-compatible JSON-RPC relay endpoint (hashio).
+   - **Status**: The SDK no longer dials a JSON-RPC relay. Read-only smart-contract
+     calls now go through the Hedera mirror node's `/contracts/call` endpoint
+     (`mirror_api_url`), so this variable is ignored and can be removed.
 
 2. **`private_key`**:
    - **Description**: Your private key in hexadecimal format. Use an secp256k1 (not DER)
@@ -157,7 +157,9 @@ Below is an explanation of the environment variables required for the `neuron-go
 7. **`mirror_api_url`**:
    - **Description**: The API endpoint of the Hedera Mirror Node.
    - **Fixed Value**: `https://testnet.mirrornode.hedera.com/api/v1`
-   - **Purpose**: Enables the SDK to query historical and real-time Hedera network data.
+   - **Purpose**: Enables the SDK to query historical and real-time Hedera network
+     data, and to perform read-only smart-contract calls via `/contracts/call`
+     (replacing the old JSON-RPC relay / hashio dependency).
 
 8. **`neuron_explorer_url`**:
    - **Description**: The API endpoint of the Neuron Explorer.
@@ -166,10 +168,8 @@ Below is an explanation of the environment variables required for the `neuron-go
 
 9. **`smart_contract_address`**:
    - **Description**: The EVM-compatible address of the Neuron smart contract.
-   - **Format**: Must be a valid Ethereum address (0x + 40 hex characters)
-   - **Example**: `0x1234567890123456789012345678901234567890`
+   - **Fixed Value**: `0x87e2fc64dc1eae07300c2fc50d6700549e1632ca`
    - **Purpose**: Used for interactions with the smart contract, such as registering devices or querying SLA information.
-   - **Note**: Can also be specified via `--smart-contract-address` flag (takes precedence over environment variable)
 
 #### Optional/Derived Information:
 - The `list_of_sellers` is only useful for data buyers and can be left empty if discovery is handled dynamically (see flags section)
@@ -344,17 +344,6 @@ The `neuron-go-hedera-sdk` supports the following command-line flags for configu
    - **Default**: Not set
    - **Example**: `--my-public-port=9000`
 
-9. **`--use-local-address`**
-   - **Description**: Forces the node to use local addresses instead of public ones. This is useful for local network testing and development.
-   - **Default**: `false`
-   - **Example**: `--use-local-address`
-
-10. **`--smart-contract-address`**
-    - **Description**: Overrides the smart contract address from the environment variable. This flag takes precedence over the `smart_contract_address` environment variable.
-    - **Format**: Must be a valid Ethereum address (0x + 40 hex characters)
-    - **Default**: Not set (uses environment variable if available)
-    - **Example**: `--smart-contract-address=0x1234567890123456789012345678901234567890`
-
 #### Buyer-Specific Flags
 
 1. **`--list-of-sellers-source`**
@@ -376,42 +365,11 @@ The `neuron-go-hedera-sdk` supports the following command-line flags for configu
       ./mydapp --mode=peer --buyer-or-seller=buyer --port=30088  --list-of-sellers-source=env
    ```
 
-   To run the program as a seller, you will need a separate environment file (e.g., .env-seller) to specify the seller's keys and configuration. The --envFile flag allows you to explicitly define which environment file to use for each instance.
+   To run the program as a seller, you will need a separate environment file (e.g., .env-seller) to specify the seller’s keys and configuration. The --envFile flag allows you to explicitly define which environment file to use for each instance.
 
    This setup makes it convenient to run both buyer and seller instances on the same machine for testing purposes. Simply specify a different --envFile value and ensure other parameters (like --port) do not conflict. This approach ensures that you can simulate both roles without any overlaps or configuration issues.          
    ```bash
       go build -o mydapp
       ./mydapp --mode=peer --buyer-or-seller=seller --envFile=.env-seller --port=20088 
    ```
-
-#### Smart Contract Address Usage Examples
-
-The smart contract address can be configured in multiple ways with the following precedence order:
-
-1. **Command-line flag** (highest priority)
-2. **Environment variable** (fallback)
-
-**Example 1: Using command-line flag**
-```bash
-./mydapp --smart-contract-address=0x1234567890123456789012345678901234567890 --buyer-or-seller=buyer
-```
-
-**Example 2: Using environment variable**
-```bash
-# In .env file
-smart_contract_address=0x1234567890123456789012345678901234567890
-
-# Run without flag
-./mydapp --buyer-or-seller=buyer
-```
-
-**Example 3: Flag overrides environment variable**
-```bash
-# In .env file
-smart_contract_address=0x1111111111111111111111111111111111111111
-
-# Flag takes precedence
-./mydapp --smart-contract-address=0x2222222222222222222222222222222222222222 --buyer-or-seller=buyer
-# Uses 0x2222... (flag value)
-```
 

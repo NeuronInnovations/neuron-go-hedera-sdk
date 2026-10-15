@@ -1,10 +1,8 @@
 package hedera_helper
 
 import (
-	"reflect"
 	"testing"
 
-	"github.com/ethereum/go-ethereum/ethclient"
 	"github.com/joho/godotenv"
 	"github.com/multiformats/go-multiaddr"
 )
@@ -14,26 +12,6 @@ func init() {
 	err := godotenv.Load("../.env")
 	if err != nil {
 		panic(err)
-	}
-}
-
-func TestGetHRpcClient(t *testing.T) {
-	tests := []struct {
-		name string
-		want *ethclient.Client
-	}{
-		// TODO: Add test cases.
-		{
-			name: "GetHRpcClient",
-			want: nil,
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := GetHRpcClient(); !reflect.DeepEqual(got, tt.want) {
-				t.Errorf("GetHRpcClient() = %v, want %v", got, tt.want)
-			}
-		})
 	}
 }
 

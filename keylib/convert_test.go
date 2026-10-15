@@ -2,6 +2,8 @@ package keylib
 
 import (
 	"testing"
+
+	"github.com/hashgraph/hedera-sdk-go/v2"
 )
 
 func TestConvertHederaPublicKeyToPeerID(t *testing.T) {
@@ -9,10 +11,9 @@ func TestConvertHederaPublicKeyToPeerID(t *testing.T) {
 		hederaPublicKey string
 	}
 	tests := []struct {
-		name    string
-		args    args
-		want    string
-		wantErr bool
+		name string
+		args args
+		want string
 	}{
 		{
 			name: "ConvertEthPublicKeyToPeerID",
@@ -22,13 +23,8 @@ func TestConvertHederaPublicKeyToPeerID(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := ConvertHederaPublicKeyToPeerID(tt.args.hederaPublicKey)
-			if (err != nil) != tt.wantErr {
-				t.Errorf("ConvertHederaPublicKeyToPeerID() error = %v, wantErr %v", err, tt.wantErr)
-				return
-			}
-			if got != tt.want {
-				t.Errorf("ConvertHederaPublicKeyToPeerID() = %v, want %v", got, tt.want)
+			if got := ConvertHederaPublicKeyToPeerID(tt.args.hederaPublicKey); got != tt.want {
+				t.Errorf("ConvertEthPublicKeyToPeerID() = %v, want %v", got, tt.want)
 			}
 		})
 	}
@@ -55,5 +51,26 @@ func TestConverHederaPublicKeyToEthereunAddress(t *testing.T) {
 				t.Errorf("ConverHederaPublicKeyToEthereunAddress() = %v, want %v", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestPeerIDFromHederaPublicKey(t *testing.T) {
+	got, err := PeerIDFromHederaPublicKey("02759b048e7ccf6ba68f9658105a4a139b5f9f5dfd451857c600cc28f33a1a99ae")
+	if err != nil || got != "16Uiu2HAm3Lkn9NRieuh3UUTWMNthSDumQL9ctTBKxQqdCC79WUSq" {
+		t.Fatalf("secp256k1 key: got %q, %v", got, err)
+	}
+
+	ed, err := hedera.PrivateKeyGenerateEd25519()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, key := range map[string]string{
+		"ed25519": ed.PublicKey().StringRaw(),
+		"garbage": "not-a-key",
+		"empty":   "",
+	} {
+		if pid, err := PeerIDFromHederaPublicKey(key); err == nil {
+			t.Errorf("%s: expected an error, got peer ID %q", name, pid)
+		}
 	}
 }

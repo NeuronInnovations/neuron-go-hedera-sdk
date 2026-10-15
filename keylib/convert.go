@@ -2,7 +2,6 @@ package keylib
 
 import (
 	"encoding/hex"
-	"fmt"
 	"log"
 	"strings"
 
@@ -13,55 +12,62 @@ import (
 	"github.com/libp2p/go-libp2p/core/peer"
 )
 
-func ConvertHederaPublicKeyToPeerID(hederaPublicKey string) (string, error) {
+func ConvertHederaPublicKeyToPeerID(hederaPublicKey string) string {
+	peerID, err := PeerIDFromHederaPublicKey(hederaPublicKey)
+	if err != nil {
+		log.Fatal(err)
+	}
+	return peerID
+}
+
+// PeerIDFromHederaPublicKey is the non-fatal form of
+// ConvertHederaPublicKeyToPeerID, for keys that come from outside our own
+// config (the smart contract, the mirror node, topic messages, the seller
+// list). It returns an error instead of exiting when the key cannot be parsed
+// or is not a secp256k1 key, so one bad registration can't take the node down.
+func PeerIDFromHederaPublicKey(hederaPublicKey string) (string, error) {
 	hpub, err := hedera.PublicKeyFromString(hederaPublicKey)
 	if err != nil {
-		return "", fmt.Errorf("error converting hedera public key to peer ID: %v", err)
+		return "", err
 	}
 
 	libp2pPubKey, err := libp2pcrypto.UnmarshalSecp256k1PublicKey(hpub.BytesRaw())
 	if err != nil {
-		return "", fmt.Errorf("error unmarshaling public key: %v", err)
+		return "", err
 	}
 
 	peerID, err := peer.IDFromPublicKey(libp2pPubKey)
 	if err != nil {
-		return "", fmt.Errorf("error creating peer ID: %v", err)
+		return "", err
 	}
 
 	return peerID.String(), nil
 }
 
 func ConverHederaPublicKeyToEthereunAddress(hederaPublicKey string) string {
-
-	publicKeyBytes, err := hex.DecodeString(hederaPublicKey)
+	ethaddress, err := EthereumAddressFromPublicKeyHex(hederaPublicKey)
 	if err != nil {
 		log.Fatal(err)
 	}
+	return ethaddress
+}
+
+// EthereumAddressFromPublicKeyHex is the non-fatal form of
+// ConverHederaPublicKeyToEthereunAddress, for keys that come from the network
+// (e.g. a connected peer's libp2p key) rather than from our own config. It returns
+// the lowercase address without 0x, or an error if the key is not a compressed
+// secp256k1 public key.
+func EthereumAddressFromPublicKeyHex(hederaPublicKey string) (string, error) {
+	publicKeyBytes, err := hex.DecodeString(hederaPublicKey)
+	if err != nil {
+		return "", err
+	}
 	decompressedEdcaPubkey, err := ethcrypto.DecompressPubkey(publicKeyBytes)
 	if err != nil {
-		log.Fatal(err)
+		return "", err
 	}
 
 	ethaddress := ethcrypto.PubkeyToAddress(*decompressedEdcaPubkey)
 	// return string with 0x prefix removed
-	return strings.ToLower(ethaddress.String()[2:])
-}
-
-// IsValidEthereumAddress validates if the given string is a valid Ethereum address format
-func IsValidEthereumAddress(address string) bool {
-	// Check if address starts with "0x" and has correct length (0x + 40 hex characters = 42 total)
-	if len(address) != 42 || !strings.HasPrefix(address, "0x") {
-		return false
-	}
-
-	// Check if the remaining characters are valid hex
-	for i := 2; i < len(address); i++ {
-		c := address[i]
-		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
-			return false
-		}
-	}
-
-	return true
+	return strings.ToLower(ethaddress.String()[2:]), nil
 }

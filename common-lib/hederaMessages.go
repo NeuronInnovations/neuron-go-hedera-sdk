@@ -1,4 +1,4 @@
-// messages.go defines the messages that are published to Hedera topics, enabling peers to communicate
+// hederaMessages.go defines the messages that are published to Hedera topics, enabling peers to communicate
 // in a publicly visible manner. The messages are designed to facilitate decentralized coordination
 // while ensuring transparency, as validators and other network participants can inspect the content
 // to understand the intent and context of the messages.
@@ -17,7 +17,7 @@
 // messages. These messages will need to be added and extended in a modular way to ensure that they align
 // with the unique requirements of each protocol, while still adhering to the transparency and audibility
 // principles that Hedera topic communications are designed to provide.
-package types
+package commonlib
 
 import (
 	"encoding/json"
@@ -25,27 +25,16 @@ import (
 	"fmt"
 )
 
-// EnvironmentVarLocation represents a location in the environment
-
-type EnvironmentVarLocation struct {
-	Latitude  float64 `json:"lat"`
-	Longitude float64 `json:"lon"`
-	Altitude  float64 `json:"alt"`
-	GPSFix    string  `json:"gpsfix"`
-}
-
-// NeuronMessage interface for all messages
 type NeuronMessage interface {
 	GetMessageType() string
 	GetVersion() string
 }
 
-// MessageType represents different types of messages
 type MessageType string
 
-const (
+var (
 	HeartbeatMessage MessageType = "NeuronHeartBeatMsg"
-	// Add other message types as needed
+	// ... TODO: do them all
 )
 
 type NeuronHeartBeatMsg struct {
@@ -97,48 +86,6 @@ func (m *NeuronScheduleSignRequestMsg) GetVersion() string {
 	return m.Version
 }
 
-// Hole Punching Message Types
-
-// NeuronPunchMeRequestMsg is sent by the seller to the buyer when direct connection fails
-// and hole punching is required. It contains the seller's encrypted IP address and timing
-// information for coordinated hole punching.
-type NeuronPunchMeRequestMsg struct {
-	MessageType        string `json:"messageType"`
-	EncryptedIpAddress []byte `json:"i"` // Seller's IP encrypted with buyer's public key
-	StdInTopic         uint64 `json:"o"` // Buyer's stdin topic
-	PublicKey          string `json:"k"` // Seller's public key
-	HederaTimestamp    string `json:"t"` // Timestamp from the HCS message for synchronization
-	PunchDelay         int    `json:"d"` // Delay in seconds after consensus (default: 10)
-	Version            string `json:"v"`
-}
-
-func (m *NeuronPunchMeRequestMsg) GetMessageType() string {
-	return m.MessageType
-}
-
-func (m *NeuronPunchMeRequestMsg) GetVersion() string {
-	return m.Version
-}
-
-// NeuronPunchMeAcknowledgmentMsg is sent by the buyer to acknowledge receipt of a
-// punchMeRequest and confirm participation in the hole punching protocol.
-type NeuronPunchMeAcknowledgmentMsg struct {
-	MessageType     string `json:"messageType"`
-	RequestTopic    uint64 `json:"r"` // Topic where punchMeRequest was received
-	PublicKey       string `json:"k"` // Buyer's public key
-	HederaTimestamp string `json:"t"` // Same timestamp from punchMeRequest for verification
-	Version         string `json:"v"`
-}
-
-func (m *NeuronPunchMeAcknowledgmentMsg) GetMessageType() string {
-	return m.MessageType
-}
-
-func (m *NeuronPunchMeAcknowledgmentMsg) GetVersion() string {
-	return m.Version
-}
-
-// ErrorType represents different types of errors
 type ErrorType string
 
 const (
@@ -158,7 +105,6 @@ const (
 	ExplorerReachError  ErrorType = "ExplorerReachError"
 )
 
-// RecoverAction represents different recovery actions
 type RecoverAction string
 
 const (
@@ -253,22 +199,6 @@ func UnmarshalNeuronMessage(jsonData []byte) (NeuronMessage, error) {
 		}
 		return &msg, nil
 
-	case "punchMeRequest":
-		var msg NeuronPunchMeRequestMsg
-		err := json.Unmarshal(jsonData, &msg)
-		if err != nil {
-			return nil, fmt.Errorf("error un-marshalling NeuronPunchMeRequestMsg: %v", err)
-		}
-		return &msg, nil
-
-	case "punchMeAcknowledgment":
-		var msg NeuronPunchMeAcknowledgmentMsg
-		err := json.Unmarshal(jsonData, &msg)
-		if err != nil {
-			return nil, fmt.Errorf("error un-marshalling NeuronPunchMeAcknowledgmentMsg: %v", err)
-		}
-		return &msg, nil
-
 	default:
 		return nil, fmt.Errorf("unknown message type: %s", messageType)
 	}
@@ -277,7 +207,7 @@ func UnmarshalNeuronMessage(jsonData []byte) (NeuronMessage, error) {
 func FullErrorTrace(err error) string {
 	var trace string
 	for i := 0; err != nil; i++ {
-		trace += fmt.Sprintf("%d: %v\n", i, err)
+		trace += fmt.Sprintf("Level %d: %v\n", i, err)
 		err = errors.Unwrap(err)
 	}
 	return trace
